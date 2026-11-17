@@ -113,8 +113,13 @@ pub const ANONYMOUS: &str = "anonymous";
 /// Owner label for a request re-sent with the credentials it was recorded with.
 pub const RECORDED: &str = "recorded";
 
+/// Builds up to 0.8.4 filed bypasses as 100003, which HQL Injection raises too
+/// ([`fix_bypass_ref`]).
+const BYPASS_REF: &str = "100009";
+const OLD_BYPASS_REF: &str = "100003";
+
 static BYPASS: AlertDef = AlertDef {
-    alert_ref: "100003",
+    alert_ref: BYPASS_REF,
     name: "Access Control Bypass",
     risk: Risk::High,
     confidence: Confidence::Medium,
@@ -152,6 +157,89 @@ static UNAUTHENTICATED: AlertDef = AlertDef {
     ],
     tags: &["OWASP_2025_A01", "OWASP_2021_A01", "OWASP_2017_A05", "API2:2023"],
 };
+
+/// Moves Access Control Bypass findings from 100003, which the active rule HQL Injection
+/// also raises, to [`BYPASS_REF`]. Sharing the id gave the two one `finding_types` row, so
+/// one showed the other's name and description. No table changes, so this runs on open
+/// (checked first: a project that needs nothing isn't written to) rather than as a schema
+/// version an older build would refuse. An issue holding only bypass findings moves with
+/// them; one that also holds HQL findings keeps those, and the bypasses get their own.
+pub(crate) fn fix_bypass_ref(conn: &rusqlite::Connection) -> Result<()> {
+    let needed: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM findings WHERE alert_ref = ?1 AND source = 'authz')
+            OR EXISTS (SELECT 1 FROM finding_types WHERE alert_ref = ?1 AND name = ?2)",
+        params![OLD_BYPASS_REF, BYPASS.name],
+        |r| r.get(0),
+    )?;
+    if !needed {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    conn.execute(
+        "UPDATE issues SET alert_ref = ?2 WHERE alert_ref = ?1
+            AND id IN (SELECT issue_id FROM findings WHERE alert_ref = ?1 AND source = 'authz')
+            AND id NOT IN (SELECT issue_id FROM findings WHERE alert_ref = ?1 AND source != 'authz'
+                AND issue_id IS NOT NULL)",
+        params![OLD_BYPASS_REF, BYPASS_REF],
+    )?;
+    // The dedupe key starts with the alert ref ("100003|GET|url|param").
+    let moved: Vec<(i64, String)> = conn
+        .prepare(
+            "UPDATE findings SET alert_ref = ?2, rule_id = CAST(?2 AS INTEGER),
+                dedupe = ?2 || substr(dedupe, length(?1) + 1)
+             WHERE alert_ref = ?1 AND source = 'authz' AND NOT EXISTS
+                (SELECT 1 FROM findings g WHERE g.dedupe = ?2 || substr(findings.dedupe, length(?1) + 1))
+             RETURNING id, host",
+        )?
+        .query_map(params![OLD_BYPASS_REF, BYPASS_REF], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, host) in moved {
+        let in_shared_issue: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM findings f JOIN issues i ON i.id = f.issue_id
+                WHERE f.id = ?1 AND i.alert_ref = ?2)",
+            params![id, OLD_BYPASS_REF],
+            |r| r.get(0),
+        )?;
+        if in_shared_issue {
+            // Out of the shared issue first: `issue_for` would find it there under the new ref.
+            conn.execute("UPDATE findings SET issue_id = NULL WHERE id = ?1", [id])?;
+            let issue = crate::scan::issues::issue_for(conn, BYPASS_REF, &host)?;
+            conn.execute("UPDATE findings SET issue_id = ?1 WHERE id = ?2", params![issue, id])?;
+        }
+    }
+    // The type row keeps a description edited in the project. HQL's is written again by its
+    // next finding, or here when it has findings already.
+    let has_new: bool =
+        conn.query_row("SELECT EXISTS (SELECT 1 FROM finding_types WHERE alert_ref = ?1)", [BYPASS_REF], |r| r.get(0))?;
+    if has_new {
+        conn.execute(
+            "DELETE FROM finding_types WHERE alert_ref = ?1 AND name = ?2",
+            params![OLD_BYPASS_REF, BYPASS.name],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE finding_types SET alert_ref = ?2, rule_id = CAST(?2 AS INTEGER) WHERE alert_ref = ?1 AND name = ?3",
+            params![OLD_BYPASS_REF, BYPASS_REF, BYPASS.name],
+        )?;
+    }
+    if let Some(hql) = crate::scan::active::alert_def(OLD_BYPASS_REF) {
+        conn.execute(
+            "INSERT OR IGNORE INTO finding_types (alert_ref, rule_id, name, description, solution, refs, tags)
+             SELECT ?1, CAST(?1 AS INTEGER), ?2, ?3, ?4, ?5, ?6
+             WHERE EXISTS (SELECT 1 FROM findings WHERE alert_ref = ?1)",
+            params![
+                hql.alert_ref,
+                hql.name,
+                hql.description,
+                hql.solution,
+                serde_json::to_string(hql.references).unwrap_or_default(),
+                serde_json::to_string(hql.tags).unwrap_or_default(),
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
 
 /// Alert definitions raised by authz runs.
 pub fn alerts() -> [&'static AlertDef; 2] {
@@ -1361,5 +1449,55 @@ mod tests {
         assert_eq!(judge(&base, &denied, false, "", false, None).verdict, Verdict::Enforced);
         let forbidden = Body::parse(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         assert_eq!(judge(&base, &forbidden, false, "", false, None).verdict, Verdict::Enforced);
+    }
+
+    #[test]
+    fn bypass_findings_leave_the_id_hql_injection_raises() {
+        use crate::capture::Capture;
+        let hql = crate::scan::active::alert_def(OLD_BYPASS_REF).expect("HQL Injection is an active alert");
+        assert_ne!(hql.name, BYPASS.name);
+        assert!(crate::scan::active::alert_def(BYPASS_REF).is_none(), "no active rule raises {BYPASS_REF}");
+        // A bypass as builds up to 0.8.4 filed it, recorded before an HQL finding on the same host.
+        let old: &'static AlertDef = Box::leak(Box::new(AlertDef { alert_ref: OLD_BYPASS_REF, ..BYPASS }));
+        let path = std::env::temp_dir().join(format!("bp-authz-ref-{}.bpdb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut store = Store::open(&path).unwrap();
+            let target = Target::from_url("http://a.test/").unwrap();
+            for (source, def, path) in [("authz", old, "/orders/7"), ("active", hql, "/search")] {
+                let req = format!("GET {path} HTTP/1.1\r\nHost: a.test\r\n\r\n");
+                let resp = b"HTTP/1.1 200 OK\r\n\r\n";
+                let id = store.record(&Capture::new("scan", &target, req.as_bytes(), Some(resp), None, None)).unwrap();
+                let msg = Message::from_exchange(id, &target, req.as_bytes(), resp);
+                store.record_findings_from(source, &msg, &[def.raise("q".to_string(), "")], None).unwrap();
+            }
+            let shared: i64 = store
+                .conn
+                .query_row("SELECT count(DISTINCT issue_id) FROM findings WHERE alert_ref = '100003'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(shared, 1, "the collision put both in one issue");
+        }
+        let store = Store::open(&path).unwrap();
+        let row = |sql: &str| -> (String, String, String) {
+            store.conn.query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap()
+        };
+        let q = "SELECT f.alert_ref, f.dedupe, t.name FROM findings f JOIN finding_types t USING (alert_ref)";
+        let (aref, dedupe, name) = row(&format!("{q} WHERE f.source = 'authz'"));
+        assert_eq!((aref.as_str(), name.as_str()), (BYPASS_REF, BYPASS.name));
+        assert!(dedupe.starts_with("100009|GET|"), "{dedupe}");
+        let (aref, _, name) = row(&format!("{q} WHERE f.source = 'active'"));
+        assert_eq!((aref.as_str(), name.as_str()), (OLD_BYPASS_REF, hql.name));
+        let (bypass_issue, hql_issue): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT (SELECT i.alert_ref FROM findings f JOIN issues i ON i.id = f.issue_id WHERE f.source = 'authz'),
+                        (SELECT i.alert_ref FROM findings f JOIN issues i ON i.id = f.issue_id WHERE f.source = 'active')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((bypass_issue.as_str(), hql_issue.as_str()), (BYPASS_REF, OLD_BYPASS_REF));
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 }

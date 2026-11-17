@@ -268,6 +268,9 @@ pub struct Correlation {
     pub new_findings: usize,
     /// Alert refs raised (one entry per matched interaction).
     pub raised: Vec<String>,
+    /// The findings those raised, new or seen again (for a scan's summary).
+    #[serde(skip)]
+    pub finding_ids: Vec<i64>,
 }
 
 impl Store {
@@ -555,6 +558,7 @@ pub fn correlate(store: &mut Store, lookup: impl Fn(&str) -> Option<&'static Ale
         // parameter, from any payload or protocol, count as hits of one finding.
         let finding = def.raise(param, "").attack(attack).other_info(info);
         out.new_findings += store.record_findings_from("active", &msg, std::slice::from_ref(&finding), base)?;
+        out.finding_ids.extend(crate::scan::active::finding_id(store, &msg, &finding)?);
         out.matched += 1;
         out.raised.push(alert_ref);
     }

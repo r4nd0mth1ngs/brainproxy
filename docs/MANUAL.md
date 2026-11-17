@@ -834,7 +834,10 @@ attack type, and pick payloads:
   traffic is passively scanned, or run the passive scan again.
 
 Passive rules run automatically on everything recorded. Active scans send real attack
-requests that can change data: prefer a test environment.
+requests that can change data: prefer a test environment. The path traversal rule names
+only files no write can damage (`/proc/version`, Windows' `kernel32.dll`, directories), so
+a parameter that writes to the path it is given doesn't overwrite a system file; see
+[ACTIVE_RULES.md](ACTIVE_RULES.md).
 By default an active scan only replays GET, HEAD, OPTIONS and POST requests from history;
 DELETE, PUT, PATCH and other methods are skipped (and counted as `skipped_methods`) unless
 you include them. POST stays on because a scan misses too much without it, but it isn't
@@ -843,6 +846,14 @@ or trigger side effects such as email; `--crawl` also submits the forms it finds
 are attacked, the result says how many (`post_targets`) with a warning (`post_hint`), which
 with JSON output or `--background` comes only once the scan is over. Text output warns before
 the attack starts, and the scan wizard says so on its last step.
+
+What `scan active` reports when it is done: `active_findings` groups the findings this scan
+raised, new or seen again (their ids are in `finding_ids`), not every active finding in the
+project (`findings list --source active` lists those). `errors` counts rule units that
+crashed; `failed_requests` counts attack requests that went out and got no response (timed
+out, refused or reset), with a `failed_requests_hint` when there are any. A target that stops
+answering finds nothing, so a scan with many failed requests is no clean bill of health: check
+the target and scan again, slower if it was overloaded.
 
 ### Access
 Access control across users: does the app let bob read alice's data? See
@@ -3304,9 +3315,11 @@ A bypass is `high` confidence when the request names an object (a number, UUID, 
 id or email address) and the owner's values or username came back, `medium` when it names
 an object but only the similarity shows it, or when the path looks privileged (admin,
 users, roles, ...), and `low` otherwise: `/dashboard` may simply be the same for everyone.
-Medium and high bypasses are findings (source `authz`): *Access Control Bypass* (100003)
+Medium and high bypasses are findings (source `authz`): *Access Control Bypass* (100009)
 for another profile, *Protected Content Without Authentication* (100004) for the anonymous
-control. Low ones are only in the results, to review.
+control. Low ones are only in the results, to review. Builds up to 0.8.4 filed *Access
+Control Bypass* as 100003, the id of the active rule *HQL Injection*; opening a project
+moves those findings (and their issues) to 100009.
 
 Safety: from history only GET requests that carry credentials are replayed;
 `--include-methods POST,PUT` (or `all`) adds others, which then change data as another user,

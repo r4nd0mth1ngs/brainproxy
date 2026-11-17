@@ -87,9 +87,13 @@ const REASON_JAVASCRIPT: &str =
 
 const ORIGINAL_VALUE_PLACEHOLDER: &str = "@@@original@@@";
 
-/// A random host under owasp.org, so a match cannot be a coincidence.
+/// A random host, so a match cannot be a coincidence, under `.invalid` (RFC 6761), which no
+/// name resolves in. ZAP's is under owasp.org: a parameter that the target *fetches* (an image
+/// URL) then made the target call a host the engagement never named. A redirect only has to
+/// name the host for the browser, so detection is the same; an app that checks the host
+/// resolves before redirecting is the one that is no longer found.
 pub(crate) static REDIRECT_SITE: LazyLock<String> =
-    LazyLock::new(|| format!("{}.owasp.org", crate::scan::active::rand_u64() >> 1));
+    LazyLock::new(|| format!("{}.redirect.invalid", crate::scan::active::rand_u64() >> 1));
 
 static JS_PATTERNS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
     let site = format!("https?://{}", *REDIRECT_SITE);
@@ -183,12 +187,12 @@ pub(crate) fn js_comments(src: &str) -> Vec<&str> {
     out
 }
 
-fn js_redirect(re: &Regex, script: &str) -> bool {
-    let present =
-        |s: &str| re.captures(s).is_some_and(|c| c[1].get(..4).is_some_and(|p| p.eq_ignore_ascii_case("http")));
-    if !present(script) {
-        return false;
-    }
+/// The redirect URL `re` finds in `script` outside its comments.
+fn js_redirect(re: &Regex, script: &str) -> Option<String> {
+    let present = |s: &str| {
+        re.captures(s).map(|c| c[1].to_string()).filter(|u| u.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("http")))
+    };
+    present(script)?;
     let mut stripped = script.to_string();
     for c in js_comments(script) {
         stripped = stripped.replace(c, "");
@@ -196,42 +200,54 @@ fn js_redirect(re: &Regex, script: &str) -> bool {
     present(&stripped)
 }
 
-/// isRedirected: which redirection point (if any) carries our site.
-pub(crate) fn redirect_type(resp: &Response, payload: &str) -> Option<(&'static AlertDef, &'static str)> {
-    if check_payload(resp.header("location")) {
-        return Some((&ALERT_LOCATION, REASON_LOCATION_HEADER));
+/// A redirect to our site: its alert, why, and the URL as the response has it.
+pub(crate) type Redirect = (&'static AlertDef, &'static str, String);
+
+/// isRedirected: which redirection point (if any) carries our site. The URL returned is the
+/// response's own text, the finding's evidence: the server may have changed the value on the
+/// way (encoded it, kept part of it), and `findings verify` looks for the evidence there.
+pub(crate) fn redirect_type(resp: &Response, payload: &str) -> Option<Redirect> {
+    if let Some(v) = resp.header("location").filter(|v| check_payload(Some(v))) {
+        return Some((&ALERT_LOCATION, REASON_LOCATION_HEADER, v.to_string()));
     }
-    if let Some(v) = resp.header("refresh") {
-        if check_payload(refresh_url(v).as_deref()) {
-            return Some((&ALERT_REFRESH, REASON_REFRESH_HEADER));
-        }
+    if let Some(url) = resp.header("refresh").and_then(refresh_url).filter(|u| check_payload(Some(u))) {
+        return Some((&ALERT_REFRESH, REASON_REFRESH_HEADER, url));
     }
     let body = resp.body_str();
     let all = tags(body);
     for meta in all.iter().filter(|t| t.name == "meta") {
         let Some(equiv) = meta.attr("http-equiv") else { continue };
-        if equiv.eq_ignore_ascii_case("location") {
-            if check_payload(meta.attr("content").and_then(location_url).as_deref()) {
-                return Some((&ALERT_META, REASON_LOCATION_META));
-            }
+        let (url, reason) = if equiv.eq_ignore_ascii_case("location") {
+            (meta.attr("content").and_then(location_url), REASON_LOCATION_META)
         } else if equiv.eq_ignore_ascii_case("refresh") {
-            if let Some(content) = meta.attr("content") {
-                if check_payload(refresh_url(content).as_deref()) {
-                    return Some((&ALERT_META, REASON_REFRESH_META));
-                }
-            }
+            (meta.attr("content").and_then(refresh_url), REASON_REFRESH_META)
+        } else {
+            continue;
+        };
+        if let Some(url) = url.filter(|u| check_payload(Some(u))) {
+            return Some((&ALERT_META, reason, url));
         }
     }
     if find_ci(body, payload, 0).is_some() {
         for script in all.iter().filter(|t| t.name == "script") {
             let end = find_ci(body, "</script", script.end).unwrap_or(body.len());
             let content = &body[script.end.min(end)..end];
-            if JS_PATTERNS.iter().any(|re| js_redirect(re, content)) {
-                return Some((&ALERT_JS, REASON_JAVASCRIPT));
+            if let Some(url) = JS_PATTERNS.iter().find_map(|re| js_redirect(re, content)) {
+                return Some((&ALERT_JS, REASON_JAVASCRIPT, url));
             }
         }
     }
     None
+}
+
+/// The value to send for a payload, and the redirect URL it should produce: the
+/// placeholder in both stands for the parameter's original value.
+fn attack(payload: &str, placeholder: bool, redirect_url: &str, value: &str) -> (String, String) {
+    if placeholder {
+        (payload.replace(ORIGINAL_VALUE_PLACEHOLDER, value), redirect_url.replace(ORIGINAL_VALUE_PLACEHOLDER, value))
+    } else {
+        (payload.to_string(), redirect_url.to_string())
+    }
 }
 
 pub struct ExternalRedirect;
@@ -260,10 +276,10 @@ impl ActiveRule for ExternalRedirect {
                 if cx.stopped() {
                     return;
                 }
-                let injection = if placeholder { payload.replace(ORIGINAL_VALUE_PLACEHOLDER, &value) } else { payload };
+                let (injection, redirect_url) = attack(&payload, placeholder, &redirect_url, &value);
                 let Ok(resp) = common::send_no_follow(cx, &injection).await else { continue };
-                if let Some((alert, reason)) = redirect_type(&resp, &redirect_url) {
-                    let f = alert.raise(cx.point().name.clone(), redirect_url).attack(injection).other_info(reason);
+                if let Some((alert, reason, evidence)) = redirect_type(&resp, &redirect_url) {
+                    let f = alert.raise(cx.point().name.clone(), evidence).attack(injection).other_info(reason);
                     cx.report(f, &resp);
                     return;
                 }
@@ -285,6 +301,12 @@ mod tests {
         assert!(check_payload(Some(&format!("HTTPS://{s}/x"))));
         assert!(!check_payload(Some(&format!("https://{s}.evil.test/"))));
         assert!(!check_payload(Some(&format!("//{s}"))));
+        // No payload names a host that resolves: the target may fetch what it is given.
+        for (payload, _, url) in payloads() {
+            let host = payload.replace("%2e", ".");
+            assert!(host.contains(".redirect.invalid") && url.contains("redirect"), "{payload}");
+            assert!(!payload.contains("owasp.org"), "{payload}");
+        }
         assert_eq!(payloads().len(), 14);
         assert_eq!(payload_count(Strength::Medium), 9);
     }

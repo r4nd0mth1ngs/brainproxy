@@ -68,6 +68,12 @@ mod e2e {
 
     static TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+    /// The files `/upload` was told to write.
+    static WRITTEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// What `/save` stored last, for `/saved` to show.
+    static SAVED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
     fn sign(book: &mut Vec<String>, text: String) {
         book.push(text);
         if book.len() > 20 {
@@ -137,8 +143,9 @@ mod e2e {
                 let name = param("name");
                 if name == "readme.txt" {
                     ok("text/plain", "read me".into())
-                } else if name.ends_with("etc/passwd") {
-                    ok("text/plain", "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1::/:/bin/false\n".into())
+                } else if name.ends_with("proc/version") {
+                    let file = "Linux version 6.1.0-18-amd64 (debian-kernel@lists.debian.org) (gcc-12) #1 SMP\n";
+                    ok("text/plain", file.into())
                 } else {
                     not_found
                 }
@@ -210,6 +217,25 @@ mod e2e {
             "/xpath-safe-clock" => xpath_rows(|e| e.0 == param("id"), &clock()),
             // Safe: the value is read and ignored, as the Benchmark's safe pages do.
             "/xpath-ignored" => xpath_page("@emplid='3'", ""),
+            // Writes what it is sent to the file `name` names (here: notes which file).
+            "/upload" => {
+                WRITTEN.lock().unwrap().push(param("name"));
+                ok("text/plain", "saved".into())
+            }
+            "/save" => {
+                *SAVED.lock().unwrap() = param("u");
+                "HTTP/1.1 302 Found\r\nLocation: /saved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            }
+            "/saved" => ok("text/html", format!("<html><body><p>Saved: {}</p></body></html>", SAVED.lock().unwrap())),
+            // Redirects to any URL that mentions an allowed site anywhere in it.
+            "/go" => {
+                let to = param("to");
+                if to.contains("allowed.test") {
+                    format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                } else {
+                    ok("text/plain", "not allowed".into())
+                }
+            }
             _ => not_found,
         }
     }
@@ -300,6 +326,61 @@ mod e2e {
         Some(any)
     }
 
+    /// One stored finding, with its row's response.
+    #[derive(Debug)]
+    struct Stored {
+        alert_ref: String,
+        method: String,
+        url: String,
+        param: String,
+        evidence: String,
+        confidence: String,
+        other_info: String,
+        response: Vec<u8>,
+    }
+
+    /// [`scan_targets`] for `paths`, with the findings it stored.
+    async fn scan_stored(name: &str, port: u16, paths: &[&str], rules: Vec<u32>) -> (ActiveSummary, Vec<Stored>) {
+        let targets = paths
+            .iter()
+            .map(|p| {
+                let (request, response) = fetch(port, p);
+                let target = Target::from_url(&format!("http://127.0.0.1:{port}{p}")).unwrap();
+                ScanTarget { history_id: None, target, request, response, duration_ms: None }
+            })
+            .collect();
+        let project = std::env::temp_dir().join(format!("bp-params-{name}-{}.bpdb", std::process::id()));
+        let s = scan_project(&project, targets, PointOptions::default(), Some(rules)).await;
+        let store = crate::store::Store::open(&project).unwrap();
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT f.alert_ref, f.method, f.url, f.param, f.evidence, f.confidence, f.other_info, h.response
+                 FROM findings f JOIN history h ON h.id = f.history_id ORDER BY f.id",
+            )
+            .unwrap();
+        let found = stmt
+            .query_map([], |r| {
+                Ok(Stored {
+                    alert_ref: r.get(0)?,
+                    method: r.get(1)?,
+                    url: r.get(2)?,
+                    param: r.get(3)?,
+                    evidence: r.get(4)?,
+                    confidence: r.get(5)?,
+                    other_info: r.get(6)?,
+                    response: r.get(7)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<Stored>, _>>()
+            .unwrap();
+        drop(stmt);
+        drop(store);
+        let _ = std::fs::remove_file(&project);
+        (s, found)
+    }
+
     fn spawn_app() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -347,7 +428,19 @@ mod e2e {
         rules: Option<Vec<u32>>,
     ) -> ActiveSummary {
         let project = std::env::temp_dir().join(format!("bp-params-{name}-{}.bpdb", std::process::id()));
+        let summary = scan_project(&project, targets, points, rules).await;
         let _ = std::fs::remove_file(&project);
+        summary
+    }
+
+    /// Scans into a new project at `project`, kept for the caller to read.
+    async fn scan_project(
+        project: &std::path::Path,
+        targets: Vec<ScanTarget>,
+        points: PointOptions,
+        rules: Option<Vec<u32>>,
+    ) -> ActiveSummary {
+        let _ = std::fs::remove_file(project);
         let guard =
             Guard::from_specs(vec![ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] }])
                 .unwrap();
@@ -369,9 +462,7 @@ mod e2e {
             check_methods: vec![],
             prune: false,
         };
-        let summary = run(&project, targets, cfg, JobControl::default()).await.unwrap();
-        let _ = std::fs::remove_file(&project);
-        summary
+        run(project, targets, cfg, JobControl::default()).await.unwrap()
     }
 
     /// Reflects the request unescaped: the decoded path, or a body as the app would read
@@ -446,7 +537,7 @@ mod e2e {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn path_traversal_own_file_name_comes_from_the_probe() {
+    async fn path_traversal_needs_file_contents_not_a_status() {
         let port = spawn_app();
         let target = |path: &str| {
             let (request, response) = fetch(port, path);
@@ -454,21 +545,18 @@ mod e2e {
             ScanTarget { history_id: None, target, request, response, duration_ms: None }
         };
         let opts = PointOptions { path: true, ..Default::default() };
-
-        // A last segment is never attacked with its own value, with or without a slash.
-        let s = scan_targets("own-status", vec![target("/own/status")], opts.clone(), Some(vec![6])).await;
-        assert!(s.raised.is_empty(), "{s:?}");
-        let s = scan_targets("own-clock", vec![target("/own/clock")], opts.clone(), Some(vec![6])).await;
-        assert!(s.raised.is_empty(), "{s:?}");
-
-        // A query parameter that reads the script is still found; the path segment is not.
-        let s = scan_targets("own-view", vec![target("/view?page=home")], opts.clone(), Some(vec![6])).await;
-        assert_eq!(s.raised.get("6-5"), Some(&1), "{s:?}");
-        assert_eq!(s.raised.len(), 1, "{s:?}");
-        // Also when the value is already the script's name and the attack is the original page.
-        let s = scan_targets("own-jsp", vec![target("/view.jsp?file=view.jsp")], opts, Some(vec![6])).await;
-        assert_eq!(s.raised.get("6-5"), Some(&1), "{s:?}");
-        assert_eq!(s.raised.len(), 1, "{s:?}");
+        // Each answers 200 for the URL's own file name and 404 for anything else. Nothing shows
+        // a file was read: a route segment, a name from a fixed list, and (the OWASP Benchmark's
+        // false reports) a value that already was the file name, the attack resending it.
+        for (name, path) in [
+            ("own-status", "/own/status"),
+            ("own-clock", "/own/clock"),
+            ("own-view", "/view?page=home"),
+            ("own-jsp", "/view.jsp?file=view.jsp"),
+        ] {
+            let s = scan_targets(name, vec![target(path)], opts.clone(), Some(vec![6])).await;
+            assert!(s.raised.is_empty(), "{path}: {s:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -583,5 +671,59 @@ mod e2e {
         .await;
         assert!(s.raised.is_empty(), "false positives: {s:?}");
         assert!(s.requests > 20, "the rules did attack: {s:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn path_traversal_names_no_file_a_write_would_clobber() {
+        let port = spawn_app();
+        let s = scan("upload", port, &["/upload?name=report.txt"], Some(vec![6])).await;
+        assert!(s.raised.is_empty(), "{s:?}");
+        let written = WRITTEN.lock().unwrap().clone();
+        assert!(written.len() > 5, "the rule attacked: {written:?}");
+        // On the OWASP Benchmark, a servlet like this one emptied /etc/passwd.
+        for name in &written {
+            let n = name.replace('\\', "/").to_ascii_lowercase();
+            let clobbers = ["passwd", "system.ini", "win.ini", "web.xml", "upload"];
+            assert!(!clobbers.iter().any(|c| n.contains(c)), "{name}");
+            assert!(
+                n == "report.txt"
+                    || n.ends_with("proc/version")
+                    || n.ends_with("system32/kernel32.dll")
+                    || n.ends_with('/'),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redirect_evidence_is_what_the_response_says() {
+        let port = spawn_app();
+        // Only the payload that keeps the original value gets past the allow list.
+        let (s, found) = scan_stored("redirect", port, &["/go?to=https://allowed.test/home"], vec![20019]).await;
+        assert_eq!(s.raised.get("20019-1"), Some(&1), "{s:?}");
+        let Stored { param, evidence, response, .. } = &found[0];
+        assert_eq!(param, "to");
+        assert!(!evidence.contains("@@@"), "the placeholder, not the URL: {evidence}");
+        assert!(evidence.ends_with("/?https://allowed.test/home"), "{evidence}");
+        let response = String::from_utf8_lossy(response);
+        assert!(response.contains(evidence.as_str()), "findings verify looks for it there: {response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_redirect_followed_is_filed_under_the_attacked_request() {
+        let port = spawn_app();
+        // `/save` stores `u` and redirects to `/saved`, which shows it unescaped.
+        let (s, found) = scan_stored("followed", port, &["/save?u=hi"], vec![40012]).await;
+        assert!(!s.raised.is_empty() && !found.is_empty(), "{s:?}");
+        for f in &found {
+            assert_eq!((f.alert_ref.as_str(), f.method.as_str()), ("40012", "GET"), "{f:?}");
+            assert!(f.url.contains("/save?"), "the attacked request, not the page it led to: {f:?}");
+            assert_eq!(f.param, "u");
+            let response = String::from_utf8_lossy(&f.response);
+            assert!(response.starts_with("HTTP/1.1 302"), "the attacked request's own response: {response}");
+            // The evidence is only on the page the redirect led to.
+            assert_eq!(f.confidence, "low", "{f:?}");
+            assert!(f.other_info.contains("GET /saved"), "{f:?}");
+        }
     }
 }

@@ -72,6 +72,10 @@ brainproxy scan active ... [--oob-wait SECS] [--no-oob]
 - SSRF (40046), ported from ZAP's beta rules: an http and an https callback URL per parameter.
   In host mode only the http one is sent (the token in the https URL's path would be inside
   TLS); the https one needs DNS mode (`--domain`).
+- Remote File Inclusion (7): ZAP's URL prefixes (`http://`, none, `HTTPS://`, with and without
+  a null byte) before a callback URL, one token each, instead of `www.google.com`, so the
+  target is never sent to a third party. Without a listener it sends nothing. https prefixes
+  need DNS mode, as for SSRF.
 - Declarative checks (Nuclei templates) with `{{interactsh-url}}`: one payload per
   request, interactsh matchers evaluated per interaction at correlation (docs/CHECKS.md).
 

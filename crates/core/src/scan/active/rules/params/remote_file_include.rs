@@ -1,13 +1,18 @@
 //! Ported from ZAP RemoteFileIncludeScanRule (ascanrules, Apache License 2.0).
 //!
-//! The payloads make the *target* fetch www.google.com; brainproxy itself only
-//! talks to the in-scope target.
+//! ZAP's payloads make the *target* fetch www.google.com and look for Google's title in the
+//! answer. The scope guard only covers brainproxy's own connections, so that used the target
+//! to call a third party the engagement never named (a scan of one host made it fetch Google).
+//! Here the URL is the OOB listener's (`brainproxy oob start`), and the target fetching it
+//! raises the alert; without a listener the rule sends nothing, like the other out-of-band
+//! checks. What it gives up: the listener answers with an empty body, so the alert says the
+//! parameter's URL was fetched, not that what came back was included in the page (which is
+//! also what SSRF, 40046, reports for the same fetch).
 
 use std::sync::LazyLock;
 
-use regex::Regex;
-
-use super::common::{self, NULL_BYTE};
+use super::common::NULL_BYTE;
+use crate::oob::Payload;
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, RuleScope, Strength};
 use crate::scan::{AlertDef, Confidence, Risk};
 
@@ -87,21 +92,15 @@ static PREFIXES: LazyLock<Vec<String>> = LazyLock::new(|| {
     plain.iter().map(|p| p.to_string()).chain(plain.iter().map(|p| format!("{NULL_BYTE}{p}"))).collect()
 });
 
-const TARGETS: [&str; 5] = [
-    "www.google.com/",
-    "www.google.com:80/",
-    "www.google.com",
-    "www.google.com/search?q=ZAP",
-    "www.google.com:80/search?q=ZAP",
-];
-
-// Java `.` does not match line terminators; neither does Rust's (except \r, which is rare here).
-static PATTERNS: LazyLock<[Regex; 2]> = LazyLock::new(|| {
-    [Regex::new(r"<title>Google</title>").unwrap(), Regex::new(r"<title.*?ZAP[ -]*?Google.*?/title>").unwrap()]
-});
-
-fn pattern(target_index: usize) -> &'static Regex {
-    &PATTERNS[if target_index < 3 { 0 } else { 1 }]
+/// The value to send: `prefix` before the listener URL without its scheme. None for an https
+/// prefix in host mode, where the token is in the path, which a TLS handshake never shows.
+fn attack(prefix: &str, payload: &Payload) -> Option<String> {
+    let https = prefix.to_ascii_lowercase().contains("https");
+    if https && !payload.dns {
+        return None;
+    }
+    let rest = payload.url.split_once("://").map_or(payload.url.as_str(), |(_, rest)| rest);
+    Some(format!("{prefix}{rest}"))
 }
 
 fn prefix_count(strength: Strength) -> usize {
@@ -134,28 +133,17 @@ impl ActiveRule for RemoteFileInclude {
 
     fn scan<'a>(&'a self, cx: &'a Cx) -> BoxFuture<'a> {
         Box::pin(async move {
-            let base = cx.base_response();
-            let original = format!("{}{}", base.head_text(), base.body_str());
             for prefix in &PREFIXES[..prefix_count(cx.strength())] {
-                for (i, target) in TARGETS.iter().enumerate() {
-                    if cx.stopped() {
-                        return;
-                    }
-                    let attack = format!("{prefix}{target}");
-                    let Ok(resp) = common::send_no_follow(cx, &attack).await else { continue };
-                    let response = format!("{}{}", resp.head_text(), resp.body_str());
-                    let Some(m) = pattern(i).find(&response) else { continue };
-                    if resp.status != 200 {
-                        continue;
-                    }
-                    // Not the same as in the original response.
-                    if pattern(i).find(&original).is_some_and(|o| o.as_str() == m.as_str()) {
-                        continue;
-                    }
-                    let f = ALERT.raise(cx.point().name.clone(), m.as_str()).attack(attack);
-                    cx.report(f, &resp);
+                if cx.stopped() {
                     return;
                 }
+                // A token per attack, so an interaction names the prefix that got through.
+                let Some(payload) = cx.oob_payload() else { return };
+                let Some(attack) = attack(prefix, &payload) else { continue };
+                let request = cx.payload_request(&attack);
+                let resp = cx.send(request.clone()).await.ok();
+                let finding = ALERT.raise(cx.point().name.clone(), "").attack(attack);
+                cx.oob_register(&payload, finding, &request, resp.as_ref());
             }
         })
     }
@@ -166,12 +154,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn payloads_and_patterns() {
+    fn payloads_name_only_the_listener() {
         assert_eq!(PREFIXES.len(), 14);
         assert_eq!(PREFIXES[7], "\0http://");
         assert_eq!(prefix_count(Strength::Medium), 2);
-        assert!(pattern(0).is_match("<html><title>Google</title>"));
-        assert!(pattern(3).is_match("<title>ZAP - Google Search</title>"));
-        assert!(!pattern(3).is_match("<title>Google</title>"));
+        let host =
+            Payload { token: "bpx".into(), host: "10.0.0.1:80".into(), url: "http://10.0.0.1/bpx".into(), dns: false };
+        let all: Vec<String> = PREFIXES.iter().filter_map(|p| attack(p, &host)).collect();
+        assert_eq!(all[..3], ["http://10.0.0.1/bpx", "10.0.0.1/bpx", "HTTP://10.0.0.1/bpx"]);
+        assert_eq!(all.len(), 8, "no https in host mode: {all:?}");
+        let dns =
+            Payload { token: "bpx".into(), host: "bpx.oob.test".into(), url: "http://bpx.oob.test/".into(), dns: true };
+        assert_eq!(attack("HtTpS://", &dns).as_deref(), Some("HtTpS://bpx.oob.test/"));
+        for p in PREFIXES.iter() {
+            assert!(attack(p, &dns).is_some_and(|a| a.contains("bpx.oob.test") && !a.contains("google")));
+        }
     }
 }

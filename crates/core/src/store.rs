@@ -802,7 +802,7 @@ impl Store {
                 self.conn.execute_batch(&format!("CREATE INDEX IF NOT EXISTS {name} ON {on};"))?;
             }
         }
-        Ok(())
+        crate::authz::fix_bypass_ref(&self.conn)
     }
 
     /// Starts a write transaction. IMMEDIATE takes the write lock at BEGIN, where the busy

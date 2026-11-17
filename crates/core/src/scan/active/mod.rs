@@ -17,7 +17,7 @@ pub mod policy;
 pub mod rules;
 pub mod source_sink;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -37,7 +37,7 @@ use crate::jobs::JobControl;
 use crate::oob::{self, Endpoint, Payload, ScanPayload};
 use crate::rules::{Engine, EngineRules, Ruled};
 use crate::scan::active::source_sink::{Sink, SourceSink};
-use crate::scan::{AlertDef, Finding, Message};
+use crate::scan::{AlertDef, Confidence, Finding, Message};
 use crate::sent::{RowBatch, RowWrite, Rows};
 use crate::session::Tool;
 use crate::store::Store;
@@ -115,6 +115,9 @@ pub struct Response {
     /// The response as the server sent it, when a match-and-replace rule changed what the scan
     /// rule reads (`raw` and the rest are then the response after it).
     received: Option<Vec<u8>>,
+    /// With redirects followed ([`Cx::send_following`]), the response to the request the rule
+    /// sent: this response is then the last redirect's, to a request the rule didn't make.
+    attacked: Option<Box<Response>>,
     text: OnceLock<String>,
 }
 
@@ -143,6 +146,7 @@ impl Response {
             raw,
             history_id: None,
             received: None,
+            attacked: None,
             text: OnceLock::new(),
         })
     }
@@ -159,8 +163,14 @@ impl Response {
             raw: Vec::new(),
             history_id: None,
             received: None,
+            attacked: None,
             text: OnceLock::new(),
         }
+    }
+
+    /// Whether `evidence` is in the head or the decoded body.
+    fn shows(&self, evidence: &str) -> bool {
+        !evidence.is_empty() && (self.head_text().contains(evidence) || self.body_str().contains(evidence))
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
@@ -249,6 +259,8 @@ struct Shared {
     deadline: Option<Instant>,
     limiter: Option<Limiter>,
     requests: AtomicU64,
+    /// See [`ActiveSummary::failed_requests`].
+    failed_requests: AtomicU64,
     reports: Mutex<mpsc::Sender<Report>>,
     raised: Mutex<BTreeMap<&'static str, usize>>,
     /// Findings not raised because their confidence was below their rule's threshold.
@@ -519,6 +531,11 @@ impl Cx {
             Err(e) => {
                 if let Some(id) = id {
                     self.failed.lock().unwrap().insert(given.to_vec(), id);
+                    // A row means it was to go out (scope refusals have none); a request rule
+                    // that blocked it isn't the target's failure.
+                    if !matches!(e, Error::Blocked(_)) {
+                        self.shared.failed_requests.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 return Err(e);
             }
@@ -600,6 +617,7 @@ impl Cx {
     pub async fn send_following_to(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
         let mut target = target.clone();
         let mut resp = self.send_to(&target, request).await?;
+        let mut attacked = None;
         for _ in 0..5 {
             if !matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
                 break;
@@ -615,8 +633,11 @@ impl Cx {
                 pq.push_str(q);
             }
             let req = RawRequest::from_bytes(self.request_for("GET", &pq)).set_header("Host", &target.host_header());
-            resp = self.send_to(&target, req.into_bytes()).await?;
+            let next = self.send_to(&target, req.into_bytes()).await?;
+            let previous = std::mem::replace(&mut resp, next);
+            attacked.get_or_insert_with(|| Box::new(previous));
         }
+        resp.attacked = attacked;
         Ok(resp)
     }
 
@@ -643,8 +664,17 @@ impl Cx {
         matches!(cache.get(&origin), Some(Some((status, sig))) if *status == resp.status && *sig == signature(resp))
     }
 
-    /// Records a finding with the exchange that proves it.
-    pub fn report(&self, finding: Finding, resp: &Response) {
+    /// Records a finding with the exchange that proves it. A response reached by following
+    /// redirects is filed under the request the rule attacked, with that request's own
+    /// response (see [`followed`]).
+    pub fn report(&self, mut finding: Finding, resp: &Response) {
+        let resp = match resp.attacked.as_deref() {
+            Some(attacked) => {
+                finding = followed(finding, attacked, resp);
+                attacked
+            }
+            None => resp,
+        };
         if !self.passes(&finding, finding.confidence) {
             return;
         }
@@ -724,6 +754,8 @@ impl Cx {
             return;
         }
         self.shared.oob_payloads.fetch_add(1, Ordering::Relaxed);
+        // The request that carried the payload, not a redirect it was answered with.
+        let resp = resp.map(|r| r.attacked.as_deref().unwrap_or(r));
         // The attack's row: the one its response came from, or the one of the attack that
         // failed. Correlating then records no second row for it.
         let history_id = match resp {
@@ -744,15 +776,45 @@ impl Cx {
     }
 }
 
+/// A finding a rule judged on `last`, the end of the redirects the attacked request's
+/// response (`attacked`) started, as it is filed under the attacked request. The page a
+/// redirect leads to is another request, which may show what this or another attack stored
+/// (a profile page showing a saved URL) or fail for its own reasons, so evidence that the
+/// attacked response doesn't show itself is low confidence, and other info names the page.
+fn followed(mut finding: Finding, attacked: &Response, last: &Response) -> Finding {
+    if attacked.shows(&finding.evidence) {
+        return finding;
+    }
+    let line = last.request.split(|&b| b == b'\r' || b == b'\n').next().unwrap_or_default();
+    let line = String::from_utf8_lossy(line);
+    let line = line.rsplit_once(' ').map_or(&*line, |(start, _version)| start);
+    let row = last.history_id.map(|id| format!(" (history {id})")).unwrap_or_default();
+    let note = format!(
+        "The attacked request was answered with a redirect ({}). What raised this was in the response to the \
+         request the redirect led to, {line}{row}, so it may come from stored input or from that page alone.",
+        attacked.status
+    );
+    finding.confidence = Confidence::Low;
+    finding.other_info = if finding.other_info.is_empty() { note } else { format!("{}\n\n{note}", finding.other_info) };
+    finding
+}
+
 /// The error a scan request's row keeps if it is given up unanswered.
 const ABANDONED: &str = "sent; no response recorded (the check timed out or the scan stopped)";
 
 /// The most reports the recorder takes off its queue before writing the rows among them.
 const ROW_BATCH: usize = 512;
 
+/// The id of the finding row `finding` on `msg` was filed in (new, or seen again).
+pub(crate) fn finding_id(store: &Store, msg: &Message, finding: &Finding) -> Result<Option<i64>> {
+    use rusqlite::OptionalExtension;
+    let key = crate::scan::findings_db::dedupe_key(finding.def.alert_ref, &msg.method, &msg.url, &finding.param);
+    Ok(store.conn.query_row("SELECT id FROM findings WHERE dedupe = ?1", [key], |r| r.get(0)).optional()?)
+}
+
 /// Records a finding (with its exchange's row, if it has none yet) or an out-of-band
-/// payload; returns the new findings.
-fn record_report(store: &mut Store, r: Report) -> Result<usize> {
+/// payload; returns how many findings were new, and the finding's id.
+fn record_report(store: &mut Store, r: Report) -> Result<(usize, Option<i64>)> {
     match r {
         Report::Finding { target, finding, history_id, base_history_id, request, response, duration_ms } => {
             let id = match history_id {
@@ -762,7 +824,8 @@ fn record_report(store: &mut Store, r: Report) -> Result<usize> {
                 }
             };
             let msg = Message::from_exchange(id, &target, &request, &response);
-            store.record_findings_from("active", &msg, std::slice::from_ref(&finding), base_history_id)
+            let new = store.record_findings_from("active", &msg, std::slice::from_ref(&finding), base_history_id)?;
+            Ok((new, finding_id(store, &msg, &finding)?))
         }
         Report::Oob { target, token, finding, request, response, duration_ms, history_id, base_history_id, check } => {
             store.oob_add_scan_payload(&ScanPayload {
@@ -780,7 +843,7 @@ fn record_report(store: &mut Store, r: Report) -> Result<usize> {
                 base_history_id,
                 check: check.as_deref(),
             })?;
-            Ok(0)
+            Ok((0, None))
         }
         Report::Row(_) => unreachable!("rows are written in batches"),
     }
@@ -925,8 +988,13 @@ pub struct ActiveSummary {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub below_threshold: BTreeMap<String, usize>,
     pub new_findings: usize,
+    /// The findings this scan raised, new or seen again (ids, ascending).
+    pub finding_ids: Vec<i64>,
     /// Rule units that crashed (panicked) instead of finishing.
     pub errors: usize,
+    /// Requests that went out and got no response: timed out, refused or reset. A target that
+    /// stops answering finds nothing, so many of these mean the scan's negatives say little.
+    pub failed_requests: u64,
     /// Check requests not sent because their method wasn't opted in (`check_methods`).
     pub check_skipped_methods: u64,
     /// Hosts the scope doesn't list that base requests named in their Host header, refused
@@ -1027,10 +1095,12 @@ pub async fn run(
     let (tx, rx) = mpsc::channel::<Report>();
     let mut store = Store::open(project)?;
     let match_rules = EngineRules::load(&store, Engine::Scan)?;
-    // It also keeps the ids of the rows it wrote, the ones pruning may delete.
-    let writer = std::thread::spawn(move || -> Result<(usize, Store, Vec<i64>)> {
+    // It also keeps the ids of the rows it wrote, the ones pruning may delete, and of the
+    // findings this scan filed.
+    let writer = std::thread::spawn(move || -> Result<(usize, Store, Vec<i64>, BTreeSet<i64>)> {
         let mut new = 0;
         let mut created = Vec::new();
+        let mut findings = BTreeSet::new();
         let mut rows = RowBatch::default();
         while let Ok(first) = rx.recv() {
             for r in std::iter::once(first).chain(rx.try_iter().take(ROW_BATCH)) {
@@ -1039,11 +1109,13 @@ pub async fn run(
                     continue;
                 }
                 created.extend(rows.write(&mut store).created);
-                new += record_report(&mut store, r)?;
+                let (n, id) = record_report(&mut store, r)?;
+                new += n;
+                findings.extend(id);
             }
             created.extend(rows.write(&mut store).created);
         }
-        Ok((new, store, created))
+        Ok((new, store, created, findings))
     });
     // A rule's own change to the Host is its test (Cloud Metadata names the metadata service),
     // so the rules' client lets those go; base requests are checked below.
@@ -1081,6 +1153,7 @@ pub async fn run(
         deadline: cfg.max_duration.map(|d| started + d),
         limiter: Limiter::new(cfg.rate),
         requests: AtomicU64::new(0),
+        failed_requests: AtomicU64::new(0),
         reports: Mutex::new(tx),
         raised: Mutex::new(BTreeMap::new()),
         below_threshold: Mutex::new(BTreeMap::new()),
@@ -1198,6 +1271,7 @@ pub async fn run(
     let below_threshold: BTreeMap<String, usize> =
         shared.below_threshold.lock().unwrap().iter().map(|(k, v)| (k.to_string(), *v)).collect();
     let requests = shared.requests.load(Ordering::Relaxed);
+    let failed_requests = shared.failed_requests.load(Ordering::Relaxed);
     let timed_out = shared.deadline.is_some_and(|d| Instant::now() >= d);
     let oob_payloads = shared.oob_payloads.load(Ordering::Relaxed);
     let oob_enabled = shared.oob.is_some();
@@ -1206,7 +1280,7 @@ pub async fn run(
     // Close the channel so the writer finishes.
     *shared.reports.lock().unwrap() = mpsc::channel().0;
     drop(shared);
-    let (mut new_findings, mut store, created) = tokio::task::spawn_blocking(move || writer.join())
+    let (mut new_findings, mut store, created, mut finding_ids) = tokio::task::spawn_blocking(move || writer.join())
         .await
         .map_err(|e| Error::Protocol(e.to_string()))?
         .map_err(|_| Error::Protocol("active scan writer panicked".into()))??;
@@ -1222,6 +1296,7 @@ pub async fn run(
             s.interactions += c.interactions;
             s.matched += c.matched;
             new_findings += c.new_findings;
+            finding_ids.extend(c.finding_ids);
             for r in c.raised {
                 *summary_raised.entry(r).or_default() += 1;
             }
@@ -1254,7 +1329,9 @@ pub async fn run(
         raised: summary_raised,
         below_threshold,
         new_findings,
+        finding_ids: finding_ids.into_iter().collect(),
         errors,
+        failed_requests,
         check_skipped_methods,
         http3_notes,
         refused_hosts,

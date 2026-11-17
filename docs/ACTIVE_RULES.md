@@ -73,7 +73,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | ID | Rule | Scope | Max risk | Alert refs |
 |---|---|---|---|---|
 | 0 | Directory Browsing | page | medium | 0 |
-| 6 | Path Traversal | param | high | 6-1, 6-2, 6-3, 6-4, 6-5 |
+| 6 | Path Traversal | param | high | 6-1, 6-2, 6-3 |
 | 7 | Remote File Inclusion | param | high | 7 |
 | 10045 | Source Code Disclosure - /WEB-INF Folder | host | high | 10045-1 |
 | 10047 | HTTPS Content Available via HTTP | page | low | 10047 |
@@ -166,6 +166,17 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   interaction goes to other info. Log4Shell puts the token in the JNDI path instead of
   `abc`, skips the DNS-only patterns in host mode, and has no Java technology filter. XXE's
   check #1 (ZAP's own callback service) is covered by check #2 and not run separately.
+- **No third-party hosts in payloads.** The scope guard covers brainproxy's own connections,
+  not what a target does with a URL it is sent, so no payload names a host outside the
+  engagement for the target to fetch:
+  - **Remote File Inclusion (7)** sends the OOB listener's URL instead of ZAP's
+    `www.google.com`, and the target fetching it raises the alert; without a listener it
+    sends nothing. The listener answers with an empty body, so it shows the URL was fetched,
+    not that its content was included, and the same fetch is also SSRF (40046).
+  - **External Redirect (20019)** redirects to a random host under `.invalid` (which never
+    resolves) instead of ZAP's under `owasp.org`. A browser only has to be sent there, so
+    redirects are found as before; an app that checks the host resolves before redirecting
+    isn't.
 - **Timing rules** port ZAP's TimingUtils regression; the sleep time is fixed at ZAP's
   default of 5 seconds. A passing high/low sequence is run a second time and must pass
   again (all time based rules: SQL 40019-40027, command injection 90037, MongoDB 90039,
@@ -243,6 +254,27 @@ those skips 40014. Prime and Spider never raise alerts themselves.
 - **HTML parsing and response comparison** use ports of ZAP's HtmlContextAnalyser and
   commonlib ComparableResponse on top of brainproxy's own lenient HTML parser (instead of
   Jericho); results can differ slightly on badly broken markup.
+- **Path Traversal (6)** doesn't run ZAP's check 5 (alert 6-5), which sends the URL's own
+  file name and reports a 200 where a random value got none: the status alone, which any
+  parameter that takes a name from a list gives, and a probe that would overwrite the app's
+  own script where the path is written to. It found nothing real on the OWASP Benchmark and
+  raised 15 false reports. The other checks report file contents only.
+- **Path Traversal (6) reads only files nothing can overwrite.** A parameter that names a
+  file the app *writes* (an upload saved under the name sent) truncates whatever it is given:
+  ZAP's `/etc/passwd` emptied the OWASP Benchmark container's. So the *nix check reads
+  `/proc/version` (made up by the kernel on every read; writing it fails, even as root,
+  evidence `Linux version …`), and the Windows check `Windows\System32\kernel32.dll` (owned by
+  TrustedInstaller and in use by every process, so not even SYSTEM may open it for writing;
+  evidence the PE header's `This program cannot be run in DOS mode`). The directory listings
+  can't be written to. ZAP's J2EE check (6-4, the app's own `WEB-INF/web.xml`, which a write
+  could replace) isn't run. What this gives up: *nix servers without a Linux `/proc` (BSDs,
+  macOS) are found only by a directory listing, and `web.xml` read through a parameter that
+  can't leave the web app's folder isn't found.
+- **Redirects followed:** a rule that follows redirects (as ZAP does) still files its
+  finding under the request it attacked, with that request's own response, not under the
+  page the redirect led to. When that response doesn't show the evidence itself (a POST
+  answered with a redirect to a page that shows what was saved), the finding is low
+  confidence and its other info names the page where the evidence was.
 - **"Not found" detection** uses 404 plus a soft-404 signature per host instead of ZAP's
   custom page configuration.
 - **WEB-INF source disclosure (10045)** detects served class files but does not decompile
