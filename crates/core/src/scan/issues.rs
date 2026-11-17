@@ -188,15 +188,32 @@ pub(crate) fn issue_for(conn: &Connection, alert_ref: &str, host: &str) -> Resul
     }
 }
 
-/// Puts a new finding in its issue and records that it was created. When the issue was
-/// decided as a whole (false positive or accepted risk), the finding takes that decision.
-pub(crate) fn created(
+/// Puts a new finding a scanner found in its issue and records that it was created. Triage
+/// made before it carries over: a suppression rule that matches it marks it a false positive,
+/// or else, when its issue was decided as a whole (false positive or accepted risk), it takes
+/// that decision. (A finding a person adds by hand is theirs to triage: see [`created`].)
+pub(crate) fn found(
     conn: &Connection,
     finding: i64,
     alert_ref: &str,
     host: &str,
     history_id: Option<i64>,
 ) -> Result<()> {
+    let issue = created(conn, finding, alert_ref, host, history_id)?;
+    if !crate::scan::findings_db::suppress_new(conn, finding, history_id)? {
+        inherit_decision(conn, finding, issue, history_id)?;
+    }
+    Ok(())
+}
+
+/// Puts a new finding in its issue and records that it was created. Returns the issue.
+pub(crate) fn created(
+    conn: &Connection,
+    finding: i64,
+    alert_ref: &str,
+    host: &str,
+    history_id: Option<i64>,
+) -> Result<i64> {
     let issue = issue_for(conn, alert_ref, host)?;
     conn.prepare_cached("UPDATE findings SET issue_id = ?1 WHERE id = ?2")?.execute(params![issue, finding])?;
     record(
@@ -210,7 +227,7 @@ pub(crate) fn created(
             ..Default::default()
         },
     )?;
-    inherit_decision(conn, finding, issue, history_id)
+    Ok(issue)
 }
 
 /// An issue's decision: the state its new instances arrive in, with its note and who made it.

@@ -1239,7 +1239,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 195 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 198 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -3036,6 +3036,22 @@ Findings are records with a history, not just rows:
   `findings issues` and `findings issue show` give `decision` (`state`, `note`, `origin`,
   `by`, `at`; null when there is none). Through MCP an agent can't change or end a person's
   decision.
+- **Suppression rules** (`findings suppress add --alert A --host H [--path-prefix /static/]
+  [--param P] --reason R`, `findings suppress list`, `findings suppress remove ID [--reopen]`):
+  an alert on a host, maybe only under a path or for one parameter, is a false positive
+  wherever a scan finds it, now and later. Matching findings are still stored, so nothing is
+  lost: they are marked `false_positive` (not a state of their own, so lists, reports,
+  `findings compare --fail-on` and rescans treat them as every false positive), with the
+  reason as their note, `suppressed_by` naming the rule, and a `state` event (`suppressed by
+  rule N: reason`), recorded as set by the person who added the rule. `add` marks the open
+  findings nobody triaged at once (`marked` counts them); findings added by hand and findings
+  someone triaged are left alone. A finding whose state is changed afterwards is no longer
+  the rule's. `list` gives each rule with `findings`, how many it still holds. `remove` stops
+  it marking new findings; `--reopen` also opens again those it still holds. Reports count
+  them among the false positives left out ("N of them by suppression rules",
+  `summary.suppressed` in JSON). Through MCP `add` and `remove` are refused: a rule decides
+  about findings nobody has seen yet, so a person makes it; an agent suggests marks on
+  findings instead.
 - **Listing:** `findings list` returns at most `--limit` rows (200; alert types, or findings
   with `--all`), from `--offset` on. `total` counts every row that matches, `count` the rows
   returned and `truncated` says more are left, so the next page is `--offset` plus `--limit`.

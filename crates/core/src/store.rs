@@ -123,12 +123,16 @@ ALTER TABLE oob_payloads ADD COLUMN base_history_id INTEGER;
 ";
 
 /// v22: triage that outlives the findings it was made on. An issue's decision (a whole issue
-/// marked false positive or accepted risk), which its new instances inherit.
+/// marked false positive or accepted risk), which its new instances inherit; suppression rules
+/// (an alert on a host, maybe under a path or for a parameter) that mark what they match a
+/// false positive, and on each finding the rule that did.
 const SCHEMA_V22: &str = "
 ALTER TABLE issues ADD COLUMN decision TEXT;
 ALTER TABLE issues ADD COLUMN decision_note TEXT;
 ALTER TABLE issues ADD COLUMN decision_origin TEXT;
 ALTER TABLE issues ADD COLUMN decision_at TEXT;
+ALTER TABLE findings ADD COLUMN suppressed_by INTEGER;
+CREATE TABLE IF NOT EXISTS suppressions (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), alert_ref TEXT NOT NULL, host TEXT NOT NULL, path_prefix TEXT NOT NULL DEFAULT '', param TEXT, reason TEXT NOT NULL, origin TEXT);
 ";
 
 /// Column documentation for the log of setting changes.

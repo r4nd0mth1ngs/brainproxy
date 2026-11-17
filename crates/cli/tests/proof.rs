@@ -368,3 +368,33 @@ fn a_whole_issue_s_decision_reaches_its_new_instances_and_an_agent_keeps_it() {
     assert!(md.contains("2 false positive"), "{md}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn suppression_rules_are_a_person_s_and_reports_say_what_they_left_out() {
+    let port = serve();
+    let (dir, project) = setup("suppress");
+    let base = format!("http://127.0.0.1:{port}");
+    ok(&project, &["send", "--url", &format!("{base}/static/a.js")]);
+    let rule = ["findings", "suppress", "add", "--alert", "10037", "--host", "127.0.0.1", "--path-prefix", "/static/"];
+    let mut by_agent = rule.to_vec();
+    by_agent.extend(["--reason", "agent thinks so"]);
+    let (code, v) = run_as(&project, &by_agent, None, true);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    let mut by_person = rule.to_vec();
+    by_person.extend(["--reason", "served by the CDN"]);
+    let added = ok(&project, &by_person);
+    assert_eq!(added["marked"], 1, "{added}");
+    let id = added["id"].to_string();
+    ok(&project, &["send", "--url", &format!("{base}/static/b.js")]);
+    ok(&project, &["send", "--url", &format!("{base}/page")]);
+    let listed = agent_ok(&project, &["findings", "suppress", "list"], None);
+    assert_eq!(listed["suppressions"][0]["findings"], 2, "{listed}");
+    let (code, v) = run_as(&project, &["findings", "suppress", "remove", &id], None, true);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    let open = ok(&project, &["findings", "list", "--all", "--alert", "10037"])["items"].clone();
+    assert_eq!(open.as_array().unwrap().len(), 1, "only /page is open work: {open}");
+    let md = ok(&project, &["report", "markdown"])["content"].as_str().unwrap().to_string();
+    assert!(md.contains("2 of them by suppression rules"), "{md}");
+    assert_eq!(ok(&project, &["findings", "suppress", "remove", &id, "--reopen"])["reopened"], 2);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

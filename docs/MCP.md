@@ -98,7 +98,10 @@ one `false_positive` with a note instead; the command refuses a tool call too); 
 refuses a tool call too); and `scan policy remove`, since a saved scan policy may be a
 person's (the command refuses a tool call too); and `findings issue review` and
 `report-summary review`, since a person reviews what an agent drafted and an agent can't vouch
-for its own draft. (`connection review`, `browser open` and the `scan script` commands are left
+for its own draft; and `findings suppress add` and `findings suppress remove`, since a
+suppression rule decides about findings nobody has seen yet (an agent reads the rules with
+`findings_suppress_list`, and suggests marks on findings instead; both commands refuse a tool
+call too). (`connection review`, `browser open` and the `scan script` commands are left
 out too; see below.)
 `findings_list` returns a page: `limit` rows from `offset` on, with `total` and `truncated`,
 so an agent works through a large project page by page (`issue` lists one issue's findings).

@@ -216,6 +216,10 @@ pub enum FindingsCmd {
     /// Show, split, merge, or rename an issue.
     #[command(subcommand)]
     Issue(IssueCmd),
+    /// Suppression rules: an alert on a host (under a path, of a parameter) is a false positive
+    /// wherever a scan finds it, now and later.
+    #[command(subcommand)]
+    Suppress(SuppressCmd),
     /// A finding's timeline: found, triaged, noted, retested, moved between issues, seen again
     /// after it was fixed, removed; each with who did it and when.
     Timeline { id: i64 },
@@ -406,6 +410,48 @@ pub enum IssueCmd {
         /// text changed since isn't approved in its place.
         #[arg(long)]
         hash: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SuppressCmd {
+    /// Add a rule. The findings it matches that are open and nobody triaged become false
+    /// positives at once, and so does each one a scanner finds later.
+    #[command(after_help = "A matching finding is stored as usual and marked false_positive, with the \
+        reason as its note (unless it has one), suppressed_by naming the rule, and a state event on its \
+        timeline (\"suppressed by rule N: reason\"), all recorded as the person who added the rule set them. \
+        So it stays out of `findings list` and reports by default (which count it among the false \
+        positives left out), out of `findings compare --fail-on`, and survives a rescan, while `--state \
+        all` still shows it. Findings added by hand and findings a person or agent triaged are left as \
+        they are. --alert matches an alert ref or a rule id (10020 or 10020-1), --host the finding's \
+        host exactly, --path-prefix the start of its URL's path, --param its parameter exactly. Refused \
+        through MCP: an agent suggests marks on findings instead (`findings mark ID --suggest`).")]
+    Add {
+        /// Alert ref or rule id, e.g. 10020 or 10020-1.
+        #[arg(long)]
+        alert: String,
+        /// The host, e.g. app.test.
+        #[arg(long)]
+        host: String,
+        /// Only findings whose URL path starts with this, e.g. /static/.
+        #[arg(long, value_name = "PATH")]
+        path_prefix: Option<String>,
+        /// Only findings of this parameter, header or cookie.
+        #[arg(long)]
+        param: Option<String>,
+        /// Why these are false positives; each finding it marks gets it as its note.
+        #[arg(long)]
+        reason: String,
+    },
+    /// The rules, with how many findings each has marked that are still false positives by it.
+    List,
+    /// Remove a rule: findings found later are no longer marked by it. Refused through MCP.
+    Remove {
+        id: i64,
+        /// Also open again the findings it marked that are still false positives by it
+        /// (otherwise they keep the state).
+        #[arg(long)]
+        reopen: bool,
     },
 }
 
@@ -1343,6 +1389,64 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 let issue = store.issue_get(id).ok();
                 let shown = issue.as_ref().map(|i| i["title"].clone()).unwrap_or(json!(title));
                 out.ok(json!({"id": id, "title": shown}), || format!("issue {id} is now {shown}"));
+            }
+        },
+        FindingsCmd::Suppress(cmd) => match cmd {
+            SuppressCmd::Add { alert, host, path_prefix, param, reason } => {
+                if crate::mcp::in_tool_call() {
+                    return Err(Error::InvalidInput(
+                        "findings suppress add is refused through MCP: a person decides what is suppressed; \
+                         suggest marks on the findings instead (`findings mark ID --suggest --state false_positive \
+                         --note ...`)"
+                            .into(),
+                    ));
+                }
+                let rule = brainproxy_core::scan::findings_db::Suppression {
+                    alert,
+                    host,
+                    path_prefix: path_prefix.unwrap_or_default(),
+                    param,
+                    reason,
+                };
+                let (id, marked) = store.suppression_add(&rule)?;
+                out.ok(json!({"id": id, "marked": marked}), || {
+                    format!("added suppression rule {id}; it marked {marked} finding(s) false positive")
+                });
+            }
+            SuppressCmd::List => {
+                let rules = store.suppressions_list()?;
+                out.ok(json!({"count": rules.len(), "suppressions": rules}), || {
+                    if rules.is_empty() {
+                        return "no suppression rules".into();
+                    }
+                    rules
+                        .iter()
+                        .map(|r| {
+                            format!(
+                                "{:>4}  {:<10} {} {}{}  {} finding(s)  {}",
+                                r["id"],
+                                r["alert_ref"].as_str().unwrap_or(""),
+                                r["host"].as_str().unwrap_or(""),
+                                r["path_prefix"].as_str().unwrap_or(""),
+                                r["param"].as_str().map(|p| format!(" param {p}")).unwrap_or_default(),
+                                r["findings"],
+                                crate::output::escape_lines(r["reason"].as_str().unwrap_or(""))
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
+            }
+            SuppressCmd::Remove { id, reopen } => {
+                if crate::mcp::in_tool_call() {
+                    return Err(Error::InvalidInput(
+                        "findings suppress remove is refused through MCP: a person's rule stays theirs".into(),
+                    ));
+                }
+                let reopened = store.suppression_remove(id, reopen)?;
+                out.ok(json!({"id": id, "reopened": reopened}), || {
+                    format!("removed suppression rule {id}; {reopened} finding(s) open again")
+                });
             }
         },
         FindingsCmd::Timeline { id } => {

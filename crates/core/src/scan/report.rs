@@ -203,6 +203,8 @@ pub struct Summary {
     /// Every finding matching the other filters that the state filter leaves out because it
     /// was dismissed (false positive, accepted risk or fixed), by state and by who set it.
     pub left_out: Vec<StateCount>,
+    /// Of the false positives left out, how many a suppression rule (`findings suppress`) marked.
+    pub suppressed: usize,
     /// How many places a secret was masked in; None when the report isn't redacted.
     pub redacted: Option<usize>,
 }
@@ -697,6 +699,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
     };
     let mut left_out: Vec<StateCount> = Vec::new();
     let mut agent_false_positives = Vec::new();
+    let mut suppressed = 0;
     if !dismissed.is_empty() {
         let hidden = FindingFilter { state: Some(dismissed.join(",")), ..opts.filter.clone() };
         let (h_where, h_args) = hidden.sql();
@@ -709,6 +712,14 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
                 Ok(StateCount { state: r.get(0)?, origin: r.get(1)?, count: r.get::<_, i64>(2)? as usize })
             })?
             .collect::<std::result::Result<_, _>>()?;
+        let n: i64 = conn.query_row(
+            &format!(
+                "SELECT count(*) FROM findings WHERE {h_where} AND state = 'false_positive' AND suppressed_by IS NOT NULL"
+            ),
+            rusqlite::params_from_iter(h_args.iter()),
+            |r| r.get(0),
+        )?;
+        suppressed = usize::try_from(n).unwrap_or(0);
         let mut stmt = conn.prepare(&format!(
             "SELECT id, state, name, risk, method, url, param, state_changed_at, note FROM findings
              WHERE {h_where} AND state_origin = 'mcp' ORDER BY risk_level DESC, id LIMIT {MAX_AGENT_FALSE_POSITIVES}"
@@ -785,6 +796,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             by_risk,
             false_positives_left_out,
             left_out,
+            suppressed,
             redacted: None,
         },
         alerts: groups,
@@ -1123,7 +1135,10 @@ fn left_out_text(r: &Report) -> Option<String> {
                 None => by.push((w, c.count)),
             }
         }
-        let by: Vec<String> = by.iter().map(|(w, k)| format!("{k} {w}")).collect();
+        let mut by: Vec<String> = by.iter().map(|(w, k)| format!("{k} {w}")).collect();
+        if state == "false_positive" && r.summary.suppressed > 0 {
+            by.push(format!("{} of them by suppression rules", r.summary.suppressed));
+        }
         parts.push(format!("{n} {} ({})", state.replace('_', " "), by.join(", ")));
     }
     Some(format!(

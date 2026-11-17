@@ -109,6 +109,12 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("note_origin", "TEXT", "gui, cli or mcp: who last set the note with `findings mark --note`; NULL if never set"),
     ("note_changed_at", "TEXT", "UTC time the note was last set"),
     ("issue_id", "INTEGER", "The issue (root cause: alert type and host) it is an instance of; join issues"),
+    (
+        "suppressed_by",
+        "INTEGER",
+        "The suppression rule (suppressions.id, `findings suppress`) that marked it a false positive; NULL when none \
+         did, or once its state was changed since",
+    ),
 ];
 
 /// Column documentation for the alert types.
@@ -180,6 +186,7 @@ pub(crate) fn mark_with(
         "UPDATE findings SET state = COALESCE(?1, state),
             note = CASE WHEN ?2 IS NULL THEN note ELSE NULLIF(?2, '') END,
             state_origin = CASE WHEN ?1 IS NULL OR ?1 = state THEN state_origin ELSE ?4 END,
+            suppressed_by = CASE WHEN ?1 IS NULL OR ?1 = state THEN suppressed_by ELSE NULL END,
             state_changed_at = CASE WHEN ?1 IS NULL OR ?1 = state THEN state_changed_at
                 ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END,
             note_origin = CASE WHEN ?2 IS NULL THEN note_origin ELSE ?4 END,
@@ -212,6 +219,114 @@ pub(crate) fn mark_with(
         }
     }
     Ok(())
+}
+
+/// Column documentation for the suppression rules (`findings suppress`).
+pub const SUPPRESSION_COLUMNS: &[(&str, &str, &str)] = &[
+    ("id", "INTEGER", "Rule id"),
+    ("time", "TEXT", "When it was added"),
+    ("alert_ref", "TEXT", "Alert ref or rule id it matches (findings.alert_ref, or findings.rule_id as text)"),
+    ("host", "TEXT", "Host it matches (findings.host, lowercase)"),
+    ("path_prefix", "TEXT", "Only findings whose URL path starts with this; '' for any path"),
+    ("param", "TEXT", "Only findings of this parameter, header or cookie; NULL for any"),
+    ("reason", "TEXT", "Why: the note of each finding it marks"),
+    ("origin", "TEXT", "Who added it: gui or cli (agents can't)"),
+];
+
+/// A suppression rule to add: findings of `alert` on `host` (under `path_prefix`, of `param`)
+/// are false positives, for `reason`, now and whenever a scanner finds one again.
+#[derive(Debug, Clone, Default)]
+pub struct Suppression {
+    pub alert: String,
+    pub host: String,
+    pub path_prefix: String,
+    pub param: Option<String>,
+    pub reason: String,
+}
+
+/// A stored rule, as matching needs it.
+struct Rule {
+    id: i64,
+    path_prefix: String,
+    param: Option<String>,
+    reason: String,
+    origin: Option<String>,
+}
+
+impl Rule {
+    fn matches(&self, url: &str, param: &str) -> bool {
+        if self.param.as_deref().is_some_and(|p| p != param) {
+            return false;
+        }
+        if self.path_prefix.is_empty() {
+            return true;
+        }
+        url::Url::parse(&identity_url(url)).is_ok_and(|u| u.path().starts_with(&self.path_prefix))
+    }
+}
+
+/// The rules for `alert_ref` (or its rule id) on `host`, oldest first.
+fn rules_for(conn: &rusqlite::Connection, alert_ref: &str, rule_id: i64, host: &str) -> Result<Vec<Rule>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, path_prefix, param, reason, origin FROM suppressions
+         WHERE (alert_ref = ?1 OR alert_ref = CAST(?2 AS TEXT)) AND host = lower(?3) ORDER BY id",
+    )?;
+    let rules = stmt
+        .query_map(params![alert_ref, rule_id, host], |r| {
+            Ok(Rule { id: r.get(0)?, path_prefix: r.get(1)?, param: r.get(2)?, reason: r.get(3)?, origin: r.get(4)? })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rules)
+}
+
+/// Marks an open finding nobody triaged a false positive by `rule`, as the rule's author set
+/// it (an agent can't undo it either), with the reason as its note when it has none, and a
+/// state event that names the rule. Returns whether it changed.
+fn suppress_by(conn: &rusqlite::Connection, finding: i64, rule: &Rule, history_id: Option<i64>) -> Result<bool> {
+    let n = conn
+        .prepare_cached(
+            "UPDATE findings SET state = 'false_positive', state_origin = ?2, suppressed_by = ?3,
+                state_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                note_origin = CASE WHEN note IS NULL THEN ?2 ELSE note_origin END,
+                note_changed_at = CASE WHEN note IS NULL THEN strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                    ELSE note_changed_at END,
+                note = COALESCE(note, ?4)
+             WHERE id = ?1 AND state = 'open' AND source != ?5
+                AND (state_origin IS NULL OR state_origin = ?6)",
+        )?
+        .execute(params![finding, rule.origin, rule.id, rule.reason, MANUAL_SOURCE, crate::provenance::SCANNER])?;
+    if n == 0 {
+        return Ok(false);
+    }
+    let text = format!("suppressed by rule {}: {}", rule.id, rule.reason);
+    crate::scan::issues::record(
+        conn,
+        &crate::scan::issues::Event {
+            origin: rule.origin.as_deref(),
+            finding: Some(finding),
+            kind: "state",
+            old: Some("open"),
+            new: Some("false_positive"),
+            text: Some(&text),
+            history_id,
+            ..Default::default()
+        },
+    )?;
+    Ok(true)
+}
+
+/// A new finding a scanner found, matched against the suppression rules: the first (oldest)
+/// that matches marks it. Returns whether one did.
+pub(crate) fn suppress_new(conn: &rusqlite::Connection, finding: i64, history_id: Option<i64>) -> Result<bool> {
+    let (alert_ref, rule_id, host, url, param): (String, i64, String, String, String) = conn
+        .prepare_cached("SELECT alert_ref, rule_id, host, url, param FROM findings WHERE id = ?1")?
+        .query_row([finding], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+    for rule in rules_for(conn, &alert_ref, rule_id, &host)? {
+        if rule.matches(&url, &param) {
+            return suppress_by(conn, finding, &rule, history_id);
+        }
+    }
+    Ok(false)
 }
 
 /// The findings of an issue that aren't removed; an issue with none is not found.
@@ -724,7 +839,7 @@ impl Store {
                 )?;
                 if id > before && created.insert(id) {
                     new += 1;
-                    crate::scan::issues::created(&tx, id, d.alert_ref, &msg.host, Some(msg.history_id))?;
+                    crate::scan::issues::found(&tx, id, d.alert_ref, &msg.host, Some(msg.history_id))?;
                     continue;
                 }
                 if let Some(old) = old_risk.as_deref().filter(|old| *old != now_risk) {
@@ -820,7 +935,7 @@ impl Store {
         let sql = format!(
             "SELECT id, alert_ref, name, risk, confidence, host, method, url, param, substr(evidence, 1, 300),
                 hits, history_id, state, origin, state_origin, state_changed_at, note_origin, note_changed_at, source,
-                issue_id
+                issue_id, suppressed_by
              FROM findings WHERE {where_sql} ORDER BY risk_level DESC, id LIMIT {limit} OFFSET {offset}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -846,6 +961,7 @@ impl Store {
                 "note_changed_at": r.get::<_, Option<String>>(17)?,
                 "source": r.get::<_, String>(18)?,
                 "issue_id": r.get::<_, Option<i64>>(19)?,
+                "suppressed_by": r.get::<_, Option<i64>>(20)?,
             }))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -934,6 +1050,125 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Adds a suppression rule and applies it to the findings it matches that are open and
+    /// nobody triaged (a person's decision stays theirs). A person adds rules: under an MCP
+    /// tool call it is refused. Returns the rule's id and how many findings it marked.
+    pub fn suppression_add(&mut self, s: &Suppression) -> Result<(i64, usize)> {
+        if crate::provenance::origin() == "mcp" {
+            return Err(Error::InvalidInput(
+                "a suppression rule is a person's decision about findings not yet seen; suggest marking the \
+                 findings instead (`findings mark ID --suggest --state false_positive --note ...`)"
+                    .into(),
+            ));
+        }
+        let alert = s.alert.trim();
+        let host = s.host.trim().to_ascii_lowercase();
+        let reason = s.reason.trim();
+        let prefix = s.path_prefix.trim();
+        if alert.is_empty() {
+            return Err(Error::InvalidInput("give the alert ref or rule id it suppresses (--alert)".into()));
+        }
+        if host.is_empty() || host.contains(['/', ' ']) {
+            return Err(Error::InvalidInput(format!("--host {host:?}: give a host name, such as app.test")));
+        }
+        if reason.is_empty() {
+            return Err(Error::InvalidInput("give the reason (--reason): it is the note of each finding".into()));
+        }
+        if !prefix.is_empty() && !prefix.starts_with('/') {
+            return Err(Error::InvalidInput(format!("--path-prefix {prefix:?}: a path starts with /")));
+        }
+        let tx = self.write_tx()?;
+        tx.execute(
+            "INSERT INTO suppressions (alert_ref, host, path_prefix, param, reason, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![alert, host, prefix, s.param, reason, crate::provenance::origin()],
+        )?;
+        let id = tx.last_insert_rowid();
+        let rule = Rule {
+            id,
+            path_prefix: prefix.to_string(),
+            param: s.param.clone(),
+            reason: reason.to_string(),
+            origin: Some(crate::provenance::origin().to_string()),
+        };
+        let found: Vec<(i64, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, url, param FROM findings WHERE (alert_ref = ?1 OR CAST(rule_id AS TEXT) = ?1)
+                    AND host = ?2 AND state = 'open' ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![alert, host], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut marked = 0;
+        for (finding, url, param) in found {
+            if rule.matches(&url, &param) && suppress_by(&tx, finding, &rule, None)? {
+                marked += 1;
+            }
+        }
+        tx.commit()?;
+        Ok((id, marked))
+    }
+
+    /// The suppression rules, oldest first, with how many findings each marked that are still
+    /// false positives by it.
+    pub fn suppressions_list(&self) -> Result<Vec<Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.time, s.alert_ref, s.host, s.path_prefix, s.param, s.reason, s.origin,
+                (SELECT count(*) FROM findings f WHERE f.suppressed_by = s.id AND f.state = 'false_positive')
+             FROM suppressions s ORDER BY s.id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let origin: Option<String> = r.get(7)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "time": r.get::<_, String>(1)?,
+                "alert_ref": r.get::<_, String>(2)?,
+                "host": r.get::<_, String>(3)?,
+                "path_prefix": r.get::<_, String>(4)?,
+                "param": r.get::<_, Option<String>>(5)?,
+                "reason": r.get::<_, String>(6)?,
+                "by": crate::provenance::describe(origin.as_deref()),
+                "origin": origin,
+                "findings": r.get::<_, i64>(8)?,
+            }))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Removes a suppression rule: findings found later are no longer marked by it. With
+    /// `reopen`, the findings it marked that are still false positives by it are open again;
+    /// otherwise they keep the state. Refused under an MCP tool call, like adding one. Returns
+    /// how many findings were opened again.
+    pub fn suppression_remove(&mut self, id: i64, reopen: bool) -> Result<usize> {
+        if crate::provenance::origin() == "mcp" {
+            return Err(Error::InvalidInput(
+                "a suppression rule is a person's decision; an agent can't remove it (suggest reopening its \
+                 findings with `findings mark ID --suggest --state open`)"
+                    .into(),
+            ));
+        }
+        let tx = self.write_tx()?;
+        if tx.execute("DELETE FROM suppressions WHERE id = ?1", [id])? == 0 {
+            return Err(Error::NotFound(format!("suppression rule {id}")));
+        }
+        let mut reopened = 0;
+        if reopen {
+            let ids: Vec<i64> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM findings WHERE suppressed_by = ?1 AND state = 'false_positive' ORDER BY id",
+                )?;
+                let rows = stmt.query_map([id], |r| r.get(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            let cause = format!("suppression rule {id} removed");
+            for f in ids {
+                mark_with(&tx, f, Some("open"), None, Some((&cause, None)))?;
+                reopened += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(reopened)
     }
 
     /// [`Store::findings_mark`] for `ids` and every finding of `issues`, as one change. Each
@@ -2553,6 +2788,54 @@ mod tests {
     fn xpb(s: &Store) -> Vec<Value> {
         let all = FindingFilter { alert_ref: Some("10037".into()), state: Some("all".into()), ..Default::default() };
         s.findings_list(&all, 100).unwrap()
+    }
+
+    #[test]
+    fn suppression_rules_mark_what_they_match_now_and_later() {
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/x");
+        seen_at(&mut s, "/static/a.js");
+        let state_of = |s: &Store, path: &str| -> (String, Option<i64>, Option<String>) {
+            let f = xpb(s).into_iter().find(|f| f["url"].as_str().unwrap().ends_with(path)).unwrap();
+            let full = s.finding_get(f["id"].as_i64().unwrap()).unwrap();
+            (f["state"].as_str().unwrap().into(), f["suppressed_by"].as_i64(), full["note"].as_str().map(Into::into))
+        };
+        // A triaged finding is a person's decision: the rule leaves it.
+        let x = xpb(&s).into_iter().find(|f| f["url"].as_str().unwrap().ends_with("/x")).unwrap();
+        s.finding_mark(x["id"].as_i64().unwrap(), Some("confirmed"), None).unwrap();
+        let bad = Suppression { alert: "10037".into(), host: "app.test".into(), ..Default::default() };
+        assert!(matches!(s.suppression_add(&bad), Err(Error::InvalidInput(_))), "a reason is needed");
+        let rule = Suppression {
+            alert: "10037".into(),
+            host: "APP.test".into(),
+            path_prefix: "/static/".into(),
+            param: None,
+            reason: "static files are served by the CDN".into(),
+        };
+        let (id, marked) = s.suppression_add(&rule).unwrap();
+        assert_eq!(marked, 1);
+        assert_eq!(state_of(&s, "/static/a.js"), ("false_positive".into(), Some(id), Some(rule.reason.clone())));
+        assert_eq!(state_of(&s, "/x").0, "confirmed");
+        // Found later: marked on arrival, as the rule's author set it, and the timeline says why.
+        seen_at(&mut s, "/static/b.js");
+        seen_at(&mut s, "/y");
+        assert_eq!(state_of(&s, "/static/b.js").0, "false_positive");
+        assert_eq!(state_of(&s, "/y").0, "open");
+        let b = xpb(&s).into_iter().find(|f| f["url"].as_str().unwrap().ends_with("/static/b.js")).unwrap();
+        assert_eq!(b["state_origin"], "cli");
+        let last = s.finding_events(b["id"].as_i64().unwrap()).unwrap().pop().unwrap();
+        assert_eq!(last["text"], format!("suppressed by rule {id}: static files are served by the CDN"));
+        let list = s.suppressions_list().unwrap();
+        assert_eq!((list[0]["host"].as_str(), list[0]["findings"].as_i64()), (Some("app.test"), Some(2)));
+        // A person who changes one's state takes it from the rule.
+        s.finding_mark(b["id"].as_i64().unwrap(), Some("confirmed"), None).unwrap();
+        assert_eq!(state_of(&s, "/static/b.js"), ("confirmed".into(), None, Some(rule.reason.clone())));
+        // Removed with --reopen, what it still holds is open again; later sightings aren't marked.
+        assert_eq!(s.suppression_remove(id, true).unwrap(), 1);
+        assert_eq!(state_of(&s, "/static/a.js").0, "open");
+        seen_at(&mut s, "/static/c.js");
+        assert_eq!(state_of(&s, "/static/c.js").0, "open");
+        assert!(matches!(s.suppression_remove(id, false), Err(Error::NotFound(_))));
     }
 
     #[test]
