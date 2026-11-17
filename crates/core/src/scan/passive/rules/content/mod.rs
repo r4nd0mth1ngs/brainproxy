@@ -13,6 +13,7 @@ mod jso;
 mod jwt;
 mod link_target;
 mod modern_app;
+mod password_hash;
 mod pii;
 mod polyfill_cdn;
 mod private_address;
@@ -46,5 +47,6 @@ pub fn all() -> Vec<Box<dyn PassiveRule>> {
         Box::new(jsf_viewstate::InsecureJsfViewState),
         Box::new(vulnerable_js::VulnerableJs),
         Box::new(jwt::JwtIssues),
+        Box::new(password_hash::PasswordHash),
     ]
 }

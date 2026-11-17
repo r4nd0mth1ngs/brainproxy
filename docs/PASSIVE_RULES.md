@@ -21,6 +21,11 @@ tokens are samples in the code) one with `alg: none` (100008-2, high), one with 
 `exp` (100008-3, low), and one with a claim named like a secret, such as `password`,
 `client_secret`, `ssn` or `card_number` (100008-4, low). Tokens only the client sends are
 left to the active rule 100007, so a token isn't reported again on every request.
+**100020 Password Hash in Response** reports a hex digest (MD5, SHA-1, SHA-2) in a field
+named like a password (`password`, `passwordHash`, `pwd`, `hash`; not a reset token, salt
+or policy), once per field name (100020-1, high), and an Argon2 or Django PBKDF2 hash
+anywhere (100020-2, high). It reads text responses but not scripts, stylesheets or source
+maps, whose values are samples.
 
 ## Rules
 
@@ -82,6 +87,7 @@ left to the active rule 100007, so a token isn't reported again on every request
 | 100001 | PHP2Shell PHP Remote Code Execution (Indicative) | high | 100001 |
 | 100005 | HTTP/3 Offered (Alt-Svc) | info | 100005 |
 | 100008 | JWT Issues | high | 100008-1, 100008-2, 100008-3, 100008-4 |
+| 100020 | Password Hash in Response | high | 100020-1, 100020-2 |
 
 Not ported: ZapVersion (ZAP-specific), UsernameIdor (needs configured usernames).
 
@@ -178,3 +184,5 @@ data files:
   `http.server`, Tomcat and Go's `http.FileServer`, and names nginx's autoindex (ZAP: Apache,
   and not at all for `/`). A listing's title counts only with the listing's own markup, so
   an article titled "Directory listing for ..." doesn't.
+- **Hash Disclosure (10097)** reports BCrypt hashes written `$2b$` and `$2y$` at any cost
+  (ZAP: only `$2y$05$`), as Node's and Python's bcrypt and PHP's `password_hash` write them.

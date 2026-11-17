@@ -62,6 +62,9 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static AlertDef)>> = LazyLock::new(|| {
         (r"\$6\$rounds=[0-9]+\$[./0-9A-Za-z]{0,16}\$[./0-9A-Za-z]{86}", &SHA512_CRYPT),
         (r"\$2\$[0-9]{2}\$[./0-9A-Za-z]{53}", &BCRYPT),
         (r"\$2a\$[0-9]{2}\$[./0-9A-Za-z]{53}", &BCRYPT),
+        // Diverges from ZAP, which knows `$2b$` (Node's bcrypt, Python) and `$2y$` (PHP's
+        // password_hash) only at cost 05: every cost of them is the same BCrypt hash.
+        (r"\$2[by]\$[0-9]{2}\$[./0-9A-Za-z]{53}", &BCRYPT),
         (r"\$3\$\$[0-9a-f]{32}", &NTLM),
         (r"\$NT\$[0-9a-f]{32}", &NTLM),
     ]
@@ -71,7 +74,7 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static AlertDef)>> = LazyLock::new(|| {
 });
 
 /// Every pattern starts with one of these prefixes; most haystacks have none.
-static PREFILTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\$(?:lm|k4|2a|2y|1|5|6|2|3|nt)\$").unwrap());
+static PREFILTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\$(?:lm|k4|2a|2b|2y|1|5|6|2|3|nt)\$").unwrap());
 
 pub struct HashDisclosure;
 
@@ -133,6 +136,18 @@ mod tests {
         let f = msg("https://a.test/").req_body(bf).scan(&HashDisclosure);
         let refs: Vec<&str> = f.iter().map(|f| f.def.alert_ref).collect();
         assert_eq!(refs, ["10097-3", "10097-7"]);
+    }
+
+    /// Node's bcrypt and Python write `$2b$`, PHP's password_hash `$2y$10$`.
+    #[test]
+    fn flags_bcrypt_of_every_variant_and_cost() {
+        let b = "$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
+        let y = "$2y$12$QjSH496pcT5CEbzjD/vtVeH03tfHKFy36d4J0Ltp3lRtee9HDxY3K";
+        let body = format!(r#"{{"users":[{{"hash":"{b}"}},{{"hash":"{y}"}}]}}"#);
+        let f = msg("https://a.test/api/users").header("Content-Type", "application/json").body(&body);
+        let got: Vec<(&str, String)> =
+            f.scan(&HashDisclosure).iter().map(|f| (f.def.alert_ref, f.evidence.clone())).collect();
+        assert_eq!(got, [("10097-7", b.to_string()), ("10097-7", y.to_string())]);
     }
 
     #[test]
