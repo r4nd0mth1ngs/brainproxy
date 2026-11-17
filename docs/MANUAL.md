@@ -1239,7 +1239,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 198 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 199 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -3052,6 +3052,21 @@ Findings are records with a history, not just rows:
   `summary.suppressed` in JSON). Through MCP `add` and `remove` are refused: a rule decides
   about findings nobody has seen yet, so a person makes it; an agent suggests marks on
   findings instead.
+- **Your own rating** (`findings rate ID... | --issue ISSUE [--risk R] [--confidence C]
+  --reason TEXT`, `findings rate ... --clear`): a scanner finding rated as you see it, such as
+  a missing header on an internal host down to low, or a confirmed injection up to critical.
+  The rating is the finding's `risk` and `confidence` from then on, so `findings list`, its
+  filters and order, `findings issues`, reports, "Fix these first" and `findings compare
+  --fail-on` all use it; a later sighting doesn't change it. The scanner's own rating is kept
+  beside it (`rated` in `findings list --all`: `scanner_risk`, `scanner_confidence`, `reason`,
+  `by`, `at`; `scanner_risk` and `rated_*` in `findings show`; `rated` on each instance of
+  `report json`) and goes on being raised by higher sightings, so `--clear` gives back what the
+  scanner says now. Reports print the rating next to the scanner's ("rated low ... by a person,
+  the scanner said medium ...: reason"). Each change is a `rated` event on the timeline.
+  `--issue` rates every scanner finding of the issue, and the findings it gets later arrive
+  rated too (`rating` in `findings issues`); `--clear --issue` ends that. Findings added by hand
+  keep the risk they were given (`findings edit --risk`). Refused through MCP: an agent
+  suggests a rating with `findings mark ID --suggest --note ...`.
 - **Listing:** `findings list` returns at most `--limit` rows (200; alert types, or findings
   with `--all`), from `--offset` on. `total` counts every row that matches, `count` the rows
   returned and `truncated` says more are left, so the next page is `--offset` plus `--limit`.

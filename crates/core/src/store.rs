@@ -125,8 +125,21 @@ ALTER TABLE oob_payloads ADD COLUMN base_history_id INTEGER;
 /// v22: triage that outlives the findings it was made on. An issue's decision (a whole issue
 /// marked false positive or accepted risk), which its new instances inherit; suppression rules
 /// (an alert on a host, maybe under a path or for a parameter) that mark what they match a
-/// false positive, and on each finding the rule that did.
+/// false positive, and on each finding the rule that did; a person's own rating of a scanner
+/// finding (risk, confidence) in place of the scanner's, kept beside it, and an issue's, which
+/// its new instances take.
 const SCHEMA_V22: &str = "
+ALTER TABLE findings ADD COLUMN scanner_risk TEXT;
+ALTER TABLE findings ADD COLUMN scanner_risk_level INTEGER;
+ALTER TABLE findings ADD COLUMN scanner_confidence TEXT;
+ALTER TABLE findings ADD COLUMN rated_reason TEXT;
+ALTER TABLE findings ADD COLUMN rated_origin TEXT;
+ALTER TABLE findings ADD COLUMN rated_at TEXT;
+ALTER TABLE issues ADD COLUMN rating_risk TEXT;
+ALTER TABLE issues ADD COLUMN rating_confidence TEXT;
+ALTER TABLE issues ADD COLUMN rating_reason TEXT;
+ALTER TABLE issues ADD COLUMN rating_origin TEXT;
+ALTER TABLE issues ADD COLUMN rating_at TEXT;
 ALTER TABLE issues ADD COLUMN decision TEXT;
 ALTER TABLE issues ADD COLUMN decision_note TEXT;
 ALTER TABLE issues ADD COLUMN decision_origin TEXT;

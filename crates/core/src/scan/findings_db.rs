@@ -115,6 +115,16 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
         "The suppression rule (suppressions.id, `findings suppress`) that marked it a false positive; NULL when none \
          did, or once its state was changed since",
     ),
+    (
+        "scanner_risk",
+        "TEXT",
+        "While a person's rating (`findings rate`) holds: the scanner's own risk (risk is the person's); NULL otherwise",
+    ),
+    ("scanner_risk_level", "INTEGER", "scanner_risk as a level"),
+    ("scanner_confidence", "TEXT", "While a person's rating holds: the scanner's own confidence"),
+    ("rated_reason", "TEXT", "Why a person rated it"),
+    ("rated_origin", "TEXT", "gui or cli: who rated it; NULL when the scanner's rating stands"),
+    ("rated_at", "TEXT", "When it was rated"),
 ];
 
 /// Column documentation for the alert types.
@@ -219,6 +229,145 @@ pub(crate) fn mark_with(
         }
     }
     Ok(())
+}
+
+/// A person's rating of scanner findings: a risk and/or a confidence (the one left out stays
+/// as it is), and why.
+#[derive(Debug, Clone, Copy)]
+pub struct Rating<'a> {
+    pub risk: Option<&'a str>,
+    pub confidence: Option<&'a str>,
+    pub reason: &'a str,
+}
+
+/// "medium/high": a risk and confidence, as a rating event records them.
+fn rating_text(risk: &str, confidence: &str) -> String {
+    format!("{risk}/{confidence}")
+}
+
+/// Rates a scanner finding as a person sees it: `risk` and/or `confidence` (the one left out
+/// stays) in place of the scanner's, which is kept beside it (scanner_risk, scanner_confidence)
+/// while the rating holds, with `reason`, by `origin`, and a `rated` event on its timeline
+/// (`text`, else the reason). Lists, filters, reports and gates use the rating. A finding
+/// added by hand has its own risk to edit. Returns whether anything changed.
+pub(crate) fn rate_one(
+    conn: &rusqlite::Connection,
+    id: i64,
+    rating: &Rating<'_>,
+    origin: &str,
+    text: Option<&str>,
+    history_id: Option<i64>,
+) -> Result<bool> {
+    let Rating { risk, confidence, reason } = *rating;
+    type Row = (String, String, String, String, Option<String>, Option<String>);
+    let (source, state, old_risk, old_confidence, old_reason, rated_by): Row = conn
+        .prepare_cached(
+            "SELECT source, state, risk, confidence, rated_reason, rated_origin FROM findings WHERE id = ?1",
+        )?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("finding {id}")))?;
+    if source == MANUAL_SOURCE {
+        return Err(Error::InvalidInput(format!(
+            "finding {id} was added by hand: its risk and confidence are its own (`findings edit {id} --risk ...`)"
+        )));
+    }
+    if state == REMOVED {
+        return Err(Error::Conflict(format!("finding {id} was removed")));
+    }
+    let new_risk = risk.unwrap_or(&old_risk);
+    let new_confidence = confidence.unwrap_or(&old_confidence);
+    let level = Risk::parse(new_risk).ok_or_else(|| Error::InvalidInput(format!("unknown risk {new_risk:?}")))?.level();
+    if Confidence::parse(new_confidence).is_none() {
+        return Err(Error::InvalidInput(format!("unknown confidence {new_confidence:?}")));
+    }
+    if rated_by.is_some()
+        && new_risk == old_risk
+        && new_confidence == old_confidence
+        && old_reason.as_deref() == Some(reason)
+    {
+        return Ok(false);
+    }
+    conn.prepare_cached(
+        "UPDATE findings SET
+            scanner_risk = CASE WHEN rated_origin IS NULL THEN risk ELSE scanner_risk END,
+            scanner_risk_level = CASE WHEN rated_origin IS NULL THEN risk_level ELSE scanner_risk_level END,
+            scanner_confidence = CASE WHEN rated_origin IS NULL THEN confidence ELSE scanner_confidence END,
+            risk = ?2, risk_level = ?3, confidence = ?4, rated_reason = ?5, rated_origin = ?6,
+            rated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ?1",
+    )?
+    .execute(params![id, new_risk, level, new_confidence, reason, origin])?;
+    crate::scan::issues::record(
+        conn,
+        &crate::scan::issues::Event {
+            origin: Some(origin),
+            finding: Some(id),
+            kind: "rated",
+            old: Some(&rating_text(&old_risk, &old_confidence)),
+            new: Some(&rating_text(new_risk, new_confidence)),
+            text: Some(text.unwrap_or(reason)),
+            history_id,
+            ..Default::default()
+        },
+    )?;
+    Ok(true)
+}
+
+/// Gives a rated finding the scanner's rating back (the highest its sightings gave since).
+/// Returns whether it was rated.
+fn unrate_one(conn: &rusqlite::Connection, id: i64) -> Result<bool> {
+    let row: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT risk, confidence, scanner_risk, scanner_confidence FROM findings
+             WHERE id = ?1 AND rated_origin IS NOT NULL",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((risk, confidence, scanner_risk, scanner_confidence)) = row else {
+        return Ok(false);
+    };
+    conn.execute(
+        "UPDATE findings SET risk = scanner_risk, risk_level = scanner_risk_level, confidence = scanner_confidence,
+            scanner_risk = NULL, scanner_risk_level = NULL, scanner_confidence = NULL,
+            rated_reason = NULL, rated_origin = NULL, rated_at = NULL
+         WHERE id = ?1",
+        [id],
+    )?;
+    crate::scan::issues::record(
+        conn,
+        &crate::scan::issues::Event {
+            finding: Some(id),
+            kind: "rated",
+            old: Some(&rating_text(&risk, &confidence)),
+            new: Some(&rating_text(&scanner_risk, &scanner_confidence)),
+            text: Some("the scanner's rating again"),
+            ..Default::default()
+        },
+    )?;
+    Ok(true)
+}
+
+/// A finding's rating as lists show it: null when the scanner's stands.
+fn rated_json(
+    reason: Option<String>,
+    origin: Option<String>,
+    at: Option<String>,
+    scanner_risk: Option<String>,
+    scanner_confidence: Option<String>,
+) -> Value {
+    match origin {
+        None => Value::Null,
+        Some(o) => json!({
+            "scanner_risk": scanner_risk,
+            "scanner_confidence": scanner_confidence,
+            "reason": reason,
+            "by": crate::provenance::describe(Some(&o)),
+            "origin": o,
+            "at": at,
+        }),
+    }
 }
 
 /// Column documentation for the suppression rules (`findings suppress`).
@@ -774,9 +923,14 @@ impl Store {
                     base_history_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18, ?19, ?20)
                  ON CONFLICT(dedupe) DO UPDATE SET hits = hits + 1, last_history_id = excluded.last_history_id,
-                    risk = CASE WHEN hits = 0 OR excluded.risk_level > risk_level THEN excluded.risk ELSE risk END,
-                    risk_level = CASE WHEN hits = 0 THEN excluded.risk_level
-                        ELSE max(risk_level, excluded.risk_level) END
+                    risk = CASE WHEN rated_origin IS NOT NULL THEN risk
+                        WHEN hits = 0 OR excluded.risk_level > risk_level THEN excluded.risk ELSE risk END,
+                    risk_level = CASE WHEN rated_origin IS NOT NULL THEN risk_level WHEN hits = 0 THEN excluded.risk_level
+                        ELSE max(risk_level, excluded.risk_level) END,
+                    scanner_risk = CASE WHEN rated_origin IS NULL THEN scanner_risk
+                        WHEN hits = 0 OR excluded.risk_level > scanner_risk_level THEN excluded.risk ELSE scanner_risk END,
+                    scanner_risk_level = CASE WHEN rated_origin IS NULL THEN scanner_risk_level
+                        WHEN hits = 0 THEN excluded.risk_level ELSE max(scanner_risk_level, excluded.risk_level) END
                  RETURNING id, risk",
             )?;
             // A finding's risk is the highest any of its sightings gave since a rescan started
@@ -784,7 +938,9 @@ impl Store {
             // rates it afresh, so a rule that rated something too high, then was fixed, lowers
             // it. Not simply the latest rating: one key can be rated differently at once (a
             // library file served old and new under two query strings), and the high one must
-            // not hide behind the low. Read first so a change goes on the timeline.
+            // not hide behind the low. Read first so a change goes on the timeline. A person's
+            // rating (`findings rate`) stays the finding's risk; the scanner's own goes on beside
+            // it in scanner_risk, for when the rating is cleared.
             let mut risk_before = tx.prepare_cached("SELECT risk FROM findings WHERE dedupe = ?1")?;
             // A finding marked fixed that is seen again is open again, when what saw it was
             // recorded after it was marked: a rescan of older traffic doesn't reopen it. The
@@ -935,7 +1091,7 @@ impl Store {
         let sql = format!(
             "SELECT id, alert_ref, name, risk, confidence, host, method, url, param, substr(evidence, 1, 300),
                 hits, history_id, state, origin, state_origin, state_changed_at, note_origin, note_changed_at, source,
-                issue_id, suppressed_by
+                issue_id, suppressed_by, rated_reason, rated_origin, rated_at, scanner_risk, scanner_confidence
              FROM findings WHERE {where_sql} ORDER BY risk_level DESC, id LIMIT {limit} OFFSET {offset}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -962,6 +1118,8 @@ impl Store {
                 "source": r.get::<_, String>(18)?,
                 "issue_id": r.get::<_, Option<i64>>(19)?,
                 "suppressed_by": r.get::<_, Option<i64>>(20)?,
+                // A person's rating in place of the scanner's (`findings rate`); null when none.
+                "rated": rated_json(r.get(21)?, r.get(22)?, r.get(23)?, r.get(24)?, r.get(25)?),
             }))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -1169,6 +1327,61 @@ impl Store {
         }
         tx.commit()?;
         Ok(reopened)
+    }
+
+    /// Rates findings as a person sees them (`rating`), or with `None` gives them the scanner's
+    /// rating back: `ids` and the scanner findings of each of `issues`, all or none. An issue
+    /// rated as a whole keeps the rating for the findings it gets later. A person does this:
+    /// under an MCP tool call it is refused. Returns the findings changed.
+    pub fn findings_rate(&mut self, ids: &[i64], issues: &[i64], rating: Option<&Rating<'_>>) -> Result<Vec<i64>> {
+        if crate::provenance::origin() == "mcp" {
+            return Err(Error::InvalidInput(
+                "rating a finding is a person's call; suggest one on the finding instead (`findings mark ID \
+                 --suggest --note ...`)"
+                    .into(),
+            ));
+        }
+        if let Some(r) = rating {
+            if r.risk.is_none() && r.confidence.is_none() {
+                return Err(Error::InvalidInput("give --risk and/or --confidence (or --clear)".into()));
+            }
+            if r.reason.trim().is_empty() {
+                return Err(Error::InvalidInput("give the reason for the rating (--reason)".into()));
+            }
+        }
+        let tx = self.write_tx()?;
+        let mut all: Vec<i64> = ids.to_vec();
+        for &issue in issues {
+            let ids = issue_ids(&tx, issue)?;
+            let mut stmt = tx.prepare_cached("SELECT source FROM findings WHERE id = ?1")?;
+            for id in ids {
+                // A finding added by hand to the issue keeps the risk it was given.
+                if stmt.query_row([id], |r| r.get::<_, String>(0))? != MANUAL_SOURCE {
+                    all.push(id);
+                }
+            }
+        }
+        all.sort_unstable();
+        all.dedup();
+        let origin = crate::provenance::origin();
+        let mut changed = Vec::new();
+        for &id in &all {
+            let done = match rating {
+                Some(r) => rate_one(&tx, id, &Rating { reason: r.reason.trim(), ..*r }, origin, None, None)?,
+                None => {
+                    current_state(&tx, id)?;
+                    unrate_one(&tx, id)?
+                }
+            };
+            if done {
+                changed.push(id);
+            }
+        }
+        for &issue in issues {
+            crate::scan::issues::set_rating(&tx, issue, rating)?;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// [`Store::findings_mark`] for `ids` and every finding of `issues`, as one change. Each
@@ -2788,6 +3001,56 @@ mod tests {
     fn xpb(s: &Store) -> Vec<Value> {
         let all = FindingFilter { alert_ref: Some("10037".into()), state: Some("all".into()), ..Default::default() };
         s.findings_list(&all, 100).unwrap()
+    }
+
+    #[test]
+    fn a_person_s_rating_holds_over_sightings_and_reaches_an_issue_s_new_instances() {
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/x");
+        let x = xpb(&s)[0].clone();
+        let (id, scanner) = (x["id"].as_i64().unwrap(), x["risk"].as_str().unwrap().to_string());
+        let up = Rating { risk: Some("high"), confidence: Some("high"), reason: "leaks the exact build" };
+        assert!(matches!(
+            s.findings_rate(&[id], &[], Some(&Rating { risk: None, confidence: None, reason: "x" })),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            s.findings_rate(&[id], &[], Some(&Rating { reason: " ", ..up })),
+            Err(Error::InvalidInput(_))
+        ));
+        assert_eq!(s.findings_rate(&[id], &[], Some(&up)).unwrap(), [id]);
+        // Rated the same again: nothing changes, nothing goes on the timeline.
+        assert!(s.findings_rate(&[id], &[], Some(&up)).unwrap().is_empty());
+        let rated = |s: &Store| xpb(s).into_iter().find(|f| f["id"] == id).unwrap();
+        let f = rated(&s);
+        assert_eq!((f["risk"].as_str(), f["confidence"].as_str()), (Some("high"), Some("high")));
+        assert_eq!(f["rated"]["scanner_risk"].as_str(), Some(scanner.as_str()), "{f}");
+        // A filter and the order go by the rating.
+        let high = FindingFilter { min_risk: Some(Risk::High), ..Default::default() };
+        assert_eq!(s.findings_list(&high, 10).unwrap().len(), 1);
+        // Seen again: the scanner's rating goes on beside it, the person's stays.
+        seen_at(&mut s, "/x");
+        assert_eq!(rated(&s)["risk"], "high");
+        let events: Vec<Value> = s.finding_events(id).unwrap().into_iter().filter(|e| e["kind"] == "rated").collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0]["new"].as_str(), events[0]["text"].as_str()), (Some("high/high"), Some(up.reason)));
+        // Cleared, the scanner's rating is back.
+        assert_eq!(s.findings_rate(&[id], &[], None).unwrap(), [id]);
+        let f = rated(&s);
+        assert_eq!((f["risk"].as_str(), f["rated"].is_null()), (Some(scanner.as_str()), true), "{f}");
+        // Rated as a whole issue, a new instance arrives rated, by the person who rated it.
+        let issue = f["issue_id"].as_i64().unwrap();
+        let down = Rating { risk: Some("info"), confidence: None, reason: "internal host" };
+        s.findings_rate(&[], &[issue], Some(&down)).unwrap();
+        assert_eq!(s.issue_get(issue).unwrap()["rating"]["risk"], "info");
+        seen_at(&mut s, "/y");
+        let y = xpb(&s).into_iter().find(|f| f["url"].as_str().unwrap().ends_with("/y")).unwrap();
+        assert_eq!((y["risk"].as_str(), y["rated"]["origin"].as_str()), (Some("info"), Some("cli")), "{y}");
+        s.findings_rate(&[], &[issue], None).unwrap();
+        assert!(s.issue_get(issue).unwrap()["rating"].is_null());
+        seen_at(&mut s, "/z");
+        let z = xpb(&s).into_iter().find(|f| f["url"].as_str().unwrap().ends_with("/z")).unwrap();
+        assert!(z["rated"].is_null(), "{z}");
     }
 
     #[test]

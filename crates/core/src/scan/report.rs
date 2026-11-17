@@ -343,6 +343,20 @@ pub struct Instance {
     /// Tickets filed for it (`findings ticket --record`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tickets: Vec<Ticket>,
+    /// A person's rating in place of the scanner's (`findings rate`): `risk` and `confidence`
+    /// are the person's, this says what the scanner said and why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rated: Option<Rated>,
+}
+
+/// A person's rating of a finding, beside the scanner's.
+#[derive(Debug, Clone, Serialize)]
+pub struct Rated {
+    pub scanner_risk: String,
+    pub scanner_confidence: String,
+    pub reason: String,
+    pub origin: Option<String>,
+    pub at: Option<String>,
 }
 
 impl Instance {
@@ -497,7 +511,8 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             f.alert_ref, f.rule_id, f.name, f.cwe, f.wasc,
             coalesce(t.description, ''), coalesce(t.solution, ''), coalesce(t.refs, '[]'), coalesce(t.tags, '[]'),
             f.origin, f.state_origin, f.state_changed_at, f.note_origin, f.note_changed_at,
-            f.last_history_id, h.time, f.issue_id, i.cvss_vector, i.cvss_score
+            f.last_history_id, h.time, f.issue_id, i.cvss_vector, i.cvss_score,
+            f.rated_origin, f.scanner_risk, f.scanner_confidence, f.rated_reason, f.rated_at
          FROM (SELECT * FROM findings WHERE {where_sql}) f LEFT JOIN finding_types t ON t.alert_ref = f.alert_ref
             LEFT JOIN history h ON h.id = coalesce(f.last_history_id, f.history_id)
             LEFT JOIN issues i ON i.id = f.issue_id
@@ -550,6 +565,16 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             cvss: match (r.get::<_, Option<String>>(33)?, r.get::<_, Option<f64>>(34)?) {
                 (Some(vector), Some(score)) => Some(CvssRating { vector, score, severity: cvss::severity(score) }),
                 _ => None,
+            },
+            rated: match r.get::<_, Option<String>>(35)? {
+                Some(origin) => Some(Rated {
+                    scanner_risk: r.get::<_, Option<String>>(36)?.unwrap_or_default(),
+                    scanner_confidence: r.get::<_, Option<String>>(37)?.unwrap_or_default(),
+                    reason: r.get::<_, Option<String>>(38)?.unwrap_or_default(),
+                    origin: Some(origin),
+                    at: r.get(39)?,
+                }),
+                None => None,
             },
         };
         let alert_ref: String = r.get(16)?;
@@ -1514,6 +1539,9 @@ fn markdown(r: &Report) -> String {
             if !inst.attack.is_empty() {
                 let _ = writeln!(s, "- Attack: {}", md_code(&inst.attack));
             }
+            if let Some(t) = rated_text(inst, r.provenance) {
+                let _ = writeln!(s, "- Rating: {}", md_escape(&t));
+            }
             if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
                 let _ = writeln!(s, "- Note ({}): {}", note_by(inst, r.provenance), md_code(n));
             }
@@ -1650,6 +1678,21 @@ fn latest_text(inst: &Instance) -> Option<String> {
     let last = inst.latest_id()?;
     let when = inst.last_seen.as_deref().map(|t| format!(" on {}", day(t))).unwrap_or_default();
     Some(format!("First seen {}; last seen in history #{last}{when}", day(&inst.time)))
+}
+
+/// A person's rating in words: "rated low (confidence high) by a person, the scanner said
+/// medium (confidence medium): behind a login".
+fn rated_text(inst: &Instance, full: bool) -> Option<String> {
+    let r = inst.rated.as_ref()?;
+    Some(format!(
+        "rated {} (confidence {}) {}, the scanner said {} (confidence {}): {}",
+        inst.risk,
+        inst.confidence,
+        who(r.origin.as_deref(), full),
+        r.scanner_risk,
+        r.scanner_confidence,
+        r.reason
+    ))
 }
 
 /// Who wrote a finding's note, in words.
@@ -2100,6 +2143,9 @@ fn html(r: &Report) -> String {
                 if !v.is_empty() {
                     row(k, format!("<code>{}</code>", esc(v)));
                 }
+            }
+            if let Some(t) = rated_text(inst, r.provenance) {
+                row("Rating", esc(&t));
             }
             if let Some(n) = inst.note.as_deref().filter(|n| !n.is_empty()) {
                 row("Note", format!("{} <span class=\"muted\">({})</span>", esc(n), esc(&note_by(inst, r.provenance))));

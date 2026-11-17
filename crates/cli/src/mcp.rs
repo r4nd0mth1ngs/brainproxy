@@ -111,6 +111,8 @@ const EXCLUDED: &[&str] = &[
     // takes it away); an agent suggests marks on findings instead. Both refuse a tool call too.
     "findings suppress add",
     "findings suppress remove",
+    // A person's rating in place of the scanner's; an agent suggests one. It refuses a tool call too.
+    "findings rate",
 ];
 
 /// Set on every command a tool call runs, so a command can refuse what an agent must not
@@ -695,6 +697,7 @@ const HINTS: &[(&str, Hints)] = &[
     ("findings issue title", SET),
     ("findings issue cvss", SET),
     ("findings issue narrative", SET),
+    ("findings rate", SET),
     ("findings suppress add", ADD),
     ("findings suppress list", READ),
     ("findings suppress remove", REPLACE),

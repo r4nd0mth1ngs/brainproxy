@@ -328,6 +328,34 @@ pub enum FindingsCmd {
         #[arg(long, conflicts_with_all = ["from", "if_state"])]
         suggest: bool,
     },
+    /// Rate scanner findings yourself: a risk and/or confidence in place of the scanner's, with
+    /// a reason. Lists, filters, reports and gates use it. Or give them the scanner's back.
+    #[command(after_help = "The scanner's own rating is kept beside the person's (rated.scanner_risk and \
+        rated.scanner_confidence in `findings list --all`; scanner_risk in `findings show`), and goes on \
+        being raised by higher sightings, so --clear gives back what the scanner rates now. Each change is \
+        on the finding's timeline (kind rated: old and new are risk/confidence, text the reason). With \
+        --issue the whole issue is rated: its findings found later take the rating too (`findings issues` \
+        gives rating); --clear --issue ends that. Findings added by hand have their own risk \
+        (`findings edit --risk`) and are refused by id, skipped with --issue. Refused through MCP: \
+        rating is a person's call; an agent suggests one (`findings mark ID --suggest --note ...`).")]
+    Rate {
+        /// Finding ids.
+        #[arg(value_name = "ID", required_unless_present = "issue")]
+        id: Vec<i64>,
+        /// Every scanner finding of this issue, and those it gets later. Repeatable.
+        #[arg(long, value_name = "ISSUE")]
+        issue: Vec<i64>,
+        #[arg(long, value_enum, required_unless_present_any = ["confidence", "clear"])]
+        risk: Option<RiskArg>,
+        #[arg(long, value_enum)]
+        confidence: Option<crate::report_cmd::ConfidenceArg>,
+        /// Why (required unless --clear).
+        #[arg(long, required_unless_present = "clear")]
+        reason: Option<String>,
+        /// Give them the scanner's rating back.
+        #[arg(long, conflicts_with_all = ["risk", "confidence", "reason"])]
+        clear: bool,
+    },
     /// Record a finding by hand, such as one from a manual test (source manual). Nothing is sent.
     #[command(after_help = "Findings with the same title share an alert type (manual:<title>), which holds the \
         description and solution: leaving one out keeps the type's, and one that differs from it is refused \
@@ -1391,6 +1419,36 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 out.ok(json!({"id": id, "title": shown}), || format!("issue {id} is now {shown}"));
             }
         },
+        FindingsCmd::Rate { id, issue, risk, confidence, reason, clear } => {
+            if crate::mcp::in_tool_call() {
+                return Err(Error::InvalidInput(
+                    "findings rate is refused through MCP: rating a finding is a person's call; suggest one with \
+                     `findings mark ID --suggest --note ...`"
+                        .into(),
+                ));
+            }
+            let reason = reason.unwrap_or_default();
+            let rating = brainproxy_core::scan::findings_db::Rating {
+                risk: risk.map(|r| r.get().as_str()),
+                confidence: confidence.map(|c| c.get().as_str()),
+                reason: &reason,
+            };
+            let changed = store.findings_rate(&id, &issue, (!clear).then_some(&rating))?;
+            let n = changed.len();
+            let mut data = json!({"ids": changed, "issues": issue, "cleared": clear});
+            if !clear {
+                data["risk"] = json!(rating.risk);
+                data["confidence"] = json!(rating.confidence);
+                data["reason"] = json!(reason);
+            }
+            out.ok(data, || {
+                if clear {
+                    format!("{n} finding(s) have the scanner's rating again")
+                } else {
+                    format!("rated {n} finding(s)")
+                }
+            });
+        }
         FindingsCmd::Suppress(cmd) => match cmd {
             SuppressCmd::Add { alert, host, path_prefix, param, reason } => {
                 if crate::mcp::in_tool_call() {

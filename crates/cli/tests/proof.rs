@@ -398,3 +398,25 @@ fn suppression_rules_are_a_person_s_and_reports_say_what_they_left_out() {
     assert_eq!(ok(&project, &["findings", "suppress", "remove", &id, "--reopen"])["reopened"], 2);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_person_rates_a_scanner_finding_and_reports_use_it() {
+    let port = serve();
+    let (dir, project) = setup("rate");
+    ok(&project, &["send", "--url", &format!("http://127.0.0.1:{port}/a")]);
+    let f = ok(&project, &["findings", "list", "--all", "--alert", "10037"])["items"][0].clone();
+    let id = f["id"].to_string();
+    let rate = ["findings", "rate", &id, "--risk", "high", "--reason", "exact framework build"];
+    let (code, v) = run_as(&project, &rate, None, true);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    let (code, v) = run_as(&project, &["findings", "rate", &id, "--risk", "high"], None, false);
+    assert_eq!(code, 2, "a reason is needed: {v}");
+    assert_eq!(ok(&project, &rate)["ids"][0].to_string(), id);
+    let shown = ok(&project, &["findings", "list", "--all", "--risk", "high"])["items"][0].clone();
+    assert_eq!((shown["risk"].as_str(), shown["rated"]["scanner_risk"].as_str()), (Some("high"), f["risk"].as_str()));
+    let md = ok(&project, &["report", "markdown"])["content"].as_str().unwrap().to_string();
+    assert!(md.contains("Rating: rated high") && md.contains("exact framework build"), "{md}");
+    ok(&project, &["findings", "rate", &id, "--clear"]);
+    assert_eq!(ok(&project, &["findings", "show", &id])["risk"], f["risk"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

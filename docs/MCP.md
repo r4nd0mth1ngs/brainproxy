@@ -101,7 +101,9 @@ person's (the command refuses a tool call too); and `findings issue review` and
 for its own draft; and `findings suppress add` and `findings suppress remove`, since a
 suppression rule decides about findings nobody has seen yet (an agent reads the rules with
 `findings_suppress_list`, and suggests marks on findings instead; both commands refuse a tool
-call too). (`connection review`, `browser open` and the `scan script` commands are left
+call too); and `findings rate`, since a risk or confidence in place of the scanner's is a
+person's call (an agent suggests one with `findings_mark` and `suggest`; the command refuses a
+tool call too). (`connection review`, `browser open` and the `scan script` commands are left
 out too; see below.)
 `findings_list` returns a page: `limit` rows from `offset` on, with `total` and `truncated`,
 so an agent works through a large project page by page (`issue` lists one issue's findings).

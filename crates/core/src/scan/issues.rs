@@ -75,6 +75,15 @@ pub const ISSUE_COLUMNS: &[(&str, &str, &str)] = &[
     ("decision_note", "TEXT", "The note given with the decision; new instances get it too"),
     ("decision_origin", "TEXT", "Who made the decision: gui, cli or mcp"),
     ("decision_at", "TEXT", "When the decision was made"),
+    (
+        "rating_risk",
+        "TEXT",
+        "Risk a person rated the whole issue (`findings rate --issue`); its new instances take it. NULL: as found",
+    ),
+    ("rating_confidence", "TEXT", "Confidence a person rated the whole issue; NULL: as found"),
+    ("rating_reason", "TEXT", "Why"),
+    ("rating_origin", "TEXT", "Who rated it: gui or cli; NULL when the scanner's rating stands"),
+    ("rating_at", "TEXT", "When"),
 ];
 
 pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
@@ -83,7 +92,7 @@ pub const EVENT_COLUMNS: &[(&str, &str, &str)] = &[
     ("finding_id", "INTEGER", "The finding it happened to (NULL for an issue's own events)"),
     ("issue_id", "INTEGER", "The finding's issue at the time, or the issue it happened to"),
     ("origin", "TEXT", "Who: gui, cli, mcp, or scanner (a fixed finding seen again: regressed); NULL when unknown (events backfilled from older projects)"),
-    ("kind", "TEXT", "created, state, note, suggested (`findings mark --suggest`: old is the state then, new the state suggested, text the note), retest, regressed, risk (a sighting rated it otherwise), edited (`findings edit`: text names the fields, old and new hold their values as JSON), moved (to another issue), title, cvss, narrative, reviewed, ticket, removed; decision (an issue's own: old and new are its decision before and after, text the note); a state event whose text starts \"inherited from issue\" is a new instance taking its issue's decision, by whoever made it; summary and summary_reviewed (the executive summary: no finding or issue)"),
+    ("kind", "TEXT", "created, state, note, suggested (`findings mark --suggest`: old is the state then, new the state suggested, text the note), retest, regressed, risk (a sighting rated it otherwise), edited (`findings edit`: text names the fields, old and new hold their values as JSON), moved (to another issue), title, cvss, narrative, reviewed, ticket, removed; decision (an issue's own: old and new are its decision before and after, text the note); a state event whose text starts \"inherited from issue\" is a new instance taking its issue's decision, by whoever made it; rated (`findings rate`: old and new are risk/confidence before and after, text the reason); summary and summary_reviewed (the executive summary: no finding or issue)"),
     ("old", "TEXT", "Value before (a state, a note, an issue id; for edited, the changed fields as JSON)"),
     ("new", "TEXT", "Value after; for retest: still_present or not_reproduced"),
     ("text", "TEXT", "Free text: the note, or what a retest sent"),
@@ -203,7 +212,86 @@ pub(crate) fn found(
     if !crate::scan::findings_db::suppress_new(conn, finding, history_id)? {
         inherit_decision(conn, finding, issue, history_id)?;
     }
+    inherit_rating(conn, finding, issue, history_id)
+}
+
+/// A new instance of an issue a person rated as a whole takes the rating, as theirs.
+fn inherit_rating(conn: &Connection, finding: i64, issue: i64, history_id: Option<i64>) -> Result<()> {
+    type Row = (Option<String>, Option<String>, String, String);
+    let row: Option<Row> = conn
+        .prepare_cached(
+            "SELECT rating_risk, rating_confidence, COALESCE(rating_reason, ''), rating_origin FROM issues
+             WHERE id = ?1 AND rating_origin IS NOT NULL",
+        )?
+        .query_row([issue], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .optional()?;
+    let Some((risk, confidence, reason, origin)) = row else {
+        return Ok(());
+    };
+    let text = format!("rated as issue {issue} was: {reason}");
+    let rating =
+        crate::scan::findings_db::Rating { risk: risk.as_deref(), confidence: confidence.as_deref(), reason: &reason };
+    crate::scan::findings_db::rate_one(conn, finding, &rating, &origin, Some(&text), history_id)?;
     Ok(())
+}
+
+/// Keeps (or with `None` ends) a person's rating of a whole issue, for the findings it gets
+/// later, with an issue event of kind `rated`.
+pub(crate) fn set_rating(
+    conn: &Connection,
+    issue: i64,
+    rating: Option<&crate::scan::findings_db::Rating<'_>>,
+) -> Result<()> {
+    let before: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT rating_risk, rating_confidence FROM issues WHERE id = ?1 AND rating_origin IS NOT NULL",
+            [issue],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let show = |risk: Option<&str>, confidence: Option<&str>| {
+        format!("{}/{}", risk.unwrap_or("as found"), confidence.unwrap_or("as found"))
+    };
+    let old = before.as_ref().map(|(r, c)| show(r.as_deref(), c.as_deref()));
+    match rating {
+        Some(r) => {
+            conn.execute(
+                "UPDATE issues SET rating_risk = ?2, rating_confidence = ?3, rating_reason = ?4, rating_origin = ?5,
+                    rating_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+                params![issue, r.risk, r.confidence, r.reason.trim(), crate::provenance::origin()],
+            )?;
+            let new = show(r.risk, r.confidence);
+            record(
+                conn,
+                &Event {
+                    issue: Some(issue),
+                    kind: "rated",
+                    old: old.as_deref(),
+                    new: Some(&new),
+                    text: Some(r.reason.trim()),
+                    ..Default::default()
+                },
+            )
+        }
+        None if before.is_some() => {
+            conn.execute(
+                "UPDATE issues SET rating_risk = NULL, rating_confidence = NULL, rating_reason = NULL,
+                    rating_origin = NULL, rating_at = NULL WHERE id = ?1",
+                [issue],
+            )?;
+            record(
+                conn,
+                &Event {
+                    issue: Some(issue),
+                    kind: "rated",
+                    old: old.as_deref(),
+                    text: Some("the scanner's rating again"),
+                    ..Default::default()
+                },
+            )
+        }
+        None => Ok(()),
+    }
 }
 
 /// Puts a new finding in its issue and records that it was created. Returns the issue.
@@ -417,6 +505,7 @@ fn after_retest(state: &str, outcome: Retest) -> Option<&'static str> {
 /// What an issue's row says, counted over its findings (removed ones left out).
 const ISSUE_SELECT: &str = "SELECT i.id, i.alert_ref, i.host, COALESCE(i.title, max(f.name)) AS title,
         i.title IS NOT NULL AS titled, i.decision, i.decision_note, i.decision_origin, i.decision_at,
+        i.rating_risk, i.rating_confidence, i.rating_reason, i.rating_origin, i.rating_at,
         max(f.risk_level) AS risk_level, count(f.id) AS instances,
         sum(f.hits) AS hits, min(f.time) AS first_seen,
         max(COALESCE((SELECT h.time FROM history h WHERE h.id = f.last_history_id), f.time)) AS last_seen,
@@ -471,6 +560,18 @@ fn issue_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
                     "at": r.get::<_, Option<String>>("decision_at")?,
                 })
             }
+            None => Value::Null,
+        },
+        // A person's rating of the whole issue, which its new instances take (`findings rate --issue`).
+        "rating": match r.get::<_, Option<String>>("rating_origin")? {
+            Some(origin) => json!({
+                "risk": r.get::<_, Option<String>>("rating_risk")?,
+                "confidence": r.get::<_, Option<String>>("rating_confidence")?,
+                "reason": r.get::<_, Option<String>>("rating_reason")?,
+                "by": crate::provenance::describe(Some(&origin)),
+                "origin": origin,
+                "at": r.get::<_, Option<String>>("rating_at")?,
+            }),
             None => Value::Null,
         },
     }))
