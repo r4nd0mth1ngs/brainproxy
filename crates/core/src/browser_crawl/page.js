@@ -322,6 +322,15 @@
     return { x, y, hit: !!hit && (hit === el || el.contains(hit)) };
   };
 
+  // A native box or slider a component library draws its own control over keeps it see-through
+  // (Material's checkbox, radio and slider): it is still the field the form reads.
+  const drawnOver = (el) => {
+    if (el.tagName !== "INPUT" || !/^(checkbox|radio|range)$/i.test(el.type)) return false;
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return r.width >= 1 && r.height >= 1 && s.visibility !== "hidden" && s.display !== "none";
+  };
+
   bp.fields = () => {
     st.fieldEls = [];
     for (const el of document.querySelectorAll("input,textarea,select," + CHOOSY)) {
@@ -330,7 +339,7 @@
       // A listbox inside a combobox (or one a combobox opened) is chosen through that combobox.
       if (choosy && el.getAttribute("role") === "listbox" && (el.closest("[role=combobox]") || st.lists.has(el))) continue;
       const off = el.disabled || el.readOnly || el.getAttribute("aria-disabled") === "true" || el.getAttribute("aria-readonly") === "true";
-      if (!off && visible(el)) st.fieldEls.push(el);
+      if (!off && (visible(el) || drawnOver(el))) st.fieldEls.push(el);
     }
     return st.fieldEls.map((el, i) => {
       const choosy = !/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName);

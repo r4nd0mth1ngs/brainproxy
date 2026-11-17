@@ -78,9 +78,10 @@ function render() {
       fetch(api('register') + '?question=' + question);
     });
   } else if (route === '/contact') {
-    // A rating slider that must be moved, and an arithmetic captcha shown in the page.
+    // A rating slider that must be moved (see-through, as Material draws its own over it), and
+    // an arithmetic captcha shown in the page.
     view.innerHTML = '<form id="c"><textarea name="comment"></textarea><p>0/160</p>' +
-      '<input type="range" name="rating" min="0" max="5" value="0">' +
+      '<input type="range" name="rating" min="0" max="5" value="0" style="opacity: 0">' +
       '<label for="cap">What is <code>3+4*2</code> ?</label><input id="cap" aria-label="Result of the CAPTCHA">' +
       '<button id="send" disabled>Send</button></form>';
     const f = document.getElementById('c');
