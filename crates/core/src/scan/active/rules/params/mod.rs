@@ -152,8 +152,105 @@ mod e2e {
                 "view.jsp" => ok("text/plain", "the source of view.jsp".into()),
                 _ => not_found,
             },
+            // `/Employees/Employee[@emplid='<id>']`, errors hidden, as the OWASP Benchmark's.
+            "/xpath" | "/staff" => xpath_page(&format!("@emplid='{}'", param("id")), ""),
+            // A numeric comparison, `[@emplid=<id>]`.
+            "/xpathnum" => xpath_page(&format!("@emplid={}", param("id")), ""),
+            // The string one on a page that changes on every request.
+            "/xpathclock" => xpath_page(&format!("@emplid='{}'", param("id")), &clock()),
+            // Safe: the value compared as data (a bound XPath variable).
+            "/xpath-safe" => xpath_rows(|e| e.0 == param("id"), ""),
+            "/xpath-safe-clock" => xpath_rows(|e| e.0 == param("id"), &clock()),
+            // Safe: the value is read and ignored, as the Benchmark's safe pages do.
+            "/xpath-ignored" => xpath_page("@emplid='3'", ""),
             _ => not_found,
         }
+    }
+
+    const EMPLOYEES: [(&str, &str); 2] = [("2", "Alice Smith, Accounts"), ("3", "Bob Jones, Sales")];
+
+    /// A header that differs on every request, as one with a clock or a CSRF token does.
+    fn clock() -> String {
+        let n = TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!(
+            "<header><h1>Staff directory</h1><nav>Home People Teams Rooms Help Sign out</nav>\
+             <p>Rendered in {n} ms for session {:x}</p></header>",
+            n * 7919
+        )
+    }
+
+    fn xpath_rows(keep: impl Fn(&(&str, &str)) -> bool, extra: &str) -> String {
+        let rows: String = EMPLOYEES.iter().filter(|e| keep(e)).map(|e| format!("{}<br/>\n", e.1)).collect();
+        let body = format!("{extra}Your query results are: <br/>\n{rows}");
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Evaluates `predicate` for each employee; one that doesn't parse is a 500.
+    fn xpath_page(predicate: &str, extra: &str) -> String {
+        if xpath_eval(predicate, EMPLOYEES[0].0).is_none() {
+            let body = "Error parsing XPath input";
+            return format!("HTTP/1.1 500 Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+        xpath_rows(|e| xpath_eval(predicate, e.0) == Some(true), extra)
+    }
+
+    /// An XPath predicate of `@emplid`, string and number literals, `=`, `and` and `or`.
+    fn xpath_eval(predicate: &str, emplid: &str) -> Option<bool> {
+        #[derive(Debug, PartialEq)]
+        enum Tok {
+            Str(String),
+            Num(f64),
+            Op(String),
+        }
+        let mut toks = Vec::new();
+        let mut rest = predicate.trim_start();
+        while let Some(c) = rest.chars().next() {
+            if c == '\'' || c == '"' {
+                let end = rest[1..].find(c)?;
+                toks.push(Tok::Str(rest[1..1 + end].to_string()));
+                rest = &rest[end + 2..];
+            } else if c == '=' {
+                toks.push(Tok::Op("=".into()));
+                rest = &rest[1..];
+            } else {
+                let end = rest.find([' ', '=', '\'', '"']).unwrap_or(rest.len());
+                let word = &rest[..end];
+                toks.push(match word {
+                    "@emplid" => Tok::Str(emplid.to_string()),
+                    "and" | "or" => Tok::Op(word.to_string()),
+                    w => Tok::Num(w.parse().ok()?),
+                });
+                rest = &rest[end..];
+            }
+            rest = rest.trim_start();
+        }
+        let value = |t: &Tok| match t {
+            Tok::Str(s) => Some(s.clone()),
+            Tok::Num(n) => Some(n.to_string()),
+            Tok::Op(_) => None,
+        };
+        // `a = b` terms joined by `and` (first) and `or`.
+        let mut any = false;
+        for alt in toks.split(|t| *t == Tok::Op("or".into())) {
+            let mut all = true;
+            for term in alt.split(|t| *t == Tok::Op("and".into())) {
+                let [a, Tok::Op(eq), b] = term else { return None };
+                if eq != "=" {
+                    return None;
+                }
+                let (a, b) = (value(a)?, value(b)?);
+                let num = |s: &str| s.parse::<f64>().ok();
+                all &= match (num(&a), num(&b)) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => a == b,
+                };
+            }
+            any |= all;
+        }
+        Some(any)
     }
 
     fn spawn_app() -> u16 {
@@ -343,6 +440,43 @@ mod e2e {
         assert_eq!(s.rules, 3, "{s:?}");
         assert_eq!(s.raised.get("40014-1"), Some(&1), "{s:?}");
         assert_eq!(s.raised.len(), 1, "{s:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finds_blind_xpath_injection() {
+        let port = spawn_app();
+        let paths = [
+            // Data originally: "and true" keeps Alice, "and false" loses her.
+            "/xpath?id=2",
+            // No data originally: "or true" finds everyone (another path: one finding per
+            // page and parameter is kept).
+            "/staff?id=9",
+            "/xpathnum?id=2",
+            "/xpathclock?id=2",
+        ];
+        let s = scan("xpath", port, &paths, Some(vec![90021])).await;
+        assert_eq!(s.raised.get("90021"), Some(&4), "{s:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn safe_xpath_pages_raise_nothing() {
+        let port = spawn_app();
+        let paths =
+            ["/xpath-safe?id=2", "/xpath-safe?id=9", "/xpath-safe-clock?id=2", "/xpath-ignored?id=2", "/xss-safe?q=2"];
+        let s = scan("xpathsafe", port, &paths, Some(vec![90021])).await;
+        assert!(s.raised.is_empty(), "false positives: {s:?}");
+        assert!(s.requests > 5 * 10, "the rule did attack: {s:?}");
+    }
+
+    #[test]
+    fn xpath_helper() {
+        assert_eq!(xpath_eval("@emplid='2'", "2"), Some(true));
+        assert_eq!(xpath_eval("@emplid='2' and '1'='2'", "2"), Some(false));
+        assert_eq!(xpath_eval("@emplid='9' or '1'='1'", "2"), Some(true));
+        assert_eq!(xpath_eval("@emplid=2 and 1=1", "2"), Some(true));
+        assert_eq!(xpath_eval("@emplid=\"2\" or \"1\"=\"2\"", "3"), Some(false));
+        assert_eq!(xpath_eval("@emplid='2''", "2"), None);
+        assert_eq!(xpath_eval("@emplid=2'", "2"), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

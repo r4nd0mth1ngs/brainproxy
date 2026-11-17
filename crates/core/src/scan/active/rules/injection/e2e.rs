@@ -108,6 +108,131 @@ fn hql(query: &str, hibernate6: bool) -> String {
     }
 }
 
+/// An LDAP filter, as far as the test directory needs one.
+#[derive(Debug)]
+enum Filter {
+    And(Vec<Filter>),
+    Or(Vec<Filter>),
+    Not(Box<Filter>),
+    /// Attribute and value; `*` in the value is a wildcard.
+    Eq(String, String),
+}
+
+/// Parses one filter at the start of `s`, returning the rest; strict like an LDAP server.
+fn parse_filter(s: &str) -> Option<(Filter, &str)> {
+    fn list(mut rest: &str) -> Option<(Vec<Filter>, &str)> {
+        let mut items = Vec::new();
+        while !rest.starts_with(')') {
+            let (f, r) = parse_filter(rest)?;
+            items.push(f);
+            rest = r;
+        }
+        (!items.is_empty()).then_some((items, &rest[1..]))
+    }
+    let s = s.strip_prefix('(')?;
+    match s.chars().next()? {
+        '&' => list(&s[1..]).map(|(v, r)| (Filter::And(v), r)),
+        '|' => list(&s[1..]).map(|(v, r)| (Filter::Or(v), r)),
+        '!' => {
+            let (f, r) = parse_filter(&s[1..])?;
+            Some((Filter::Not(Box::new(f)), r.strip_prefix(')')?))
+        }
+        _ => {
+            let end = s.find(')')?;
+            let (attr, value) = s[..end].split_once('=')?;
+            if attr.is_empty() || attr.contains(['(', '*']) || value.contains('(') {
+                return None;
+            }
+            Some((Filter::Eq(attr.to_lowercase(), value.to_string()), &s[end + 1..]))
+        }
+    }
+}
+
+/// RFC 4515 `\XX` escapes decoded.
+fn ldap_unescape(v: &str) -> String {
+    let mut out = String::new();
+    let mut rest = v;
+    while let Some(i) = rest.find('\\') {
+        out.push_str(&rest[..i]);
+        let hex = rest.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok());
+        out.push(hex.map_or('\\', char::from));
+        rest = rest.get(i + if hex.is_some() { 3 } else { 1 }..).unwrap_or("");
+    }
+    out + rest
+}
+
+/// RFC 4515 escaping, as a safe app does it.
+fn ldap_escape(v: &str) -> String {
+    v.chars()
+        .map(|c| match c {
+            '*' | '(' | ')' | '\\' | '\0' => format!("\\{:02x}", c as u32),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+fn matches(f: &Filter, entry: &[(&str, &str)]) -> bool {
+    match f {
+        Filter::And(v) => v.iter().all(|f| matches(f, entry)),
+        Filter::Or(v) => v.iter().any(|f| matches(f, entry)),
+        Filter::Not(f) => !matches(f, entry),
+        Filter::Eq(attr, value) => entry.iter().filter(|(a, _)| a.eq_ignore_ascii_case(attr)).any(|(_, v)| {
+            let parts: Vec<String> = value.split('*').map(ldap_unescape).collect();
+            if parts.len() == 1 {
+                return v.eq_ignore_ascii_case(&parts[0]);
+            }
+            let v = v.to_lowercase();
+            let (first, last) = (parts[0].to_lowercase(), parts[parts.len() - 1].to_lowercase());
+            v.starts_with(&first) && v.ends_with(&last) && v.len() >= first.len() + last.len()
+        }),
+    }
+}
+
+const DIRECTORY: [&[(&str, &str)]; 2] = [
+    &[("objectClass", "person"), ("uid", "alice"), ("street", "1 Main St")],
+    &[("objectClass", "person"), ("uid", "bob"), ("street", "2 High St")],
+];
+
+/// ESAPI's `encodeForHTML`: everything but letters, digits and a few marks as `&#xHH;`.
+fn esapi_html(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_string() } else { format!("&#x{:x};", c as u32) }).collect()
+}
+
+/// Runs `filter` over the directory like the OWASP Benchmark's LDAP pages: records, or the
+/// query echoed entity-encoded; a broken filter is a 500, or its JNDI error when `errors`.
+fn ldap_page(filter: &str, errors: bool, extra: &str) -> String {
+    let Some((f, "")) = parse_filter(filter) else {
+        return if errors {
+            html("<pre>javax.naming.directory.InvalidSearchFilterException: Unbalanced parenthesis</pre>")
+        } else {
+            status(500, "<p>Server error</p>")
+        };
+    };
+    let rows: String = DIRECTORY
+        .iter()
+        .filter(|e| matches(&f, e))
+        .map(|e| format!("Record found with name {}<br>Address: {}<br>", e[1].1, e[2].1))
+        .collect();
+    let body = if rows.is_empty() {
+        format!("LDAP query results: nothing found for query: {}", esapi_html(filter))
+    } else {
+        format!("LDAP query results:<br>{rows}")
+    };
+    html(&format!("{extra}<p>{body}</p>"))
+}
+
+/// A page that differs on every request, as one with a clock or a CSRF token does.
+static RENDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn clock_header() -> String {
+    let n = RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "<header><h1>Staff directory</h1><nav>Home People Teams Rooms Help Sign out</nav>\
+         <p>Rendered in {n} ms for session {:x}</p></header>",
+        n * 7919
+    )
+}
+
 fn handle(path: &str, query: &str) -> String {
     let param = |name: &str| -> String {
         query.split('&').find_map(|p| p.strip_prefix(&format!("{name}="))).map(url_decode).unwrap_or_default()
@@ -275,6 +400,23 @@ fn handle(path: &str, query: &str) -> String {
         "/hqlnum" => hql(&format!("from com.shop.Product where id = {}", param("id")), false),
         // Hibernate 6 behind a page that shows parser errors (HTML-escaped) but not others.
         "/hql6" => hql(&format!("from com.shop.Product where name = '{}'", param("name")), true),
+        // `(&(objectclass=person)(uid=<value>))`, errors hidden.
+        "/ldap" | "/people" => ldap_page(&format!("(&(objectClass=person)(uid={}))", param("user")), false, ""),
+        // The same, with the JNDI error shown.
+        "/ldaperr" => ldap_page(&format!("(&(objectClass=person)(uid={}))", param("user")), true, ""),
+        // The value in an OR, nested one level deeper.
+        "/ldapor" => {
+            ldap_page(&format!("(&(objectClass=person)(|(uid={})(street=nowhere)))", param("user")), false, "")
+        }
+        // The value in a filter on a page that changes on every request.
+        "/ldapclock" => ldap_page(&format!("(&(objectClass=person)(uid={}))", param("user")), false, &clock_header()),
+        // Safe: the value escaped (RFC 4515), also on a page that changes on every request.
+        "/ldapsafe" => ldap_page(&format!("(&(objectClass=person)(uid={}))", ldap_escape(&param("user"))), true, ""),
+        "/ldapsafeclock" => {
+            ldap_page(&format!("(&(objectClass=person)(uid={}))", ldap_escape(&param("user"))), true, &clock_header())
+        }
+        // Safe: the value is read and ignored, as the Benchmark's safe pages do.
+        "/ldapignored" => ldap_page("(&(objectClass=person)(uid=bob))", true, ""),
         // Safe: the same page whatever the parameter is.
         "/safe" => html("<p>static content</p>"),
         // Safe: small pages that echo what they were sent.
@@ -655,6 +797,64 @@ async fn sql_injection_doesnt_name_a_database_after_an_hql_error() {
     let (_, found) = scan("hqlsqli", 40018, Strength::Medium, vec![target(port, "/hql?name=apple")]).await;
     // Hibernate 5's "unexpected token:" used to read as Hypersonic SQL.
     assert!(found.iter().all(|f| f.1 == "SQL Injection"), "{found:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ldap_injection_error_and_boolean_based() {
+    let port = spawn_app();
+    let targets = vec![
+        target(port, "/ldaperr?user=alice"),
+        // Data originally: the clause ANDed onto the uid keeps alice, the false one loses her.
+        target(port, "/ldap?user=alice"),
+        // No data originally: `*` finds everyone, the false clause no one (another path: one
+        // finding per page and parameter is kept).
+        target(port, "/people?user=zzz"),
+        // ORed: the true clause finds everyone, the false one keeps the original.
+        target(port, "/ldapor?user=alice"),
+        target(port, "/ldapclock?user=alice"),
+    ];
+    let (s, found) = scan("ldap", 40015, Strength::Medium, targets).await;
+    assert_eq!(s.raised.get("40015-1"), Some(&1), "{found:?}");
+    assert_eq!(s.raised.get("40015-2"), Some(&4), "{found:?}");
+    let error = found.iter().find(|f| f.0 == "40015-1").expect("error based finding");
+    assert_eq!(error.3, "|!<>=~=>=<=*(),+-\"'\\/");
+    let attacks: Vec<&str> = found.iter().filter(|f| f.0 == "40015-2").map(|f| f.3.as_str()).collect();
+    assert_eq!(attacks.iter().filter(|a| **a == "alice)(objectClass=*").count(), 3, "{attacks:?}");
+    assert!(attacks.contains(&"*)(objectClass=*"), "{attacks:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ldap_injection_safe_pages_raise_nothing() {
+    let port = spawn_app();
+    for strength in [Strength::Medium, Strength::Insane] {
+        let targets = vec![
+            target(port, "/ldapsafe?user=alice"),
+            target(port, "/ldapsafe?user=zzz"),
+            target(port, "/ldapsafeclock?user=alice"),
+            target(port, "/ldapignored?user=alice"),
+            target(port, "/echo?q=alice"),
+            target(port, "/words?q=crisp"),
+            target(port, "/kb?q=zzz"),
+        ];
+        let (s, found) = scan("ldapsafe", 40015, strength, targets).await;
+        assert!(s.raised.is_empty(), "{strength:?}: {found:?}");
+        assert!(s.requests > 7 * 8, "the rule did attack: {s:?}");
+    }
+}
+
+#[test]
+fn ldap_filter_helper() {
+    fn run(f: &str) -> Option<(usize, &str)> {
+        parse_filter(f).map(|(f, rest)| (DIRECTORY.iter().filter(|e| matches(&f, e)).count(), rest))
+    }
+    assert_eq!(run("(&(objectClass=person)(uid=alice))"), Some((1, "")));
+    assert_eq!(run("(&(objectClass=person)(uid=*))"), Some((2, "")));
+    assert_eq!(run("(&(objectClass=person)(uid=alice)(objectClass=zz))"), Some((0, "")));
+    assert_eq!(run("(|(uid=al*)(uid=b*b))"), Some((2, "")));
+    assert_eq!(run("(!(uid=alice))"), Some((1, "")));
+    assert_eq!(run(&format!("(uid={})", ldap_escape("*)(uid=*"))), Some((0, "")));
+    assert_eq!(run("(&(uid=alice)"), None);
+    assert_eq!(run("(&(uid=alice)))"), Some((1, ")")));
 }
 
 #[test]
