@@ -65,6 +65,9 @@ mod e2e {
 
     static TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+    /// What `/save` stored last, for `/saved` to show.
+    static SAVED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
     fn sign(book: &mut Vec<String>, text: String) {
         book.push(text);
         if book.len() > 20 {
@@ -152,6 +155,11 @@ mod e2e {
                 "view.jsp" => ok("text/plain", "the source of view.jsp".into()),
                 _ => not_found,
             },
+            "/save" => {
+                *SAVED.lock().unwrap() = param("u");
+                "HTTP/1.1 302 Found\r\nLocation: /saved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            }
+            "/saved" => ok("text/html", format!("<html><body><p>Saved: {}</p></body></html>", SAVED.lock().unwrap())),
             // Redirects to any URL that mentions an allowed site anywhere in it.
             "/go" => {
                 let to = param("to");
@@ -165,8 +173,18 @@ mod e2e {
         }
     }
 
-    /// One stored finding: alert ref, method, URL, param, evidence, and its row's response.
-    type Stored = (String, String, String, String, String, Vec<u8>);
+    /// One stored finding, with its row's response.
+    #[derive(Debug)]
+    struct Stored {
+        alert_ref: String,
+        method: String,
+        url: String,
+        param: String,
+        evidence: String,
+        confidence: String,
+        other_info: String,
+        response: Vec<u8>,
+    }
 
     /// [`scan_targets`] for `paths`, with the findings it stored.
     async fn scan_stored(name: &str, port: u16, paths: &[&str], rules: Vec<u32>) -> (ActiveSummary, Vec<Stored>) {
@@ -184,12 +202,23 @@ mod e2e {
         let mut stmt = store
             .conn
             .prepare(
-                "SELECT f.alert_ref, f.method, f.url, f.param, f.evidence, h.response
+                "SELECT f.alert_ref, f.method, f.url, f.param, f.evidence, f.confidence, f.other_info, h.response
                  FROM findings f JOIN history h ON h.id = f.history_id ORDER BY f.id",
             )
             .unwrap();
         let found = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .query_map([], |r| {
+                Ok(Stored {
+                    alert_ref: r.get(0)?,
+                    method: r.get(1)?,
+                    url: r.get(2)?,
+                    param: r.get(3)?,
+                    evidence: r.get(4)?,
+                    confidence: r.get(5)?,
+                    other_info: r.get(6)?,
+                    response: r.get(7)?,
+                })
+            })
             .unwrap()
             .collect::<Result<Vec<Stored>, _>>()
             .unwrap();
@@ -425,11 +454,29 @@ mod e2e {
         // Only the payload that keeps the original value gets past the allow list.
         let (s, found) = scan_stored("redirect", port, &["/go?to=https://allowed.test/home"], vec![20019]).await;
         assert_eq!(s.raised.get("20019-1"), Some(&1), "{s:?}");
-        let (_, _, _, param, evidence, response) = &found[0];
+        let Stored { param, evidence, response, .. } = &found[0];
         assert_eq!(param, "to");
         assert!(!evidence.contains("@@@"), "the placeholder, not the URL: {evidence}");
         assert!(evidence.ends_with("/?https://allowed.test/home"), "{evidence}");
         let response = String::from_utf8_lossy(response);
         assert!(response.contains(evidence.as_str()), "findings verify looks for it there: {response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_redirect_followed_is_filed_under_the_attacked_request() {
+        let port = spawn_app();
+        // `/save` stores `u` and redirects to `/saved`, which shows it unescaped.
+        let (s, found) = scan_stored("followed", port, &["/save?u=hi"], vec![40012]).await;
+        assert!(!s.raised.is_empty() && !found.is_empty(), "{s:?}");
+        for f in &found {
+            assert_eq!((f.alert_ref.as_str(), f.method.as_str()), ("40012", "GET"), "{f:?}");
+            assert!(f.url.contains("/save?"), "the attacked request, not the page it led to: {f:?}");
+            assert_eq!(f.param, "u");
+            let response = String::from_utf8_lossy(&f.response);
+            assert!(response.starts_with("HTTP/1.1 302"), "the attacked request's own response: {response}");
+            // The evidence is only on the page the redirect led to.
+            assert_eq!(f.confidence, "low", "{f:?}");
+            assert!(f.other_info.contains("GET /saved"), "{f:?}");
+        }
     }
 }

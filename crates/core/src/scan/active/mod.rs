@@ -37,7 +37,7 @@ use crate::jobs::JobControl;
 use crate::oob::{self, Endpoint, Payload, ScanPayload};
 use crate::rules::{Engine, EngineRules, Ruled};
 use crate::scan::active::source_sink::{Sink, SourceSink};
-use crate::scan::{AlertDef, Finding, Message};
+use crate::scan::{AlertDef, Confidence, Finding, Message};
 use crate::sent::{RowBatch, RowWrite, Rows};
 use crate::session::Tool;
 use crate::store::Store;
@@ -115,6 +115,9 @@ pub struct Response {
     /// The response as the server sent it, when a match-and-replace rule changed what the scan
     /// rule reads (`raw` and the rest are then the response after it).
     received: Option<Vec<u8>>,
+    /// With redirects followed ([`Cx::send_following`]), the response to the request the rule
+    /// sent: this response is then the last redirect's, to a request the rule didn't make.
+    attacked: Option<Box<Response>>,
     text: OnceLock<String>,
 }
 
@@ -143,6 +146,7 @@ impl Response {
             raw,
             history_id: None,
             received: None,
+            attacked: None,
             text: OnceLock::new(),
         })
     }
@@ -159,8 +163,14 @@ impl Response {
             raw: Vec::new(),
             history_id: None,
             received: None,
+            attacked: None,
             text: OnceLock::new(),
         }
+    }
+
+    /// Whether `evidence` is in the head or the decoded body.
+    fn shows(&self, evidence: &str) -> bool {
+        !evidence.is_empty() && (self.head_text().contains(evidence) || self.body_str().contains(evidence))
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
@@ -600,6 +610,7 @@ impl Cx {
     pub async fn send_following_to(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
         let mut target = target.clone();
         let mut resp = self.send_to(&target, request).await?;
+        let mut attacked = None;
         for _ in 0..5 {
             if !matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
                 break;
@@ -615,8 +626,11 @@ impl Cx {
                 pq.push_str(q);
             }
             let req = RawRequest::from_bytes(self.request_for("GET", &pq)).set_header("Host", &target.host_header());
-            resp = self.send_to(&target, req.into_bytes()).await?;
+            let next = self.send_to(&target, req.into_bytes()).await?;
+            let previous = std::mem::replace(&mut resp, next);
+            attacked.get_or_insert_with(|| Box::new(previous));
         }
+        resp.attacked = attacked;
         Ok(resp)
     }
 
@@ -643,8 +657,17 @@ impl Cx {
         matches!(cache.get(&origin), Some(Some((status, sig))) if *status == resp.status && *sig == signature(resp))
     }
 
-    /// Records a finding with the exchange that proves it.
-    pub fn report(&self, finding: Finding, resp: &Response) {
+    /// Records a finding with the exchange that proves it. A response reached by following
+    /// redirects is filed under the request the rule attacked, with that request's own
+    /// response (see [`followed`]).
+    pub fn report(&self, mut finding: Finding, resp: &Response) {
+        let resp = match resp.attacked.as_deref() {
+            Some(attacked) => {
+                finding = followed(finding, attacked, resp);
+                attacked
+            }
+            None => resp,
+        };
         if !self.passes(&finding, finding.confidence) {
             return;
         }
@@ -724,6 +747,8 @@ impl Cx {
             return;
         }
         self.shared.oob_payloads.fetch_add(1, Ordering::Relaxed);
+        // The request that carried the payload, not a redirect it was answered with.
+        let resp = resp.map(|r| r.attacked.as_deref().unwrap_or(r));
         // The attack's row: the one its response came from, or the one of the attack that
         // failed. Correlating then records no second row for it.
         let history_id = match resp {
@@ -742,6 +767,29 @@ impl Cx {
             base_history_id: self.base.history_id,
         });
     }
+}
+
+/// A finding a rule judged on `last`, the end of the redirects the attacked request's
+/// response (`attacked`) started, as it is filed under the attacked request. The page a
+/// redirect leads to is another request, which may show what this or another attack stored
+/// (a profile page showing a saved URL) or fail for its own reasons, so evidence that the
+/// attacked response doesn't show itself is low confidence, and other info names the page.
+fn followed(mut finding: Finding, attacked: &Response, last: &Response) -> Finding {
+    if attacked.shows(&finding.evidence) {
+        return finding;
+    }
+    let line = last.request.split(|&b| b == b'\r' || b == b'\n').next().unwrap_or_default();
+    let line = String::from_utf8_lossy(line);
+    let line = line.rsplit_once(' ').map_or(&*line, |(start, _version)| start);
+    let row = last.history_id.map(|id| format!(" (history {id})")).unwrap_or_default();
+    let note = format!(
+        "The attacked request was answered with a redirect ({}). What raised this was in the response to the \
+         request the redirect led to, {line}{row}, so it may come from stored input or from that page alone.",
+        attacked.status
+    );
+    finding.confidence = Confidence::Low;
+    finding.other_info = if finding.other_info.is_empty() { note } else { format!("{}\n\n{note}", finding.other_info) };
+    finding
 }
 
 /// The error a scan request's row keeps if it is given up unanswered.

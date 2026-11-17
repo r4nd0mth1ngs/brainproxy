@@ -190,6 +190,11 @@ those skips 40014. Prime and Spider never raise alerts themselves.
 - **HTML parsing and response comparison** use ports of ZAP's HtmlContextAnalyser and
   commonlib ComparableResponse on top of brainproxy's own lenient HTML parser (instead of
   Jericho); results can differ slightly on badly broken markup.
+- **Redirects followed:** a rule that follows redirects (as ZAP does) still files its
+  finding under the request it attacked, with that request's own response, not under the
+  page the redirect led to. When that response doesn't show the evidence itself (a POST
+  answered with a redirect to a page that shows what was saved), the finding is low
+  confidence and its other info names the page where the evidence was.
 - **"Not found" detection** uses 404 plus a soft-404 signature per host instead of ZAP's
   custom page configuration.
 - **WEB-INF source disclosure (10045)** detects served class files but does not decompile
