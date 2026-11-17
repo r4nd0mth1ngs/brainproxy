@@ -807,7 +807,11 @@ attack type, and pick payloads:
     `crawl-browser`, and the browser's own background features (updates, sync, safe
     browsing, WebRTC) are off. It uses a fresh temporary profile, removed afterwards, so
     nothing from your normal browser is used; with a login profile, the session is added
-    to every request on the site and renewed when lost.
+    to every request on the site and renewed when lost. The crawl reloads pages to get back
+    to a state; when the browser then asks whether a script, style, image or font it
+    already fetched in this crawl has changed (a conditional GET), the crawl's proxy
+    answers 304 itself, so that request isn't sent or recorded. The summary counts them in
+    `revalidations_answered`.
   - **Limits:** depth, max pages (page loads, clicks and form submissions, counting the
     reloads and clicks needed to get back to a page state), rate, path
     prefix and the site's origin apply as for the plain crawl, and it stops after 30

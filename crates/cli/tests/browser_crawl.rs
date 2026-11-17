@@ -113,9 +113,16 @@ fn serve_spa() -> (u16, Arc<Mutex<Vec<String>>>) {
                         }
                     }
                 }
+                let text = String::from_utf8_lossy(&buf[..len]).to_ascii_lowercase();
                 let line = String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string();
                 log.lock().unwrap().push(line.clone());
                 let path = line.split(' ').nth(1).unwrap_or("/");
+                // The script may be cached but must be revalidated on every use.
+                if path == "/app.js" && text.contains("\r\nif-none-match: \"v1\"") {
+                    let _ = s.write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n");
+                    return;
+                }
+                let cache = if path == "/app.js" { "ETag: \"v1\"\r\nCache-Control: max-age=0\r\n" } else { "" };
                 let (ct, body) = if path == "/app.js" {
                     ("application/javascript", APP.to_string())
                 } else if path.starts_with("/api/") {
@@ -135,7 +142,7 @@ fn serve_spa() -> (u16, Arc<Mutex<Vec<String>>>) {
                     ("text/html", INDEX.to_string())
                 };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\n{cache}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = s.write_all(resp.as_bytes());
@@ -198,6 +205,9 @@ fn browser_crawl_finds_api_calls_made_by_javascript() {
     assert!(saw("GET /api/settings?nickname=brainproxy "), "{lines:?}");
     assert!(saw("GET /reports "), "the pushState route is loaded directly too: {lines:?}");
     assert!(saw("POST /api/login "), "a button enabled by filling the form is clicked: {lines:?}");
+    // Every page load revalidates the script; once fetched, the crawl answers that itself.
+    assert_eq!(lines.iter().filter(|l| l.starts_with("GET /app.js ")).count(), 1, "{lines:?}");
+    assert!(data["revalidations_answered"].as_u64().unwrap() >= 1, "{v}");
     // Nothing destructive reached the site.
     assert!(!lines.iter().any(|l| l.starts_with("DELETE ") || l.contains("logout")), "{lines:?}");
     assert!(!saw("GET /account/7 "), "a link labelled Delete account isn't followed: {lines:?}");

@@ -6,6 +6,11 @@
 //! and records every exchange (source `crawl-browser`). It also counts requests in
 //! flight, which tells the crawler when the page has gone quiet.
 //!
+//! The crawler reloads pages to get back to a state, and the browser revalidates every
+//! script, style, image and font that the site marks `max-age=0` on each load. With
+//! `answer_revalidations`, such a request for a file already fetched in this crawl is
+//! answered 304 here and neither sent nor recorded: the browser keeps its copy.
+//!
 //! A separate proxy from `proxy run` on purpose: it needs no running proxy, never holds a
 //! request in the intercept queue, and its limits apply only to the crawl.
 
@@ -52,6 +57,8 @@ pub(crate) struct Options {
     pub tap: Option<Arc<dyn Tap>>,
     /// Rows keep no content (`--no-store`).
     pub no_store: bool,
+    /// Answer conditional requests for static files fetched before with 304, unsent.
+    pub answer_revalidations: bool,
 }
 
 /// What a gateway's owner does with the browser's requests as they pass.
@@ -72,6 +79,8 @@ pub(crate) struct Stats {
     pub blocked_count: usize,
     /// Hosts the engagement scope refused.
     pub refused_hosts: BTreeSet<String>,
+    /// Revalidations answered 304 by the gateway, not sent.
+    pub revalidations_answered: usize,
 }
 
 struct Shared {
@@ -84,6 +93,8 @@ struct Shared {
     in_flight: AtomicUsize,
     last_done: Mutex<Instant>,
     stats: Mutex<Stats>,
+    /// Static files fetched (200 or 304) in this crawl, by URL.
+    fetched: Mutex<HashSet<String>>,
 }
 
 pub(crate) struct Gateway {
@@ -109,6 +120,7 @@ impl Gateway {
             in_flight: AtomicUsize::new(0),
             last_done: Mutex::new(Instant::now()),
             stats: Mutex::default(),
+            fetched: Mutex::default(),
         });
         let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
         let s = shared.clone();
@@ -310,6 +322,18 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
         return (error_response(403, "blocked", &msg), None);
     }
 
+    // The browser holds a copy (it asks conditionally) of a file this crawl already fetched.
+    let cacheable = s.opts.answer_revalidations
+        && method == "GET"
+        && parsed.as_ref().is_some_and(|u| is_static(u) || u.path().ends_with(".js") || u.path().ends_with(".mjs"));
+    if cacheable
+        && (header(&head.headers, "if-none-match").is_some() || header(&head.headers, "if-modified-since").is_some())
+        && s.fetched.lock().unwrap().contains(&url)
+    {
+        s.stats.lock().unwrap().revalidations_answered += 1;
+        return (b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n".to_vec(), None);
+    }
+
     let auth = s.opts.auth.as_deref().filter(|_| ours);
     if ours {
         let mut req = RawRequest::from_bytes(request);
@@ -361,6 +385,9 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
         }
     };
     let status = parse_response_head(final_response(&response)).ok().map(|h| h.status);
+    if cacheable && matches!(status, Some(200 | 304)) {
+        s.fetched.lock().unwrap().insert(url.clone());
+    }
     {
         let mut st = s.stats.lock().unwrap();
         st.requests += 1;

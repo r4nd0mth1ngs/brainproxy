@@ -96,6 +96,9 @@ pub struct BrowserCrawlSummary {
     pub tab_restarts: usize,
     /// Requests the browser made (all recorded, source crawl-browser).
     pub requests: usize,
+    /// The browser's revalidations of scripts, styles, images and fonts already fetched in
+    /// this crawl, answered 304 by the crawl itself: not sent, not recorded.
+    pub revalidations_answered: usize,
     pub by_status: BTreeMap<String, usize>,
     pub depth_reached: usize,
     pub pages_loaded: usize,
@@ -241,6 +244,7 @@ pub async fn crawl(project: &Path, cfg: BrowserCrawlConfig, ctl: JobControl) -> 
             source: "crawl-browser",
             tap: None,
             no_store: false,
+            answer_revalidations: true,
         },
         save,
     )
@@ -274,6 +278,7 @@ pub async fn crawl(project: &Path, cfg: BrowserCrawlConfig, ctl: JobControl) -> 
     let (new_findings, record_errors) = crate::crawl::join_writer(writer).await?;
     let mut s = explored?;
     s.requests = stats.requests;
+    s.revalidations_answered = stats.revalidations_answered;
     s.by_status = stats.by_status;
     s.errors += stats.errors;
     let mut eps: Vec<Endpoint> = stats.endpoints.into_iter().collect();
