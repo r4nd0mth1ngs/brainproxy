@@ -58,13 +58,18 @@ These use IDs from 100000, so they never clash with ZAP's.
     (100007-6, when the token has a `kid`); for an RS or PS token, HS256 signed with the
     origin's RSA public key as the secret (100007-7, *Algorithm Confusion*). Keys are
     looked for, up to four: PEM public keys in responses recorded from the origin (found
-    through history's full-text index, no request); then, with at most 8 requests, the
-    `.pem` and `.pub` files history requested from the origin or links to (up to 3, such as a
-    directory listing's `jwt.pub`), `/.well-known/jwks.json`, `/jwks.json`,
-    `/.well-known/openid-configuration` (and its same-origin `jwks_uri`), `/jwt.pub`,
-    `/public.pem` and `/publickey.pem`. A JWKS key is tried in four PEM forms, a key file as
-    it was found, with and without a final newline; and with `oob start`, a `jku`
-    and an `x5u` naming the listener (100007-8 when the server calls it).
+    through history's full-text index, no request); then, with at most 12 requests, the
+    `.pem`, `.pub` and JWKS files history requested from the origin, then those it links to
+    (up to 3 in all; the links in the directory listings the passive scan raised Directory
+    Browsing, 10033, on come before those in other recorded pages, such as Juice Shop's
+    `/encryptionkeys` listing's `jwt.pub`), `/.well-known/jwks.json`,
+    `/.well-known/openid-configuration` and `/.well-known/oauth-authorization-server` (and
+    their same-origin `jwks_uri`), `/jwks.json`, `/jwt.pub`, `/public.pem`, `/publickey.pem`
+    and `/encryptionkeys/jwt.pub`. Only PEM public keys and JWKS keys are read from an
+    answer, so a single-page app's page served at each of these paths gives no key, just a
+    request. A JWKS key is tried in four PEM forms, a key file as it was found, with and
+    without a final newline; and with `oob start`, a `jku` and an `x5u` naming the listener
+    (100007-8 when the server calls it).
 
   The payload is never changed except `exp` in the expiry test, so a forged token claims
   the same user as the real one. The attacks run once per origin, token place, algorithm

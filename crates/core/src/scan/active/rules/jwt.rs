@@ -16,8 +16,8 @@
 //!   and differs from the one without a token: a changed signature, `alg: none`, no signature, an
 //!   expired token (only once the secret is known), a `kid` pointing at `/dev/null` signed
 //!   with an empty key, the site's own RSA public key used as an HMAC secret (from PEM keys
-//!   in its recorded responses, key files history names or links to, its JWKS, or common key
-//!   paths), and a `jku`/`x5u` header naming the OOB listener (needs `oob start`).
+//!   in its recorded responses, key files history names or links to, directory listings
+//!   the passive scan found first, its JWKS, or common key paths), and a `jku`/`x5u` header naming the OOB listener (needs `oob start`).
 //!
 //! The payload is never changed except for `exp` in the expiry test, so a forged token
 //! claims the same identity as the real one. With `--auth`, the session leaves the token's
@@ -349,17 +349,23 @@ pub(super) fn rsa_pems(jwk: &Map<String, Value>) -> Vec<String> {
 }
 
 /// Paths where an origin's public signing key often is, tried after the key files its history
-/// names. A site that answers any path with its app page gives no key there, just a request.
+/// names. A site that answers any path with its app page gives no key there, just a request:
+/// only PEM public keys and JWKS keys are read from an answer, never the page itself.
 const KEY_PATHS: &[&str] = &[
+    // The JWKS and the two metadata documents (OpenID Connect, RFC 8414) naming its `jwks_uri`.
     "/.well-known/jwks.json",
-    "/jwks.json",
     "/.well-known/openid-configuration",
+    "/.well-known/oauth-authorization-server",
+    "/jwks.json",
     "/jwt.pub",
     "/public.pem",
     "/publickey.pem",
+    // OWASP Juice Shop's, and the shape of a key directory served with the app's static files.
+    "/encryptionkeys/jwt.pub",
 ];
-/// Requests the key search sends at most, per origin, token place and algorithm.
-const KEY_REQUESTS: usize = 8;
+/// Requests the key search sends at most, per origin, token place and algorithm: the history
+/// files, the common paths and a `jwks_uri` one names.
+const KEY_REQUESTS: usize = 12;
 /// Key files from history fetched at most (before the common paths).
 const HISTORY_KEY_FILES: usize = 3;
 /// Keys tried at most (each in up to four PEM forms).
@@ -412,7 +418,7 @@ fn pems_in(text: &str) -> Vec<Vec<String>> {
 struct RecordedKeys {
     /// PEM keys in its recorded responses.
     pems: Vec<PublicKey>,
-    /// Key files it requested or linked to (`.pem`, `.pub`), at most [`HISTORY_KEY_FILES`].
+    /// Key files it requested or linked to (`.pem`, `.pub`, a JWKS), at most [`HISTORY_KEY_FILES`].
     paths: Vec<String>,
 }
 
@@ -424,6 +430,17 @@ fn recorded_keys(project: &std::path::Path, target: &crate::http::Target) -> rus
     conn.busy_timeout(std::time::Duration::from_secs(2))?;
     let at = rusqlite::params![target.scheme, target.host, target.port];
     let mut out = RecordedKeys::default();
+    let read =
+        |r: &rusqlite::Row<'_>| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?));
+    // Directory listings the passive scan found (Directory Browsing), first: a key directory
+    // left listable names its files, and a full-text match on "pub" can be crowded out of
+    // the newest rows below by script bundles.
+    let mut st = conn.prepare(
+        "SELECT DISTINCT h.id, h.path, h.resp_body_text FROM findings f JOIN history h ON h.id = f.history_id
+         WHERE f.alert_ref = '10033' AND h.scheme = ?1 AND h.host = ?2 AND h.port = ?3
+         ORDER BY h.id DESC LIMIT 10",
+    )?;
+    let mut bodies: Vec<(i64, String, Option<String>)> = st.query_map(at, read)?.collect::<rusqlite::Result<_>>()?;
     // Keys in bodies, and links to key files, found through the full-text index.
     let mut st = conn.prepare(
         "SELECT h.id, h.path, h.resp_body_text FROM history_fts JOIN history h ON h.id = history_fts.rowid
@@ -431,22 +448,21 @@ fn recorded_keys(project: &std::path::Path, target: &crate::http::Target) -> rus
          ORDER BY h.id DESC LIMIT 20",
     )?;
     for query in ["resp_body_text : \"public key\"", "resp_body_text : (pem OR pub)"] {
-        let rows = st.query_map(rusqlite::params![target.scheme, target.host, target.port, query], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
-        })?;
-        for row in rows {
-            let (id, path, Some(text)) = row? else { continue };
-            for pem in pems_in(&text) {
-                add_key(
-                    &mut out.pems,
-                    PublicKey { source: format!("the key in history {id} ({path})"), kid: None, pems: pem },
-                );
-            }
-            for link in KEY_LINK.captures_iter(&text).filter_map(|c| c.get(1)) {
-                if let Some(p) = same_origin_path(link.as_str(), &path, &target.origin()) {
-                    if !out.paths.contains(&p) {
-                        out.paths.push(p);
-                    }
+        let rows = st.query_map(rusqlite::params![target.scheme, target.host, target.port, query], read)?;
+        bodies.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+    }
+    for (id, path, text) in bodies {
+        let Some(text) = text else { continue };
+        for pem in pems_in(&text) {
+            add_key(
+                &mut out.pems,
+                PublicKey { source: format!("the key in history {id} ({path})"), kid: None, pems: pem },
+            );
+        }
+        for link in KEY_LINK.captures_iter(&text).filter_map(|c| c.get(1)) {
+            if let Some(p) = same_origin_path(link.as_str(), &path, &target.origin()) {
+                if !out.paths.contains(&p) {
+                    out.paths.push(p);
                 }
             }
         }
@@ -454,7 +470,7 @@ fn recorded_keys(project: &std::path::Path, target: &crate::http::Target) -> rus
     // Key files requested before (their body may not be in the index).
     let mut st = conn.prepare(
         "SELECT DISTINCT path FROM history WHERE scheme = ?1 AND host = ?2 AND port = ?3
-            AND (path LIKE '%.pem' OR path LIKE '%.pub') ORDER BY id DESC LIMIT 5",
+            AND (path LIKE '%.pem' OR path LIKE '%.pub' OR path LIKE '%jwks%') ORDER BY id DESC LIMIT 5",
     )?;
     let requested: Vec<String> = st.query_map(at, |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     for p in requested.into_iter().rev() {

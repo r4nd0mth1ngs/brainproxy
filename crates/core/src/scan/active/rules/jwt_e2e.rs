@@ -35,12 +35,15 @@ fn pem() -> String {
 /// A key file that isn't in the JWKS, as a server reads it (no final newline), for each
 /// path whose server signs with one: one at a common path, one in a directory a recorded
 /// listing links to (labelled as Juice Shop's is), one only ever seen inside a recorded
-/// JSON response.
+/// JSON response, one in Juice Shop's key directory that nothing links to, and one a listing
+/// the passive scan raised Directory Browsing on links to, among many newer pages saying "pub".
 fn key_file(path: &str) -> Option<String> {
     let (n, label) = match path {
         "/confusion-common" => (0x11, "PUBLIC KEY"),
         "/confusion-listed" => (0x22, "RSA PUBLIC KEY"),
         "/confusion-seen" => (0x33, "PUBLIC KEY"),
+        "/confusion-dir" => (0x44, "RSA PUBLIC KEY"),
+        "/confusion-browsed" => (0x55, "PUBLIC KEY"),
         _ => return None,
     };
     let mut jwk = Map::new();
@@ -55,13 +58,20 @@ fn key_file(path: &str) -> Option<String> {
 fn recorded(path: &str) -> Vec<(&'static str, String)> {
     match path {
         "/confusion-listed" => vec![(
-            "/encryptionkeys/",
+            "/certs/",
             page(
                 "200 OK",
-                r#"<ul><li><a href="jwt.pub">jwt.pub</a></li><li><a href="premium.key">k</a></li></ul>"#,
+                r#"<ul><li><a href="signing.pub">signing.pub</a></li><li><a href="premium.key">k</a></li></ul>"#,
                 "text/html",
             ),
         )],
+        // The listing first (Directory Browsing is raised on it), then script bundles saying "pub".
+        "/confusion-browsed" => {
+            let listing = r#"<title>listing directory /rsa/</title><ul id="files"><li><a href="/rsa/app.pem">app.pem</a></li></ul>"#;
+            let mut rows = vec![("/rsa/", page("200 OK", listing, "text/html"))];
+            rows.extend((0..25).map(|_| ("/bundle.js", page("200 OK", "var pub = 1;", "text/javascript"))));
+            rows
+        }
         "/confusion-seen" => {
             let body = json!({"publicKey": key_file(path).unwrap()}).to_string();
             vec![("/api/config", page("200 OK", &body, "application/json"))]
@@ -91,7 +101,8 @@ fn issued(path: &str) -> String {
         "/weak" | "/weak-noexp" => hs256(b"secret", &json!({"alg": "HS256", "typ": "JWT"}), &payload),
         "/kid" => hs256(STRONG, &json!({"alg": "HS256", "typ": "JWT", "kid": "k1"}), &payload),
         "/expired" => hs256(STRONG, &json!({"alg": "HS256", "typ": "JWT"}), &json!({"sub": "alice", "exp": 1})),
-        "/confusion" | "/confusion-common" | "/confusion-listed" | "/confusion-seen" | "/confusion-cookie" => format!(
+        "/confusion" | "/confusion-common" | "/confusion-listed" | "/confusion-seen" | "/confusion-cookie"
+        | "/confusion-dir" | "/confusion-browsed" => format!(
             "{}.{}.{}",
             b64(&if path == "/confusion" {
                 json!({"alg": "RS256", "typ": "JWT", "kid": "k1"})
@@ -139,7 +150,8 @@ fn accepts(path: &str, token: &str) -> bool {
             safe(if kid.ends_with("dev/null") { b"" } else { STRONG })
         }
         "/confusion-cookie" => alg.eq_ignore_ascii_case("none") || accepts("/confusion-common", token),
-        "/confusion" | "/confusion-common" | "/confusion-listed" | "/confusion-seen" => match alg {
+        "/confusion" | "/confusion-common" | "/confusion-listed" | "/confusion-seen" | "/confusion-dir"
+        | "/confusion-browsed" => match alg {
             "HS256" => hmac_ok(key_file(path).unwrap_or_else(pem).as_bytes(), token) && live,
             "RS256" => URL_SAFE_NO_PAD.decode(parts[2]).is_ok_and(|s| s == RSA_SIG) && live,
             _ => false,
@@ -163,8 +175,20 @@ fn handle(req: &str) -> String {
     if path == "/jwt.pub" {
         return page("200 OK", &key_file("/confusion-common").unwrap(), "application/octet-stream");
     }
-    if path == "/encryptionkeys/jwt.pub" {
-        return page("200 OK", &key_file("/confusion-listed").unwrap(), "application/octet-stream");
+    for (file, owner) in [
+        ("/certs/signing.pub", "/confusion-listed"),
+        ("/encryptionkeys/jwt.pub", "/confusion-dir"),
+        ("/rsa/app.pem", "/confusion-browsed"),
+    ] {
+        if path == file {
+            return page("200 OK", &key_file(owner).unwrap(), "application/octet-stream");
+        }
+    }
+    // Any other path is the app's page, as a single-page app answers it: no key at the common
+    // key paths, though each answers 200.
+    let pages = ["/safe", "/expired", "/whoami", "/noverify", "/none", "/stripped", "/weak", "/kid", "/ignores"];
+    if !path.starts_with("/confusion") && !pages.iter().any(|p| path.starts_with(p)) {
+        return page("200 OK", "<!doctype html><html><body><app-root></app-root></body></html>", "text/html");
     }
     let token = req
         .lines()
@@ -303,11 +327,23 @@ async fn scan_carried(port: u16, path: &str, strength: Strength, carried: Carrie
     if !recorded.is_empty() {
         let store = crate::store::Store::open(&db).unwrap();
         let origin = Target::from_url(&format!("http://127.0.0.1:{port}")).unwrap();
+        let mut ids = Vec::new();
         for (at, resp) in recorded {
             let req = format!("GET {at} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
             let capture =
                 crate::capture::Capture::new("proxy", &origin, req.as_bytes(), Some(resp.as_bytes()), None, None);
-            store.record(&capture).unwrap();
+            ids.push(store.record(&capture).unwrap());
+        }
+        if path == "/confusion-browsed" {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO findings (source, rule_id, alert_ref, name, risk, risk_level, confidence, host,
+                        method, url, dedupe, history_id) VALUES ('passive', 10033, '10033', 'Directory Browsing',
+                        'medium', 2, 'medium', '127.0.0.1', 'GET', 'u', 'd', ?1)",
+                    [ids[0]],
+                )
+                .unwrap();
         }
     }
     let cfg = ActiveConfig {
@@ -330,7 +366,7 @@ async fn scan_carried(port: u16, path: &str, strength: Strength, carried: Carrie
     };
     let summary = run(&db, vec![target(port, path, carried)], cfg, JobControl::default()).await.unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
-    let mut st = conn.prepare("SELECT alert_ref FROM findings ORDER BY alert_ref").unwrap();
+    let mut st = conn.prepare("SELECT alert_ref FROM findings WHERE source = 'active' ORDER BY alert_ref").unwrap();
     let refs: Vec<String> = st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
     drop(st);
     let mut values = Vec::new();
@@ -381,6 +417,11 @@ async fn each_weakness_is_found_and_only_it() {
         ("/confusion-common", Strength::Medium, vec!["100007-7"]),
         ("/confusion-listed", Strength::Medium, vec!["100007-7"]),
         ("/confusion-seen", Strength::Medium, vec!["100007-7"]),
+        // Nothing in history: Juice Shop's key directory, among paths a single-page app
+        // answers with its page.
+        ("/confusion-dir", Strength::Medium, vec!["100007-7"]),
+        // A Directory Browsing finding's listing, which newer pages crowd out of a text search.
+        ("/confusion-browsed", Strength::Medium, vec!["100007-7"]),
     ] {
         let (refs, _) = scan(port, path, strength).await;
         assert_eq!(refs, want, "{path}");
