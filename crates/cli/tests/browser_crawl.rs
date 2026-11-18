@@ -127,6 +127,56 @@ render();
 fetch(api('me'));
 "#;
 
+/// A hash-routed app (served at /shop) in the way of Angular with `useHash`: router links on
+/// buttons carry only the route (`routerlink="/signup"`), and every other path on the server
+/// is its fallback start page. Its sign-up form needs a password typed twice, an option picked
+/// in a listbox that isn't a native select, and an answer; the button waits for all of them.
+/// Its settings, read again on every route change, are revalidated as Juice Shop's are.
+const SHOP: &str = r##"<!doctype html><html><head><title>Shop</title></head><body>
+<nav><a href="#/about" routerlink="/about">About</a> <button routerlink="/signup">Sign up</button>
+<button routerlink="/basket">Basket</button></nav><div id="view"></div><script>
+const view = document.getElementById('view');
+document.querySelectorAll('button[routerlink]').forEach((b) =>
+  b.addEventListener('click', () => { location.hash = '#' + b.getAttribute('routerlink'); }));
+function render() {
+  fetch('/api/shop-settings');
+  const route = location.hash.slice(1);
+  if (route === '/signup') {
+    view.innerHTML = '<form id="s"><input name="email" aria-label="Email"><input name="pw" type="password">' +
+      '<input name="repeat" type="password" aria-label="Repeat password">' +
+      '<div role="listbox" aria-label="Security question"><div role="option" aria-selected="false" data-v="pet">Your first pet?</div>' +
+      '<div role="option" aria-selected="false" data-v="city">Your city?</div></div>' +
+      '<input name="answer" aria-label="Answer"><button id="create" disabled>Create account</button></form>';
+    const f = document.getElementById('s');
+    let question = '';
+    const check = () => {
+      document.getElementById('create').disabled = !(f.email.value.includes('@') && f.pw.value.length >= 5 &&
+        f.repeat.value === f.pw.value && question && f.answer.value);
+    };
+    f.querySelectorAll('[role=option]').forEach((o) => o.addEventListener('click', () => {
+      f.querySelectorAll('[role=option]').forEach((x) => x.setAttribute('aria-selected', String(x === o)));
+      question = o.dataset.v;
+      check();
+    }));
+    f.addEventListener('input', check);
+    f.addEventListener('submit', (e) => {
+      e.preventDefault();
+      fetch('/api/users', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({email: f.email.value, question})});
+    });
+  } else if (route === '/about') {
+    view.innerHTML = '<p>About us</p>';
+  } else {
+    view.innerHTML = '<p>Welcome to the shop</p>' +
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => '<button data-item="' + n + '">Add to cart</button>').join('');
+    view.querySelectorAll('[data-item]').forEach((b) => b.addEventListener('click', () =>
+      fetch('/api/cart/' + b.dataset.item, {method: 'POST'})));
+  }
+}
+addEventListener('hashchange', render);
+render();
+</script></body></html>"##;
+
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_brainproxy"))
 }
@@ -188,9 +238,19 @@ fn serve_spa() -> (u16, Arc<Mutex<Vec<String>>>) {
                     let _ = s.write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n");
                     return;
                 }
-                let cache = if path == "/app.js" { "ETag: \"v1\"\r\nCache-Control: max-age=0\r\n" } else { "" };
+                if path == "/api/shop-settings" && text.contains("\r\nif-none-match: \"s1\"") {
+                    let _ = s.write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"s1\"\r\nConnection: close\r\n\r\n");
+                    return;
+                }
+                let cache = match path {
+                    "/app.js" => "ETag: \"v1\"\r\nCache-Control: max-age=0\r\n",
+                    "/api/shop-settings" => "ETag: \"s1\"\r\nCache-Control: no-cache\r\n",
+                    _ => "",
+                };
                 let (ct, body) = if path == "/app.js" {
                     ("application/javascript", APP.to_string())
+                } else if path == "/shop" {
+                    ("text/html", SHOP.to_string())
                 } else if path.starts_with("/api/") {
                     ("application/json", "{\"ok\":true}".to_string())
                 } else if path.starts_with("/spin") {
@@ -324,6 +384,34 @@ fn browser_crawl_fills_comboboxes_captchas_and_staged_forms() {
     assert!(saw("GET /api/feedback?captcha=11&rating=5 "), "the captcha is solved: {lines:?}");
     assert!(saw("GET /api/password?answer=brainproxy "), "the fields opened later are filled: {lines:?}");
     assert!(v["data"]["forms_submitted"].as_u64().unwrap() >= 3, "{v}");
+}
+
+/// A hash-routed app: a router link on a button is its route after "#", not a path to load
+/// (that gets the server's fallback page and spends the crawl on copies of the start page);
+/// a sign-up form with a repeated password and a listbox is sent; and data the app reads
+/// again on every route change is sent once until something is written.
+#[test]
+fn browser_crawl_follows_hash_router_links_and_signs_up() {
+    if !browser_available("browser_crawl_follows_hash_router_links_and_signs_up") {
+        return;
+    }
+    let (_dir, project) = test_project("browser-hash-routes");
+    let (port, seen) = serve_spa();
+    let shop = format!("http://127.0.0.1:{port}/shop");
+    let (code, v) =
+        run(&["crawl", &shop, "--browser", "--depth", "3", "--max-pages", "30", "--max-minutes", "3"], &project);
+    assert_eq!(code, 0, "{v}");
+    let lines = seen.lock().unwrap().clone();
+    let saw = |l: &str| lines.iter().any(|x| x.starts_with(l));
+    assert!(saw("POST /api/users "), "the sign-up form is sent: {lines:?}");
+    for wrong in ["GET /signup ", "GET /basket ", "GET /about "] {
+        assert!(!saw(wrong), "{wrong}is a route, not a path: {lines:?}");
+    }
+    // A list's rows all do the same: one row's button is tried, in each state it shows in.
+    let mut rows: Vec<&String> = lines.iter().filter(|l| l.starts_with("POST /api/cart/")).collect();
+    rows.sort();
+    rows.dedup();
+    assert_eq!(rows.len(), 1, "{rows:?}");
 }
 
 #[test]

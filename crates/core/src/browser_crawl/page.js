@@ -120,8 +120,18 @@
       });
     };
     for (const el of document.querySelectorAll("a[href],area[href]")) put(el, el.getAttribute("href"));
-    for (const el of document.querySelectorAll("[data-href],[data-url],[routerlink],[ng-href]"))
-      put(el, el.getAttribute("data-href") || el.getAttribute("data-url") || el.getAttribute("routerlink") || el.getAttribute("ng-href"));
+    // A link with an href was taken above: the framework wrote its real address there (an
+    // Angular routerLink on <a> gets "#/x" in a hash-routed app), and its attribute is only the route.
+    const hashRouted = /^#!?\//.test(location.hash) || !!document.querySelector('a[href^="#/"],a[href^="#!/"]');
+    for (const el of document.querySelectorAll("[data-href],[data-url],[routerlink],[ng-href]")) {
+      const data = el.getAttribute("data-href") || el.getAttribute("data-url");
+      if (!data && el.hasAttribute("href")) continue;
+      const route = el.getAttribute("routerlink");
+      const v = data || route || el.getAttribute("ng-href");
+      // A router route on a button: in a hash-routed app it is the part after "#", and loading it
+      // as a path gets the server's fallback page (the app's start page) instead.
+      put(el, v === route && hashRouted && /^\/(?!\/)/.test(route) ? (location.hash.startsWith("#!") ? "#!" : "#") + route : v);
+    }
     for (const el of document.querySelectorAll("iframe[src],frame[src]")) put(el, el.getAttribute("src"));
     return [...out.values()].slice(0, 500);
   };

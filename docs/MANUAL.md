@@ -2376,7 +2376,11 @@ Crawl and active-scan scope and safety flags:
   `brainproxy browser list`, `--headful` shows its window, `--avoid REGEX` (repeatable)
   skips more elements, `--allow-destructive` clicks destructive-looking ones and sends
   DELETE. It tries at most 40 elements per page state and chains of up to 6 clicks, and
-  waits at most 10 s for a page to settle.
+  waits at most 10 s for a page to settle. Elements described alike that differ only in
+  their place (every row's *Add to basket* in a list) count as one: the first is tried, in
+  at most 3 page states. A router link on an element without an `href` (Angular's
+  `routerlink="/orders"` on a button) is crawled as a link; on a hash-routed page (its address
+  or links are `#/…`) it is the route after `#` (`/#/orders`), not a path on the server.
 - `scan active --include-methods DELETE,PUT,PATCH` (or `all`): also attack requests with
   these methods. A GraphQL mutation (a request whose `query`, in a JSON body or batch, an
   `application/graphql` body, a multipart upload's `operations`, a form body or the URL, defines

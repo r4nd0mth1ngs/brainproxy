@@ -58,7 +58,8 @@ const DOM_QUIET_MS: f64 = 300.0;
 const MAX_CLICKS_PER_STATE: usize = 40;
 /// Longest chain of clicks from a page load.
 const MAX_CHAIN: usize = 6;
-/// The same element (by key) is tried in at most this many states.
+/// The same element (by description, its place aside: see [`alike_key`]) is tried in at most
+/// this many states.
 const MAX_PER_ELEMENT: usize = 3;
 /// Labels and URLs listed in the summary.
 const MAX_LISTED: usize = 50;
@@ -103,7 +104,8 @@ pub struct BrowserCrawlSummary {
     /// Requests the browser made (all recorded, source crawl-browser).
     pub requests: usize,
     /// The browser's revalidations of scripts, styles, images and fonts already fetched in
-    /// this crawl, answered 304 by the crawl itself: not sent, not recorded.
+    /// this crawl, and of other data whose copy is still the site's last answer, answered 304
+    /// by the crawl itself: not sent, not recorded.
     pub revalidations_answered: usize,
     pub by_status: BTreeMap<String, usize>,
     pub depth_reached: usize,
@@ -852,6 +854,10 @@ impl<'a> Explorer<'a> {
             return;
         }
         let mut queued = 0;
+        // Elements alike but for their place (a list's "Add to basket" on every row) do the same
+        // thing, as the state key already takes them: one of them is tried, not every row's,
+        // which would spend the page budget on one list.
+        let mut alike: HashSet<&str> = HashSet::new();
         let next = |explorer: &mut Self, step: Step, submits: bool| {
             let mut path = a.path.clone();
             path.push(step);
@@ -877,11 +883,15 @@ impl<'a> Explorer<'a> {
                 }
                 continue;
             }
+            let kind = alike_key(&c.key);
+            if !alike.insert(kind) {
+                continue;
+            }
             // Once per state; the same element in other states counts towards MAX_PER_ELEMENT.
             if !self.tried.insert(format!("{key:x} {}", c.key)) {
                 continue;
             }
-            let n = self.per_element.entry(c.key.clone()).or_default();
+            let n = self.per_element.entry(kind.to_string()).or_default();
             if *n >= MAX_PER_ELEMENT {
                 continue;
             }
@@ -1010,6 +1020,12 @@ pub(crate) fn state_key(s: &Snapshot) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     parts.hash(&mut h);
     h.finish()
+}
+
+/// An element's key without its place among the elements described alike: every row's
+/// "button|||Add to Basket|#3" is "button|||Add to Basket|".
+fn alike_key(key: &str) -> &str {
+    key.rsplit_once('#').map_or(key, |(desc, _)| desc)
 }
 
 /// "deleteItem", "delete_item" and "delete-item" all read "delete item".
@@ -1175,6 +1191,15 @@ mod tests {
             state_key(&snap("https://a.test/about", &[], &[])),
             state_key(&snap("https://a.test/contact", &[], &[]))
         );
+    }
+
+    #[test]
+    fn rows_alike_share_a_key() {
+        assert_eq!(alike_key("button|||Add to Basket|#12"), "button|||Add to Basket|");
+        assert_eq!(alike_key("button|||Add to Basket|#1"), alike_key("button|||Add to Basket|#2"));
+        // An id with "#" in it keeps everything before the place.
+        assert_eq!(alike_key("a|||x|tab#2#1"), "a|||x|tab#2");
+        assert_ne!(alike_key("button|||Add to Basket|#1"), alike_key("button|||Basket|#1"));
     }
 
     #[test]
