@@ -842,6 +842,10 @@ attack type, and pick payloads:
     the same way, until a request that may change something (anything but GET, HEAD or
     OPTIONS) is answered; the first read after it goes to the site. The summary counts both
     in `revalidations_answered`.
+  - **Side effects:** clicking and submitting is what a person would do, so the site's
+    data changes: with a login, for example, it adds products to the basket and changes
+    their quantities (POST and PUT requests), and the forms it sends post feedback or
+    create accounts. Crawl a test instance, or one whose data you may change.
   - **Limits:** depth, max pages (page loads, clicks and form submissions, counting the
     reloads and clicks needed to get back to a page state), rate, path
     prefix and the site's origin apply as for the plain crawl, and it stops after 30
