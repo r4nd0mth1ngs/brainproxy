@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { diffRows, needsUnsafe, sideCells, unsafeReason, verdictLine, verifyArgs, type Verify, type VerifySide } from "./verifyFinding.ts";
+import { diffRows, needsUnsafe, sideCells, stripRows, unsafeReason, verdictLine, verifyArgs, type Verify, type VerifySide } from "./verifyFinding.ts";
 
 const side = (o: Partial<VerifySide>): VerifySide => ({
   request_history_id: 1,
@@ -39,4 +39,17 @@ test("the verdict and the rows Diff compares", () => {
   assert.deepEqual(diffRows(v), [12, 13]);
   assert.match(verdictLine({ ...v, differences: { ...v.differences, summary: [] } }), /^No difference/);
   assert.equal(diffRows({ ...v, with: side({ history_ids: [] }) }), null);
+  assert.deepEqual(stripRows(v).map(([label]) => label), ["Without payload", "With payload"]);
+});
+
+test("a forged JWT's verdict is the proof against the request without a token", () => {
+  const v = {
+    id: 8, attack: "eyJ...", evidence: "", baseline_from: "scan", edited_request: false, repeat: 1,
+    without: side({}), with: side({ history_ids: [11] }),
+    differences: { status_changed: false, length_delta: 0, duration_delta_ms: 0, evidence_only_with_payload: null, summary: [] },
+    control: side({ request_history_id: null, history_ids: [12], status: 401 }),
+    proof: { reproduced: true, forged_like_valid: true, control_like_valid: false, summary: "reproduced: the forged token was answered like the valid one" },
+  } satisfies Verify;
+  assert.match(verdictLine(v), /^reproduced:/);
+  assert.deepEqual(stripRows(v).map(([label]) => label), ["Valid token", "Forged token", "Without a token"]);
 });

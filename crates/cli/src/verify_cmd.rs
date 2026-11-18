@@ -8,10 +8,18 @@
 //! as Replay sends one), alternately `--repeat` times, each recorded with source `retest` like a
 //! retest's, which the background passive scan leaves alone. Nothing about the finding changes:
 //! what the responses mean is for whoever reads them.
+//!
+//! A JWT finding on a forged token (100007) is the exception to "without the payload": the
+//! valid token and the forged one are meant to be answered alike, so the proof is a third
+//! request, the attack with the token taken out, as the scan's own control was. It is sent
+//! alongside (`control`), and `proof` says whether the forged token was answered like the
+//! valid one and unlike the request without a token.
 
 use std::path::Path;
 
+use brainproxy_core::auth::Keep;
 use brainproxy_core::diff::{diff, DiffMode};
+use brainproxy_core::http::RawRequest;
 use brainproxy_core::store::{HistoryItem, Store};
 use brainproxy_core::Error;
 use serde_json::{json, Value};
@@ -25,6 +33,13 @@ const MAX_REPEAT: u32 = 20;
 const MAX_CHANGES: usize = 20;
 /// Requests in history looked at for a baseline when the scan didn't record one.
 const MATCH_CANDIDATES: i64 = 200;
+/// The JWT rule's findings on a forged token it judged accepted: answered like the valid token
+/// and unlike the request without one.
+const FORGED_TOKEN: &[&str] = &["100007-1", "100007-2", "100007-3", "100007-5", "100007-6", "100007-7"];
+/// The JWT rule's weak secret, found offline.
+const WEAK_SECRET: &str = "100007-4";
+/// How alike two answers must be to count as the same page (the JWT rule's own measure).
+const SAME_PAGE: f32 = 0.9;
 
 #[derive(clap::Args)]
 pub struct VerifyArgs {
@@ -96,6 +111,15 @@ pub fn verify(project: &Path, a: VerifyArgs, out: &Out) -> Result<(), Error> {
     }
     let attack = f["attack"].as_str().unwrap_or_default().to_string();
     let evidence = f["evidence"].as_str().unwrap_or_default().to_string();
+    let alert_ref = f["alert_ref"].as_str().unwrap_or_default();
+    if alert_ref == WEAK_SECRET {
+        return Err(Error::InvalidInput(format!(
+            "finding {} was found offline: the token's signature verifies with the secret its other info names, \
+             and nothing was sent, so there is no request to compare without; it holds for as long as the server \
+             signs with that secret. To show the server takes a token signed with it, sign one in Replay",
+            a.id
+        )));
+    }
     if attack.is_empty() && f["base_history_id"].is_null() {
         return Err(Error::InvalidInput(format!(
             "finding {} has no payload to compare without: only an active scan's finding, which records its \
@@ -166,18 +190,31 @@ pub fn verify(project: &Path, a: VerifyArgs, out: &Out) -> Result<(), Error> {
         }
     }
 
+    // A JWT finding's token stays as the attack has it: with --auth the session would put its
+    // own (valid) token on over the forged one. The baseline takes the session's, as it should.
+    let keep = if alert_ref.starts_with("100007-") {
+        token_keep(&attack_item.request, f["param"].as_str().unwrap_or_default())
+    } else {
+        Keep::default()
+    };
+    let control = FORGED_TOKEN.contains(&alert_ref).then(|| token_control(&attack_item.request, &attack)).flatten();
+    let mut sides: Vec<(&brainproxy_core::http::Target, &[u8], Keep)> = vec![
+        (&base_item.target, &base_item.request, Keep::default()),
+        (&attack_item.target, &attack_request, keep.clone()),
+    ];
+    if let Some(c) = &control {
+        sides.push((&attack_item.target, c, keep));
+    }
+
     let mut sender = Resender::open(project, &store, a.auth.as_deref(), a.timeout)?;
     drop(store);
     // Each side's rows, with the error of a send that got no response.
-    let mut rows: (Vec<Row>, Vec<Row>) = (Vec::new(), Vec::new());
-    // Alternately, so a server that slows down or changes meanwhile affects both alike.
+    let mut rows: Vec<Vec<Row>> = vec![Vec::new(); sides.len()];
+    // Alternately, so a server that slows down or changes meanwhile affects every side alike.
     let sent = (|| {
         for _ in 0..a.repeat {
-            for (side, target, request) in [
-                (&mut rows.0, &base_item.target, &base_item.request),
-                (&mut rows.1, &attack_item.target, &attack_request),
-            ] {
-                side.push(match sender.send(target, request)? {
+            for (side, (target, request, keep)) in rows.iter_mut().zip(&sides) {
+                side.push(match sender.send_keeping(target, request, keep)? {
                     Resent::Answered(id) => (id, None),
                     Resent::Failed(id, e) => (id, Some(e.to_string())),
                 });
@@ -192,9 +229,10 @@ pub fn verify(project: &Path, a: VerifyArgs, out: &Out) -> Result<(), Error> {
     let read = |side: &[Row]| -> Result<Vec<Send>, Error> {
         side.iter().map(|(id, error)| read_send(&store, *id, error.clone(), &evidence)).collect()
     };
-    let (without, with) = (read(&rows.0)?, read(&rows.1)?);
+    let (without, with) = (read(&rows[0])?, read(&rows[1])?);
+    let no_token = rows.get(2).map(|r| read(r)).transpose()?;
     let differences = differences(&without, &with, !evidence.is_empty());
-    let side = |sends: &[Send], request: i64| {
+    let side = |sends: &[Send], request: Option<i64>| {
         let answered: Vec<&Send> = sends.iter().filter(|s| s.status.is_some()).collect();
         json!({
             "request_history_id": request,
@@ -207,7 +245,7 @@ pub fn verify(project: &Path, a: VerifyArgs, out: &Out) -> Result<(), Error> {
             "sends": sends.iter().map(Send::json).collect::<Vec<_>>(),
         })
     };
-    let data = json!({
+    let mut data = json!({
         "id": a.id,
         "name": f["name"],
         "param": f["param"],
@@ -218,10 +256,15 @@ pub fn verify(project: &Path, a: VerifyArgs, out: &Out) -> Result<(), Error> {
         "baseline_from": from,
         "edited_request": a.request.is_some(),
         "repeat": a.repeat,
-        "without": side(&without, base_id),
-        "with": side(&with, attack_id),
+        "without": side(&without, Some(base_id)),
+        "with": side(&with, Some(attack_id)),
         "differences": differences,
     });
+    if let Some(no_token) = &no_token {
+        // Built from the attack request now, so it has no row of its own to name.
+        data["control"] = side(no_token, None);
+        data["proof"] = token_proof(&without, &with, no_token);
+    }
     out.ok(data.clone(), || text(&data));
     Ok(())
 }
@@ -359,15 +402,22 @@ fn join(statuses: &[u16]) -> String {
 }
 
 fn text(d: &Value) -> String {
+    let token = d["control"].is_object();
     let mut out = format!(
-        "finding {} ({}{}): sent {}× without and with the payload\n",
+        "finding {} ({}{}): sent {}× {}\n",
         d["id"],
         d["name"].as_str().unwrap_or_default(),
         d["param"].as_str().filter(|p| !p.is_empty()).map(|p| format!(", {p}")).unwrap_or_default(),
-        d["repeat"]
+        d["repeat"],
+        if token { "with the valid token, the forged one and none" } else { "without and with the payload" }
     );
-    for (label, key) in [("without", "without"), ("with   ", "with")] {
-        for s in d[key]["sends"].as_array().into_iter().flatten() {
+    let sides: &[(&str, &str)] = if token {
+        &[("valid   ", "without"), ("forged  ", "with"), ("no token", "control")]
+    } else {
+        &[("without", "without"), ("with   ", "with")]
+    };
+    for (label, key) in sides {
+        for s in d[*key]["sends"].as_array().into_iter().flatten() {
             let ev = match s["evidence"].as_bool() {
                 Some(true) => "  evidence: yes",
                 Some(false) => "  evidence: no",
@@ -386,12 +436,92 @@ fn text(d: &Value) -> String {
     }
     let notes: Vec<&str> =
         d["differences"]["summary"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-    if notes.is_empty() {
+    if let Some(proof) = d["proof"]["summary"].as_str() {
+        out.push_str(&format!("  {proof}\n"));
+    } else if notes.is_empty() {
         out.push_str("  no difference\n");
     } else {
         out.push_str(&format!("  differs: {}\n", notes.join("; ")));
     }
     out
+}
+
+/// What the session must leave as the attack request has it for a JWT finding: the token's
+/// place, as the rule named it (`Cookie: NAME`, a header's name, or a parameter's).
+fn token_keep(request: &[u8], place: &str) -> Keep {
+    let mut keep = Keep::default();
+    if let Some(cookie) = place.strip_prefix("Cookie: ") {
+        keep.cookies.push(cookie.to_string());
+    } else if request_headers(request).iter().any(|(k, _)| k.eq_ignore_ascii_case(place)) {
+        keep.headers.push(place.to_string());
+    } else if !place.is_empty() {
+        keep.params.push(place.to_string());
+    }
+    keep
+}
+
+/// The attack request with the forged token taken out (an empty value), as the scan sent its
+/// control; None when the request doesn't hold the token.
+fn token_control(request: &[u8], token: &str) -> Option<Vec<u8>> {
+    let text = String::from_utf8_lossy(request);
+    if token.is_empty() || !text.contains(token) {
+        return None;
+    }
+    Some(RawRequest::from_bytes(text.replace(token, "").into_bytes()).update_content_length().into_bytes())
+}
+
+/// Whether two answers are the same page: the same status and nearly the same words.
+fn same_page(a: &Send, b: &Send) -> bool {
+    a.status == b.status && diff(&a.body, &b.body, DiffMode::Words, 0, 0).similarity >= SAME_PAGE
+}
+
+/// A side's last answered send.
+fn last_answered(sends: &[Send]) -> Option<&Send> {
+    sends.iter().rev().find(|s| s.status.is_some())
+}
+
+/// Whether a forged token's finding holds now: the forged token answered like the valid one,
+/// and the request without a token otherwise. Each side's last answer is compared.
+fn token_proof(valid: &[Send], forged: &[Send], control: &[Send]) -> Value {
+    let (Some(v), Some(f), Some(c)) = (last_answered(valid), last_answered(forged), last_answered(control)) else {
+        return json!({
+            "reproduced": null,
+            "forged_like_valid": null,
+            "control_like_valid": null,
+            "summary": "not judged: a request got no response",
+        });
+    };
+    let shown = |s: &Send| format!("{} ({} B)", s.status.unwrap_or_default(), s.length.unwrap_or_default());
+    let (forged_like, control_like) = (same_page(f, v), same_page(c, v));
+    // A refused valid token makes every comparison meaningless, as the scan also judges.
+    let refused = v.status.is_some_and(|s| s >= 400);
+    let summary = if refused {
+        format!(
+            "not reproduced: the valid token was refused, {}: its session may have ended (pass --auth PROFILE)",
+            shown(v)
+        )
+    } else if control_like {
+        format!(
+            "not reproduced: the request without a token was answered like the valid token, {}, so the page \
+             doesn't depend on the token",
+            shown(c)
+        )
+    } else if !forged_like {
+        format!("not reproduced: the forged token was answered {}, the valid one {}", shown(f), shown(v))
+    } else {
+        format!(
+            "reproduced: the forged token was answered like the valid one, {}, and the request without a token \
+             otherwise, {}",
+            shown(f),
+            shown(c)
+        )
+    };
+    json!({
+        "reproduced": !refused && forged_like && !control_like,
+        "forged_like_valid": forged_like,
+        "control_like_valid": control_like,
+        "summary": summary,
+    })
 }
 
 /// A request in history the attack request repeats with only the payload changed: the
@@ -542,6 +672,17 @@ mod tests {
         assert!(payload_part(&String::from_utf8_lossy(&attack[spans[0].clone()]), "hello\"<x>\""));
         // Another header layout isn't the same request.
         assert!(changed_spans(b"GET / HTTP/1.1\nA: 1\n\n", b"GET / HTTP/1.1\n\n").is_none());
+    }
+
+    #[test]
+    fn a_jwt_findings_token_place_is_kept_and_its_control_has_no_token() {
+        let req = b"POST /a?t=eyJx HTTP/1.1\r\nauthorization: Bearer eyJx\r\nCookie: jwt=eyJx\r\nContent-Length: 6\r\n\r\nt=eyJx";
+        assert_eq!(token_keep(req, "Cookie: jwt").cookies, ["jwt"]);
+        assert_eq!(token_keep(req, "Authorization").headers, ["Authorization"]);
+        assert_eq!(token_keep(req, "t").params, ["t"]);
+        let control = String::from_utf8(token_control(req, "eyJx").unwrap()).unwrap();
+        assert!(!control.contains("eyJx") && control.contains("Content-Length: 2\r\n"), "{control}");
+        assert!(token_control(req, "eyJy").is_none() && token_control(req, "").is_none());
     }
 
     #[test]

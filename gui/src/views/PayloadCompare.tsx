@@ -5,7 +5,7 @@
 import { MAX_BODY, rawResponse, run, type HistoryEntry } from "../api";
 import { useApp } from "../store";
 import { confirm } from "../ui/Confirm";
-import { diffRows, needsUnsafe, sideCells, unsafeReason, verdictLine, verifyArgs, type Verify } from "./verifyFinding.ts";
+import { diffRows, needsUnsafe, sideCells, stripRows, unsafeReason, verdictLine, verifyArgs, type Verify } from "./verifyFinding.ts";
 
 type App = ReturnType<typeof useApp>;
 
@@ -34,11 +34,8 @@ export async function openVerifyDiff(app: App, v: Verify): Promise<void> {
 }
 
 export function VerifyStrip({ v, onDiff }: { v: Verify; onDiff: () => void }) {
-  const rows: [string, Verify["without"]][] = [
-    ["Without payload", v.without],
-    ["With payload", v.with],
-  ];
-  const differs = v.differences.summary.length > 0;
+  const rows = stripRows(v);
+  const differs = v.proof ? v.proof.reproduced === true : v.differences.summary.length > 0;
   return (
     <div className="verify-strip">
       <table className="verify-table">

@@ -1092,6 +1092,16 @@ pub enum Attempt<'a> {
     Answered(&'a Exchange),
 }
 
+/// What the session leaves as a request has it: cookies and parameters by name, headers by
+/// name in any case (a scan rule's [`crate::scan::active::Cx::send_keeping`],
+/// [`AuthSession::send_as_watched_keeping`]).
+#[derive(Debug, Clone, Default)]
+pub struct Keep {
+    pub cookies: Vec<String>,
+    pub params: Vec<String>,
+    pub headers: Vec<String>,
+}
+
 /// A live session shared by every request of a command run.
 pub struct AuthSession {
     pub profile: AuthProfile,
@@ -1413,15 +1423,34 @@ impl AuthSession {
         tool: crate::session::Tool,
         req: &RawRequest,
         target: &Target,
+        watch: impl FnMut(Attempt<'_>) -> Result<()>,
+    ) -> Result<Exchange> {
+        self.send_as_watched_keeping(tool, req, target, &Keep::default(), watch).await
+    }
+
+    /// [`AuthSession::send_as_watched`], leaving what `keep` names as the request has it (see
+    /// [`AuthSession::prepare_keeping`]): a forged token sent again, say, which the session's
+    /// own token would otherwise replace.
+    pub async fn send_as_watched_keeping(
+        &self,
+        tool: crate::session::Tool,
+        req: &RawRequest,
+        target: &Target,
+        keep: &Keep,
         mut watch: impl FnMut(Attempt<'_>) -> Result<()>,
     ) -> Result<Exchange> {
-        let prepared = self.prepare(tool, target, req.as_bytes(), &[], &[]).await;
+        fn names(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        let (cookies, params, headers) = (names(&keep.cookies), names(&keep.params), names(&keep.headers));
+        let prepare = || self.prepare_keeping(tool, target, req.as_bytes(), &cookies, &params, &headers);
+        let prepared = prepare().await;
         let first = RawRequest::from_bytes(prepared.request.clone());
         watch(Attempt::Sending(&first))?;
         let ex = self.client.send(&first, target).await?;
         watch(Attempt::Answered(&ex))?;
         if self.after_response(&prepared, &ex.response).await {
-            let again = RawRequest::from_bytes(self.prepare(tool, target, req.as_bytes(), &[], &[]).await.request);
+            let again = RawRequest::from_bytes(prepare().await.request);
             watch(Attempt::Sending(&again))?;
             let ex = self.client.send(&again, target).await?;
             watch(Attempt::Answered(&ex))?;

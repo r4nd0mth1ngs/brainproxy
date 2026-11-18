@@ -4,7 +4,8 @@
 
 /** One side of `findings verify`: the request sent, and how its sends went. */
 export interface VerifySide {
-  request_history_id: number;
+  /** Null for a JWT finding's control, built from the attack request at the time. */
+  request_history_id: number | null;
   history_ids: number[];
   status: number | null;
   length: number | null;
@@ -31,6 +32,10 @@ export interface Verify {
     evidence_only_with_payload: boolean | null;
     summary: string[];
   };
+  /** A JWT finding on a forged token: the attack with the token taken out. */
+  control?: VerifySide;
+  /** Whether the forged token was answered like the valid one and unlike `control`. */
+  proof?: { reproduced: boolean | null; forged_like_valid: boolean | null; control_like_valid: boolean | null; summary: string };
 }
 
 /** `findings verify`; `edited` sends the request on stdin as the one with the payload. */
@@ -62,8 +67,16 @@ export function sideCells(s: VerifySide): { status: string; length: string; time
   };
 }
 
-/** The result in one line, for a toast or the strip's heading. */
+/** The strip's rows: without and with the payload, or for a forged JWT the three tokens. */
+export function stripRows(v: Verify): [string, VerifySide][] {
+  if (v.control) return [["Valid token", v.without], ["Forged token", v.with], ["Without a token", v.control]];
+  return [["Without payload", v.without], ["With payload", v.with]];
+}
+
+/** The result in one line, for a toast or the strip's heading. A forged JWT is meant to be
+ * answered like the valid one, so its verdict is the proof, not the differences. */
 export function verdictLine(v: Verify): string {
+  if (v.proof) return v.proof.summary;
   const d = v.differences.summary;
   return d.length ? d.join("; ") : "No difference between the responses with and without the payload";
 }

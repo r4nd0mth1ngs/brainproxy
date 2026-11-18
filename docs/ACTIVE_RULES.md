@@ -84,6 +84,11 @@ These use IDs from 100000, so they never clash with ZAP's.
   requests, so the session doesn't send it with every forged token after. The passive rule
   100008 reports what traffic shows without sending anything.
 
+  A forged token's finding names, in its other info, the history rows of the two answers it
+  was judged against (the real token's and the one without a token). `findings verify`
+  sends all three again and says whether the forged token still gets the real one's answer
+  and the request without a token doesn't; a weak secret, found offline, isn't verified.
+
 ## Rules
 
 | ID | Rule | Scope | Max risk | Alert refs |

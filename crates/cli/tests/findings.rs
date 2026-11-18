@@ -363,3 +363,139 @@ fn a_finding_is_sent_with_and_without_its_payload() {
     assert!(v["error"]["message"].as_str().unwrap().contains("no payload"), "{v}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// jwt.io's example token: HS256 signed with "your-256-bit-secret", a secret the JWT rule knows.
+const JWT_ISSUED: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+
+/// An orders page that lets in the token it issues (`POST /login`) and, wrongly, any token
+/// whose header says `alg: none`; without a token it asks to log in. While `open` is set it
+/// lets anyone in.
+fn serve_jwt(open: Arc<AtomicBool>) -> u16 {
+    use base64::Engine;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let open = open.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let mut req = Vec::new();
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let k = s.read(&mut buf).unwrap_or(0);
+                    if k == 0 {
+                        return;
+                    }
+                    req.extend_from_slice(&buf[..k]);
+                }
+                let text = String::from_utf8_lossy(&req).to_string();
+                let token = text
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().starts_with("authorization: bearer ").then(|| l[22..].trim()))
+                    .unwrap_or("")
+                    .to_string();
+                let header = token.split('.').next().unwrap_or("");
+                let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(header).unwrap_or_default();
+                let none = String::from_utf8_lossy(&header).to_ascii_lowercase().contains("\"alg\":\"none\"");
+                let (status, body, ctype) = if text.starts_with("POST /login ") {
+                    ("200 OK", format!("{{\"token\":\"{JWT_ISSUED}\"}}"), "application/json")
+                } else if open.load(Ordering::SeqCst) || token == JWT_ISSUED || none {
+                    ("200 OK", "<h1>Orders of alice</h1><ul><li>order 1</li><li>order 2</li></ul>".into(), "text/html")
+                } else {
+                    ("401 Unauthorized", "<h1>Please log in</h1>".into(), "text/html")
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    port
+}
+
+#[test]
+fn a_forged_jwt_is_verified_against_the_valid_token_and_none() {
+    let open = Arc::new(AtomicBool::new(false));
+    let port = serve_jwt(open.clone());
+    let (dir, project) = setup("verify-jwt");
+    let url = format!("http://127.0.0.1:{port}/orders");
+    let bearer = format!("Authorization: Bearer {JWT_ISSUED}");
+    let sent = ok(&project, &["send", "--url", &url, "-H", &bearer]);
+    let base = sent["id"].as_i64().unwrap_or_else(|| panic!("{sent}"));
+    ok(&project, &["scan", "active", "--history-id", &base.to_string(), "--rules=100007", "--strength", "medium"]);
+    let list = ok(&project, &["findings", "list", "--all", "--source", "active"]);
+    let id_of = |r: &str| {
+        let items = list["items"].as_array().unwrap_or_else(|| panic!("{list}"));
+        let f = items.iter().find(|f| f["alert_ref"] == r).unwrap_or_else(|| panic!("{r}: {list}"));
+        f["id"].to_string()
+    };
+    let (none, weak) = (id_of("100007-2"), id_of("100007-4"));
+
+    // The finding names both answers it was judged against.
+    let shown = ok(&project, &["findings", "show", &none]);
+    let other = shown["other_info"].as_str().unwrap();
+    assert!(other.contains("answered 200") && other.contains("without a token (history"), "{other}");
+
+    // The valid and the forged token are answered alike: the proof is the request without one.
+    let v = ok(&project, &["findings", "verify", &none]);
+    let status = |side: &str| v[side]["status"].as_u64();
+    assert_eq!((status("without"), status("with"), status("control")), (Some(200), Some(200), Some(401)), "{v}");
+    assert_eq!(v["control"]["request_history_id"], Value::Null, "{v}");
+    let p = &v["proof"];
+    assert_eq!((p["reproduced"].as_bool(), p["forged_like_valid"].as_bool()), (Some(true), Some(true)), "{v}");
+    assert_eq!(p["control_like_valid"], false, "{v}");
+    assert!(p["summary"].as_str().unwrap().starts_with("reproduced:"), "{v}");
+    let control = ok(&project, &["history", "show", &v["control"]["history_ids"][0].to_string()]);
+    let request = control["request"]["content"].as_str().unwrap_or_default().to_string();
+    assert!(!request.contains("eyJ") && request.contains("Bearer"), "the token taken out: {control}");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .args(["--format", "text", "--project"])
+        .arg(&project)
+        .args(["findings", "verify", &none])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("no token") && text.contains("reproduced: the forged token"), "{text}");
+
+    // With a session the forged token is still the one sent, not the session's own.
+    let login = format!("http://127.0.0.1:{port}/login");
+    ok(
+        &project,
+        &[
+            "auth",
+            "add",
+            "alice",
+            "--login-url",
+            &login,
+            "--login-body",
+            "{}",
+            "--token-regex",
+            r#""token":"([^"]+)""#,
+            "--token-header",
+            "Authorization: Bearer {{token}}",
+        ],
+    );
+    let v = ok(&project, &["findings", "verify", &none, "--auth", "alice"]);
+    let forged = ok(&project, &["history", "show", &v["with"]["history_ids"][0].to_string()]);
+    let attack = shown["attack"].as_str().unwrap();
+    assert!(forged["request"]["content"].as_str().unwrap_or_default().contains(attack), "{forged}");
+    assert_eq!(v["proof"]["reproduced"], true, "{v}");
+
+    // Once the page lets anyone in, the forged token proves nothing.
+    open.store(true, Ordering::SeqCst);
+    let v = ok(&project, &["findings", "verify", &none]);
+    assert_eq!(
+        (v["proof"]["reproduced"].as_bool(), v["proof"]["control_like_valid"].as_bool()),
+        (Some(false), Some(true)),
+        "{v}"
+    );
+
+    // A weak secret was found offline: there is nothing to send.
+    let (code, v) = run(&project, &["findings", "verify", &weak]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("found offline"), "{v}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

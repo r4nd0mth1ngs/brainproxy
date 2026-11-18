@@ -638,6 +638,16 @@ impl Probe<'_> {
     }
 
     fn report(&self, def: &'static AlertDef, forged: &str, other: String, resp: &Response) {
+        // The two answers it was judged against, for a reader checking it by hand (findings
+        // verify sends all three again).
+        let row = |r: &Response| r.history_id.map(|id| format!(" (history {id})")).unwrap_or_default();
+        let other = format!(
+            "{other}\n\nThe real token{} was answered {}, the request without a token{} {}.",
+            row(&self.real),
+            self.real.status,
+            row(&self.absent),
+            self.absent.status
+        );
         self.cx.report(def.raise(self.place.clone(), "").attack(forged.to_string()).other_info(other), resp);
     }
 

@@ -968,14 +968,7 @@ pub struct OobSummary {
     pub waited_ms: u64,
 }
 
-/// What the logged-in session leaves as a rule's request has it ([`Cx::send_keeping`]):
-/// cookies and parameters by name, headers by name in any case.
-#[derive(Debug, Clone, Default)]
-pub struct Keep {
-    pub cookies: Vec<String>,
-    pub params: Vec<String>,
-    pub headers: Vec<String>,
-}
+pub use crate::auth::Keep;
 
 /// A request to attack, with its baseline response.
 #[derive(Debug, Clone)]

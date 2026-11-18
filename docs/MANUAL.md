@@ -3179,7 +3179,18 @@ Findings are records with a history, not just rows:
   `differences`: `status_changed`, `length_delta`, `duration_delta_ms`,
   `evidence_only_with_payload` (null without evidence), the last bodies' line diff (`body`:
   `identical`, `similarity`, the first 20 changed lines) and a `summary` in words (a time
-  difference under a second isn't named there). Nothing about the finding changes: mark it
+  difference under a second isn't named there). A JWT finding on a forged token (100007-1, -2,
+  -3, -5, -6, -7) is judged otherwise, because the forged token is meant to get the valid
+  token's answer: a third request is sent alongside, the attack with the token taken out (as
+  the scan's own control was), as `control` (its `request_history_id` is null, as it is built
+  from the attack request), and `proof` says whether the finding holds now: `reproduced`
+  (true when the forged token got the valid one's answer, by status and nearly the same
+  words, and the request without a token didn't), `forged_like_valid`, `control_like_valid`
+  and a `summary` in words, which the text output prints in place of the differences. A
+  valid token that is refused, or a page that answers without a token as with one, is not
+  reproduced. The session (`--auth`) leaves the token's header, cookie or parameter as the
+  attack has it, so the forged token is the one sent. A weak secret (100007-4) was found
+  offline, with nothing sent, so it is refused. Nothing about the finding changes: mark it
   once you've judged it.
 - **Posture** (`findings posture`): open issues and findings by risk, findings by state, a
   risk × confidence grid, the 20 hosts with most open findings, what each completed

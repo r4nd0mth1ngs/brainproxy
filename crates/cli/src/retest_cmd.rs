@@ -16,7 +16,7 @@
 
 use std::path::Path;
 
-use brainproxy_core::auth::Attempt;
+use brainproxy_core::auth::{Attempt, Keep};
 use brainproxy_core::http::{Client, RawRequest, SendOptions};
 use brainproxy_core::scan::findings_db::fingerprint;
 use brainproxy_core::scan::issues::Retest;
@@ -361,6 +361,16 @@ impl Resender {
     /// Sends one request. Fails, sending nothing, for a target out of scope; and when the
     /// request couldn't be recorded or the user interrupted it.
     pub(crate) fn send(&mut self, target: &brainproxy_core::http::Target, request: &[u8]) -> Result<Resent, Error> {
+        self.send_keeping(target, request, &Keep::default())
+    }
+
+    /// [`Resender::send`], the session leaving what `keep` names as the request has it.
+    pub(crate) fn send_keeping(
+        &mut self,
+        target: &brainproxy_core::http::Target,
+        request: &[u8],
+        keep: &Keep,
+    ) -> Result<Resent, Error> {
         let guard = self.client.options().guard.clone().expect("a resender has a guard");
         crate::require_in_scope(&guard, target)?;
         let req = RawRequest::from_bytes(request.to_vec());
@@ -387,7 +397,7 @@ impl Resender {
                                 None => Ok(()),
                             },
                         };
-                        s.send_as_watched(brainproxy_core::session::Tool::Send, &req, target, watch).await
+                        s.send_as_watched_keeping(brainproxy_core::session::Tool::Send, &req, target, keep, watch).await
                     }
                     None => {
                         sending(log, rows, open, &req)?;

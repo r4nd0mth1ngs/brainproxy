@@ -351,7 +351,10 @@ Stop so Settings › Keyboard lists them.
 `views/PayloadCompare.tsx`, `views/verifyFinding.ts`) runs `findings verify ID`: the request the
 scan started from and the attack go out again, now, and a strip shows each one's status,
 length, time and whether the evidence is in the response, what differs in words, and which
-request stood in for the baseline when the scan didn't record one. *Diff responses* opens the
+request stood in for the baseline when the scan didn't record one. For a JWT finding on a
+forged token the strip has three rows (the valid token, the forged one, and the request
+without a token) and says whether the finding was reproduced instead of what differs, since the
+forged token is meant to get the valid one's answer. *Diff responses* opens the
 two responses in Diff (without the payload as A). A request that may change data is sent only
 after a confirmation (`--allow-unsafe`), as for a retest. *Send to Replay* opens the attack
 with its payload highlighted, and the tab remembers the finding: *Compare with baseline* there
