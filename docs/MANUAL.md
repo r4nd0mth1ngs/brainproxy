@@ -835,8 +835,13 @@ attack type, and pick payloads:
     one-time codes, browser logins and passkeys in auth profiles). The crawl reloads pages to get back
     to a state; when the browser then asks whether a script, style, image or font it
     already fetched in this crawl has changed (a conditional GET), the crawl's proxy
-    answers 304 itself, so that request isn't sent or recorded. The summary counts them in
-    `revalidations_answered`.
+    answers 304 itself, so that request isn't sent or recorded. A single-page app also
+    reads the same data again on every route change (Juice Shop its configuration, about
+    five times a page): a conditional GET whose copy (its `ETag` or `Last-Modified`, with
+    the same cookies and `Authorization`) is the last answer the site gave is answered 304
+    the same way, until a request that may change something (anything but GET, HEAD or
+    OPTIONS) is answered; the first read after it goes to the site. The summary counts both
+    in `revalidations_answered`.
   - **Limits:** depth, max pages (page loads, clicks and form submissions, counting the
     reloads and clicks needed to get back to a page state), rate, path
     prefix and the site's origin apply as for the plain crawl, and it stops after 30

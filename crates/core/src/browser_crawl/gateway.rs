@@ -9,12 +9,14 @@
 //! The crawler reloads pages to get back to a state, and the browser revalidates every
 //! script, style, image and font that the site marks `max-age=0` on each load. With
 //! `answer_revalidations`, such a request for a file already fetched in this crawl is
-//! answered 304 here and neither sent nor recorded: the browser keeps its copy.
+//! answered 304 here and neither sent nor recorded: the browser keeps its copy. So is a
+//! conditional GET for other data (an app's API) whose last answer, since the last request
+//! that may have changed something, had the validator the browser asks with.
 //!
 //! A separate proxy from `proxy run` on purpose: it needs no running proxy, never holds a
 //! request in the intercept queue, and its limits apply only to the crawl.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -57,7 +59,8 @@ pub(crate) struct Options {
     pub tap: Option<Arc<dyn Tap>>,
     /// Rows keep no content (`--no-store`).
     pub no_store: bool,
-    /// Answer conditional requests for static files fetched before with 304, unsent.
+    /// Answer conditional requests for static files fetched before, and for other GETs whose
+    /// copy is still the last answer (see [`Validators`]), with 304, unsent.
     pub answer_revalidations: bool,
 }
 
@@ -95,6 +98,61 @@ struct Shared {
     stats: Mutex<Stats>,
     /// Static files fetched (200 or 304) in this crawl, by URL.
     fetched: Mutex<HashSet<String>>,
+    /// Other GET answers the site gave a validator, since the last write (see [`Validators`]).
+    validators: Mutex<Validators>,
+}
+
+/// The validator (ETag or Last-Modified) of the last answer to each GET that isn't a static
+/// file, keyed on the URL and the credentials sent. A single-page app asks again for the same
+/// data on every route change (Juice Shop: its configuration about five times per page), and
+/// the browser asks conditionally; while nothing could have changed it, the answer is the copy
+/// the browser holds, so the crawl gives the 304 itself instead of sending and recording the
+/// same exchange again. Any answered request that may change something (not GET, HEAD or OPTIONS)
+/// forgets them all: a basket read after an item is added must reach the site.
+/// ponytail: a change the site makes on its own (time, other users) between two reads in one
+/// crawl isn't seen; the first read after any write, and every read without a validator, is sent.
+#[derive(Default)]
+struct Validators {
+    by_key: HashMap<String, String>,
+    /// Bumped by each answered write, so a read that was out across one doesn't record a validator.
+    epoch: u64,
+}
+
+impl Validators {
+    fn key(url: &str, headers: &[(String, String)]) -> String {
+        format!(
+            "{url}\n{}\n{}",
+            header(headers, "cookie").unwrap_or(""),
+            header(headers, "authorization").unwrap_or("")
+        )
+    }
+
+    /// Whether the browser's copy, named by the request's conditional headers, is the last answer.
+    fn current(&self, key: &str, headers: &[(String, String)]) -> bool {
+        let Some(v) = self.by_key.get(key) else { return false };
+        match header(headers, "if-none-match") {
+            Some(tags) => tags.split(',').any(|t| t.trim() == v),
+            None => header(headers, "if-modified-since") == Some(v.as_str()),
+        }
+    }
+
+    /// Notes the answer to a GET sent at `epoch`.
+    fn answered(&mut self, key: String, epoch: u64, status: Option<u16>, response: &[u8]) {
+        if epoch != self.epoch {
+            return;
+        }
+        let head = parse_response_head(response).ok().filter(|_| matches!(status, Some(200 | 304)));
+        let validator = head.as_ref().and_then(|h| h.header("etag").or(h.header("last-modified")).map(str::trim));
+        match validator.filter(|v| !v.is_empty()) {
+            Some(v) => drop(self.by_key.insert(key, v.to_string())),
+            None => drop(self.by_key.remove(&key)),
+        }
+    }
+
+    fn write_sent(&mut self) {
+        self.by_key.clear();
+        self.epoch += 1;
+    }
 }
 
 pub(crate) struct Gateway {
@@ -121,6 +179,7 @@ impl Gateway {
             last_done: Mutex::new(Instant::now()),
             stats: Mutex::default(),
             fetched: Mutex::default(),
+            validators: Mutex::default(),
         });
         let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
         let s = shared.clone();
@@ -348,6 +407,22 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
     if let Some(tap) = &s.opts.tap {
         request = tap.outgoing(target, request);
     }
+    // Keyed on the request as it goes out, with the session's credentials in it.
+    let mut read = match method.as_str() {
+        "GET" if s.opts.answer_revalidations && !cacheable => {
+            let sent_head = RawRequest::from_bytes(request.clone()).head().ok();
+            let headers = sent_head.as_ref().map_or(&head.headers, |h| &h.headers);
+            let key = Validators::key(&url, headers);
+            let v = s.validators.lock().unwrap();
+            if v.current(&key, headers) {
+                drop(v);
+                s.stats.lock().unwrap().revalidations_answered += 1;
+                return (b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n".to_vec(), None);
+            }
+            Some((key, v.epoch))
+        }
+        _ => None,
+    };
     // In flight while it waits for its turn too, so the page isn't taken as settled.
     let _busy = InFlight::new(s);
     if let Some(l) = &s.limiter {
@@ -359,6 +434,8 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
         a.observe(response);
         // Session lost: log in again and replay with the new session.
         if a.is_logged_out(response) && a.relogin(generation).await {
+            // Its answer is for other credentials than the read was keyed on.
+            read = None;
             request = a.apply_to(&request, &[], target);
             (recorded, sent) = forward_recorded(s, target, &request, &method).await;
             if let Ok((_, response)) = &sent {
@@ -387,6 +464,12 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
     let status = parse_response_head(final_response(&response)).ok().map(|h| h.status);
     if cacheable && matches!(status, Some(200 | 304)) {
         s.fetched.lock().unwrap().insert(url.clone());
+    }
+    match read {
+        Some((key, epoch)) => s.validators.lock().unwrap().answered(key, epoch, status, final_response(&response)),
+        // A write the site answered (the browser's own calls home are refused unsent).
+        None if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") => s.validators.lock().unwrap().write_sent(),
+        None => {}
     }
     {
         let mut st = s.stats.lock().unwrap();
@@ -558,6 +641,36 @@ mod tests {
         assert!(blocked_reason("https://a.test/api/items/3", "delete", &exclude, true).is_some());
         assert!(blocked_reason("https://a.test/api/items/3", "DELETE", &exclude, false).is_none());
         assert!(blocked_reason("https://a.test/api/items", "POST", &exclude, true).is_none());
+    }
+
+    #[test]
+    fn repeated_reads_are_answered_until_something_is_written() {
+        let mut v = Validators::default();
+        let ok = |etag: &str| format!("HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Length: 0\r\n\r\n").into_bytes();
+        let ask = headers(&[("Cookie", "token=a"), ("If-None-Match", "W/\"1\"")]);
+        let key = Validators::key("http://a.test/rest/config", &ask);
+        assert!(!v.current(&key, &ask), "nothing seen yet: sent");
+        v.answered(key.clone(), v.epoch, Some(200), &ok("W/\"1\""));
+        assert!(v.current(&key, &ask), "the browser holds the last answer: answered here");
+        // Another copy, other credentials, or no conditional header: sent.
+        assert!(!v.current(&key, &headers(&[("Cookie", "token=a"), ("If-None-Match", "W/\"0\"")])));
+        let other = headers(&[("Cookie", "token=b"), ("If-None-Match", "W/\"1\"")]);
+        assert!(!v.current(&Validators::key("http://a.test/rest/config", &other), &other));
+        assert!(!v.current(&key, &headers(&[("Cookie", "token=a")])));
+        // A write forgets everything, and a read that was out across it records nothing.
+        let before = v.epoch;
+        v.write_sent();
+        assert!(!v.current(&key, &ask));
+        v.answered(key.clone(), before, Some(200), &ok("W/\"1\""));
+        assert!(!v.current(&key, &ask));
+        // Last-Modified works the same; an answer without a validator, or an error, forgets it.
+        let since = headers(&[("If-Modified-Since", "Tue, 17 Nov 2026 10:00:00 GMT")]);
+        let k2 = Validators::key("http://a.test/rest/news", &since);
+        let lm = b"HTTP/1.1 304 Not Modified\r\nLast-Modified: Tue, 17 Nov 2026 10:00:00 GMT\r\n\r\n";
+        v.answered(k2.clone(), v.epoch, Some(304), lm);
+        assert!(v.current(&k2, &since));
+        v.answered(k2.clone(), v.epoch, Some(500), lm);
+        assert!(!v.current(&k2, &since));
     }
 
     #[test]

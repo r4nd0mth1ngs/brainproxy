@@ -412,6 +412,11 @@ fn browser_crawl_follows_hash_router_links_and_signs_up() {
     rows.sort();
     rows.dedup();
     assert_eq!(rows.len(), 1, "{rows:?}");
+    // Read on every page load and route change, but asked again only after a write.
+    let reads = lines.iter().filter(|l| l.starts_with("GET /api/shop-settings ")).count();
+    let writes = lines.iter().filter(|l| l.starts_with("POST ")).count();
+    assert!(reads <= writes + 1, "{reads} reads, {writes} writes: {lines:?}");
+    assert!(v["data"]["pages_loaded"].as_u64().unwrap() > writes as u64 + 1, "{v}");
 }
 
 #[test]
