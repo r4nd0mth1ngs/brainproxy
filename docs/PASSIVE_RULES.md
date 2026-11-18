@@ -189,6 +189,14 @@ noise on modern applications:
 - **Anti-clickjacking (10020-1)** and **CSP Header Not Set (10038-1)** skip a text/html body
   without any markup (socket.io answers a POST with `ok`): there is no page to frame or
   script to restrict.
+- **Private IP Disclosure (2)** skips an address written as IPv4-mapped IPv6
+  (`::ffff:172.17.0.1`) when the target itself is at a loopback or private address (or is
+  `localhost`). That form is how a dual-stack server writes the peer of a connection, so it
+  is the tester's own address as the server saw it ("Blocked illegal activity by
+  ::ffff:172.17.0.1" behind a Docker port mapping). Behind a public address (or a host
+  name), a private peer is the site's own proxy or load balancer, and is still reported, as
+  is an address in plain dotted form (a configured `192.168.99.100:3000`). Like ZAP, it
+  also skips the request's own host, and (unlike ZAP) a range such as `10.0.0.0/8`.
 - **PII Disclosure (10062)** is Medium at low confidence (ZAP: High, Medium) for a card
   number with no label such as `card`, `credit`, `cc` or `pan` in the 40 characters before
   it: one number in ten passes the Luhn check, so ids and order numbers did.

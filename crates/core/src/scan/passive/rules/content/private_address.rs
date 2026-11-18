@@ -64,6 +64,39 @@ fn is_cidr(text: &str, end: usize) -> bool {
     b.get(end) == Some(&b'/') && b.get(end + 1).is_some_and(u8::is_ascii_digit)
 }
 
+/// Diverges from ZAP: an address written as IPv4-mapped IPv6 (`::ffff:172.17.0.1`) is how a
+/// dual-stack server (Node, Java, .NET) writes the peer of a socket, so in a response it is
+/// almost always the address the server saw this request come from ("Blocked illegal activity
+/// by ::ffff:172.17.0.1"). Reached at a loopback or private address, the server sees the
+/// tester at a private address of their own network (a Docker bridge's gateway, a LAN
+/// address), which tells nothing new. Behind a public address, a private peer is the server's
+/// own proxy or load balancer, which is worth reporting, as is any address in the dotted form
+/// alone (a configured host such as `192.168.99.100:3000`).
+fn echoed_peer(text: &str, start: usize, host: &str) -> bool {
+    let before = &text.as_bytes()[..start];
+    let mapped = before.len() >= 7 && before[before.len() - 7..].eq_ignore_ascii_case(b"::ffff:");
+    mapped && internal_host(host)
+}
+
+/// Whether the target host is a loopback or private address (or `localhost`): one only a
+/// tester inside its network reaches. A name is taken as public, whatever it resolves to.
+fn internal_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback() || v4.is_private())
+        }
+        Err(_) => false,
+    }
+}
+
 pub struct PrivateAddress;
 
 impl PassiveRule for PrivateAddress {
@@ -95,7 +128,10 @@ impl PassiveRule for PrivateAddress {
                 continue;
             }
             pos = all.end().max(all.start() + 1);
-            if !addr.as_str().eq_ignore_ascii_case(&msg.host) && !is_cidr(body, all.end()) {
+            if !addr.as_str().eq_ignore_ascii_case(&msg.host)
+                && !is_cidr(body, all.end())
+                && !echoed_peer(body, addr.start(), &msg.host)
+            {
                 found.push(all.as_str());
             }
         }
@@ -137,5 +173,30 @@ mod tests {
         assert!(m.body(js).scan(&PrivateAddress).is_empty());
         let f = msg("https://a.test/").html("net 10.0.0.0/8, gateway 10.0.0.1").scan(&PrivateAddress);
         assert_eq!(f[0].evidence, "10.0.0.1");
+    }
+
+    /// Juice Shop in Docker, reached at 127.0.0.1, names the tester's address as the bridge
+    /// gateway shows it: that isn't a disclosure. A configured host on the same page still is.
+    #[test]
+    fn ignores_the_testers_own_address_echoed_by_an_internal_server() {
+        let blocked = "<title>Error: Blocked illegal activity by ::ffff:172.17.0.1</title>";
+        for target in ["http://127.0.0.1:3300/profile", "http://localhost/", "http://10.1.2.3/", "http://[::1]/"] {
+            assert!(msg(target).html(blocked).scan(&PrivateAddress).is_empty(), "{target}");
+        }
+        let config = r#"{"uri":"http://192.168.99.100:3000"} blocked ::FFFF:172.17.0.1"#;
+        let f = msg("http://127.0.0.1:3300/rest/admin/application-configuration").html(config).scan(&PrivateAddress);
+        assert_eq!(
+            (f[0].evidence.as_str(), f[0].other_info.as_str()),
+            ("192.168.99.100:3000", "192.168.99.100:3000\n")
+        );
+        // The dotted form alone may be anything the server knows of, so it is reported.
+        assert_eq!(msg("http://127.0.0.1/").html("by 172.17.0.1").scan(&PrivateAddress)[0].evidence, "172.17.0.1");
+    }
+
+    /// Behind a public name, a private peer is the site's own proxy or load balancer.
+    #[test]
+    fn reports_a_private_peer_of_a_public_site() {
+        let f = msg("https://shop.test/").html("request from ::ffff:10.0.4.7 refused").scan(&PrivateAddress);
+        assert_eq!(f[0].evidence, "10.0.4.7");
     }
 }
