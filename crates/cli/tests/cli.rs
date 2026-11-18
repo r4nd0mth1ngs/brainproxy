@@ -708,6 +708,11 @@ fn crawl_reads_a_single_page_apps_fallback_page_once() {
     let paths: Vec<&str> =
         v["data"]["endpoints"].as_array().unwrap().iter().filter_map(|e| e["path"].as_str()).collect();
     assert_eq!(paths, ["/", "/api/items", "/main.js"], "{v}");
+    // The seed is fetched before the made-up path, so the page's findings are filed under it,
+    // and each copy of the page is one more sighting of them, not a finding per URL.
+    assert!(lines[0].starts_with("GET / ") && lines[1].starts_with("GET /brainproxy-"), "{lines:?}");
+    let (_, q) = run(&["query", "SELECT url, hits FROM findings WHERE alert_ref = '10038-1'"], &project, None);
+    assert_eq!(q["data"]["rows"], serde_json::json!([[site, 4]]), "{q}");
 }
 
 /// A bundle that posts to one route and gets another that only answers POST.

@@ -280,6 +280,8 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
     // that page again), so reading every copy multiplies the crawl. A path that can't exist
     // shows what that answer looks like on each seed's origin.
     let mut fallbacks: HashMap<String, (u16, u64)> = HashMap::new();
+    // Seeds fetched before their origin's probe, waiting to be read like any other page.
+    let mut prefetched: VecDeque<(Req, usize, bool, FetchResult)> = VecDeque::new();
     for u in &seeds {
         let origin = u.origin().ascii_serialization();
         // A budget that only covers the seeds has no room for copies to skip.
@@ -287,6 +289,19 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
             continue;
         }
         let Some(probe) = fallback_probe(u).filter(|p| scope.allows(p)) else { continue };
+        // The seed goes first: the passive scan files a page's findings under the first URL it
+        // was seen at (a copy of it elsewhere is another sighting), and that should be the
+        // site's own page, not a made-up path.
+        let seed = Req { method: "GET".into(), url: strip_fragment(u), body: None };
+        if scope.allows(u) && seen.insert(seed.clone()) {
+            if let Some(l) = &limiter {
+                l.wait().await;
+            }
+            sent += 1;
+            *per_path.entry(("GET".into(), u.path().to_string())).or_default() += 1;
+            let result = fetch(&client, &rows, cfg.auth.as_deref(), &jar, &seed, &cfg.headers).await;
+            prefetched.push_back((seed, 0, false, result));
+        }
         if let Some(l) = &limiter {
             l.wait().await;
         }
@@ -385,8 +400,14 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
                 Some((req, depth, guessed, result))
             });
         }
-        let Some(done) = running.join_next().await else { break };
-        let Ok(Some((req, depth, guessed, (target, raw_req, recorded, outcome)))) = done else { continue };
+        let (req, depth, guessed, (target, raw_req, recorded, outcome)) = match prefetched.pop_front() {
+            Some(done) => done,
+            None => {
+                let Some(done) = running.join_next().await else { break };
+                let Ok(Some(done)) = done else { continue };
+                done
+            }
+        };
         summary.requests += 1;
         match outcome {
             Err(e) => failed(&mut summary, &mut out_of_scope, &save, (&target, &raw_req, recorded), &e),

@@ -2364,7 +2364,10 @@ Crawl and active-scan scope and safety flags:
   other copies are not counted as endpoints and their links aren't read again, so relative
   links on an index.html served at `/a/b` don't multiply. The summary counts them in
   `fallback_pages`. A catch-all page that changes with each request (it echoes the path or
-  carries a nonce) isn't recognised.
+  carries a nonce) isn't recognised. The first seed of each origin is requested just before
+  that path, so a finding about the page itself (a missing header) is filed under the seed:
+  the passive scan counts each copy of a page as another hit of that finding, whichever
+  crawl, proxy or tool recorded it ([PASSIVE_RULES.md](PASSIVE_RULES.md)).
 - Paths read from scripts: when the code beside a path shows another method
   (`http.post(`…`)`, `.put(`, `.patch(`, `.delete(`, or `method: "POST"` / `type: "PUT"` in
   the call's options), the plain crawler doesn't send it, as a GET would only fail and the
