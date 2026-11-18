@@ -164,7 +164,9 @@ mod tests {
     /// bundle), and none for ids in URLs or for constants in scripts.
     #[test]
     fn one_finding_per_part_and_not_ids_in_urls_or_scripts() {
-        let ts = |d: i64| (now() - d).to_string();
+        // The clock is read once: read per value, a second can tick between two of them.
+        let base = now();
+        let ts = |d: i64| (base - d).to_string();
         let records: String = (1..=8).map(|d| format!("{{\"t\":{}}},", ts(d * 60))).collect();
         let f = msg("https://a.test/").header("Content-Type", "application/json").body(&records).scan(&Timestamp);
         assert_eq!((f.len(), f[0].evidence.as_str()), (1, ts(60).as_str()));
