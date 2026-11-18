@@ -152,6 +152,16 @@ Behaviour follows ZAP's default (MEDIUM) alert threshold. The main differences:
 - **Findings are de-duplicated:** the same alert, method, URL (without its query) and
   parameter is one finding with a `hits` count; the first evidence is kept. ZAP lists each
   differing evidence separately (for example two `Server` headers in one response).
+- **A copy of a page is one more hit, not another finding.** The rules that judge a page's
+  protections and shape from its headers and markup alone (10017, 10020, 10038, 10055,
+  10109 and 90003) file a finding seen in a copy of a page they already reported under the
+  URL where they first saw it, as another hit. A copy is a response from the same origin
+  with the same status and body, raising the same evidence: a single-page app's start
+  page, which it gives for every unknown path, or an error page shared by many endpoints.
+  A page with content of its own (or an empty body) is still a finding of its own. The
+  other rules still raise one per URL: those that read the URL or the request, report what
+  a body discloses, or report a header any response may send (X-Powered-By, Server,
+  X-Content-Type-Options). ZAP raises one per URL for all of them.
 
 ### Less noise
 

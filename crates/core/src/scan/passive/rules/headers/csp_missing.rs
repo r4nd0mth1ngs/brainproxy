@@ -90,6 +90,10 @@ impl PassiveRule for CspMissing {
         &ALERTS
     }
 
+    fn page_level(&self) -> bool {
+        true
+    }
+
     fn scan(&self, msg: &Message, out: &mut Vec<Finding>) {
         if !msg.is_html() || is_redirect(msg.status) {
             return;

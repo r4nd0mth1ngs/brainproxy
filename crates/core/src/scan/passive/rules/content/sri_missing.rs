@@ -54,6 +54,10 @@ impl PassiveRule for SriMissing {
         &ALERTS
     }
 
+    fn page_level(&self) -> bool {
+        true
+    }
+
     fn scan(&self, msg: &Message, out: &mut Vec<Finding>) {
         // Diverges from ZAP, which parses every response: a `<script>` in a string of a JS
         // bundle, JSON or a source map isn't an element of a page.

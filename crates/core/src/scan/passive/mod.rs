@@ -109,6 +109,16 @@ pub fn all_rules() -> &'static [Box<dyn PassiveRule>] {
     RULES.get_or_init(rules::all)
 }
 
+/// Whether a finding with this alert ref is one of a rule that judges only the page
+/// ([`PassiveRule::page_level`]), so a copy of the page at another URL is the same finding.
+fn page_level(alert_ref: &str) -> bool {
+    static REFS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+    REFS.get_or_init(|| {
+        all_rules().iter().filter(|r| r.page_level()).flat_map(|r| r.alerts().iter().map(|a| a.alert_ref)).collect()
+    })
+    .contains(alert_ref)
+}
+
 static CHECK_HOME: OnceLock<PathBuf> = OnceLock::new();
 
 /// Also run the passive checks (`scope: passive`) of the brainproxy feed and the
@@ -545,7 +555,7 @@ pub fn scan_pending(store: &mut Store) -> Result<ScanStats> {
         let Some(batch_last) = batch.last().map(|m| m.history_id) else { break };
         for msg in &batch {
             let findings = scan_message_with(msg, &settings, &scripts);
-            stats.new_findings += store.record_findings("passive", msg, &findings)?;
+            stats.new_findings += store.record_passive_findings(msg, &findings, page_level)?;
             stats.scanned += 1;
         }
         last = batch_last;
@@ -574,7 +584,7 @@ pub fn scan_late(store: &mut Store, id: i64) -> Result<usize> {
     let mut new = 0;
     for msg in store.scan_messages_after(id - 1, &settings.scanned_sources(), 1)?.iter().filter(|m| m.history_id == id)
     {
-        new += store.record_findings("passive", msg, &scan_message(msg, &settings))?;
+        new += store.record_passive_findings(msg, &scan_message(msg, &settings), page_level)?;
     }
     Ok(new)
 }
@@ -935,6 +945,51 @@ mod tests {
         assert!(next.new_findings > 0 && findings(&store) > before, "{next:?}");
         // Once: the list is empty again.
         assert_eq!(scan_pending(&mut store).unwrap().scanned, 0);
+    }
+
+    /// A single-page app answers every unknown path with its start page: a page-level finding
+    /// there is one finding seen at many URLs, not one per URL. A page of its own, the same page
+    /// on another origin, and a finding of a rule that reads the URL are still their own.
+    #[test]
+    fn a_copy_of_a_page_at_another_url_is_another_sighting() {
+        let mut store = Store::open_in_memory().unwrap();
+        let spa = "<!doctype html><html><head><title>Shop</title></head><body><app-root></app-root>\
+            <script src=\"main.js\"></script> mail me at 10.0.0.9</body></html>";
+        let own = "<!doctype html><html><head><title>About</title></head><body><p>About us</p>\
+            <script src=\"about.js\"></script></body></html>";
+        let record = |url: &str, body: &str| {
+            let target = Target::from_url(url).unwrap();
+            let path = &url[url::Url::parse(url).unwrap().origin().ascii_serialization().len()..];
+            let request = format!("GET {path} HTTP/1.1\r\nHost: {}\r\n\r\n", target.host);
+            let response =
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            store.record(&Capture::new("crawl", &target, request.as_bytes(), Some(response.as_bytes()), None, None))
+        };
+        for url in ["http://a.test/", "http://a.test/x/socket.io/", "http://a.test/nope", "http://a.test:8080/x"] {
+            record(url, spa).unwrap();
+        }
+        record("http://a.test/about", own).unwrap();
+        record("http://a.test/x/nope?q=1", spa).unwrap();
+        scan_pending(&mut store).unwrap();
+        let seen = |s: &Store, alert: &str| -> Vec<(String, i64)> {
+            let sql = "SELECT url, hits FROM findings WHERE alert_ref = ?1 ORDER BY id";
+            let rows = s.query(sql, &[alert.to_string()], 100, 100).unwrap().rows;
+            rows.iter().map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_i64().unwrap())).collect()
+        };
+        let pages = |hits| {
+            vec![
+                ("http://a.test/".to_string(), hits),
+                ("http://a.test:8080/x".to_string(), 1),
+                ("http://a.test/about".to_string(), 1),
+            ]
+        };
+        assert_eq!(seen(&store, "10038-1"), pages(4));
+        assert_eq!(seen(&store, "10109"), pages(4));
+        // Private IP Disclosure isn't one of them: it is raised on each URL, as before.
+        assert_eq!(seen(&store, "2").len(), 5);
+        // A rescan counts them the same way.
+        rescan(&mut store).unwrap();
+        assert_eq!(seen(&store, "10038-1"), pages(4));
     }
 
     /// A feed check that no longer loads is said, and a rescan keeps its findings; before, it

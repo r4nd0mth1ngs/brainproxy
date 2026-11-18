@@ -161,4 +161,11 @@ pub trait PassiveRule: Send + Sync {
     /// Every alert this rule can raise (for `scan rules`).
     fn alerts(&self) -> &'static [&'static AlertDef];
     fn scan(&self, msg: &Message, out: &mut Vec<Finding>);
+    /// Whether it judges only the page a response serves (its headers and markup), never the
+    /// request or URL: the same page served at another URL (a single-page app's start page,
+    /// which answers every unknown path, or a shared error page) is then the same finding,
+    /// counted again rather than raised again (`Store::record_passive_findings`).
+    fn page_level(&self) -> bool {
+        false
+    }
 }

@@ -86,6 +86,10 @@ impl PassiveRule for AntiClickjacking {
         &ALERTS
     }
 
+    fn page_level(&self) -> bool {
+        true
+    }
+
     fn scan(&self, msg: &Message, out: &mut Vec<Finding>) {
         if !msg.is_html() || msg.resp_body.is_empty() || !zap_is_text(msg) {
             return;

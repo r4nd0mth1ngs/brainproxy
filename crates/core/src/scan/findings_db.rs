@@ -921,6 +921,74 @@ impl Store {
         findings: &[Finding],
         base: Option<i64>,
     ) -> Result<usize> {
+        let urls = vec![msg.url.as_str(); findings.len()];
+        self.record_findings_at(source, msg, findings, &urls, base)
+    }
+
+    /// The passive scanner's [`Store::record_findings`]. A finding of a rule that judges only
+    /// the page (`page_level`, by alert ref), in a response that is a copy of a page it was
+    /// already found in at another URL of the same origin, is another sighting of that one: a
+    /// single-page app answers every unknown path with its start page, and many sites share one
+    /// error page, so one missing header there is one finding, not one per URL. A copy has the
+    /// same status, body and evidence, so a page with content of its own is a finding of its own.
+    pub fn record_passive_findings(
+        &mut self,
+        msg: &Message,
+        findings: &[Finding],
+        page_level: impl Fn(&str) -> bool,
+    ) -> Result<usize> {
+        let mut first = Vec::with_capacity(findings.len());
+        for f in findings {
+            first.push(if page_level(f.def.alert_ref) { self.first_page_copy(msg, f)? } else { None });
+        }
+        let urls: Vec<&str> = first.iter().map(|u| u.as_deref().unwrap_or(&msg.url)).collect();
+        self.record_findings_at("passive", msg, findings, &urls, None)
+    }
+
+    /// The URL of the first passive finding like `f` whose first sighting got the same answer as
+    /// `msg`, from the same origin. An empty body isn't a page: many endpoints answer with one.
+    fn first_page_copy(&self, msg: &Message, f: &Finding) -> Result<Option<String>> {
+        if msg.resp_body.is_empty() {
+            return Ok(None);
+        }
+        // Only one counted so far (hits > 0): during a rescan, one not found again yet could
+        // take sightings and then be found nowhere itself (its row may no longer be scanned).
+        // The length is compared first: SQLite reads it from the row's header, where comparing
+        // bodies reads each one in full.
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT f.url FROM findings f JOIN history h ON h.id = f.history_id
+             WHERE f.alert_ref = ?1 AND f.host = ?2 AND f.source = 'passive' AND f.method = ?3 AND f.param = ?4
+                AND f.evidence = ?5 AND f.hits > 0 AND f.state != 'removed'
+                AND h.scheme = ?6 AND h.port = ?7 AND h.status = ?8 AND length(h.resp_body) = ?10
+                AND h.resp_body = ?9
+             ORDER BY f.id LIMIT 1",
+        )?;
+        let evidence = truncate(&f.evidence, 2000);
+        let args = params![
+            f.def.alert_ref,
+            msg.host,
+            msg.method,
+            f.param,
+            evidence,
+            msg.scheme,
+            msg.port,
+            msg.status,
+            msg.resp_body,
+            i64::try_from(msg.resp_body.len()).unwrap_or(i64::MAX)
+        ];
+        Ok(stmt.query_row(args, |r| r.get(0)).optional()?)
+    }
+
+    /// Records `findings` from `msg`, each at its URL in `urls`: the message's own, or that of
+    /// the first page it is a copy of.
+    fn record_findings_at(
+        &mut self,
+        source: &str,
+        msg: &Message,
+        findings: &[Finding],
+        urls: &[&str],
+        base: Option<i64>,
+    ) -> Result<usize> {
         if findings.is_empty() {
             return Ok(0);
         }
@@ -933,7 +1001,7 @@ impl Store {
         // One response can raise the same finding twice (two versioned Server headers): it
         // takes the higher of the risks, as one sighting.
         let keys: Vec<String> =
-            findings.iter().map(|f| dedupe_key(f.def.alert_ref, &msg.method, &msg.url, &f.param)).collect();
+            findings.iter().zip(urls).map(|(f, url)| dedupe_key(f.def.alert_ref, &msg.method, url, &f.param)).collect();
         let mut risks: std::collections::HashMap<&str, Risk> = std::collections::HashMap::new();
         for (f, key) in findings.iter().zip(&keys) {
             let r = risks.entry(key).or_insert(f.risk);
@@ -981,7 +1049,7 @@ impl Store {
                  WHERE id = ?1 AND state = 'fixed'
                     AND (state_changed_at IS NULL OR (SELECT time FROM history WHERE id = ?3) >= state_changed_at)",
             )?;
-            for (f, dedupe) in findings.iter().zip(&keys) {
+            for ((f, dedupe), url) in findings.iter().zip(&keys).zip(urls) {
                 let d = f.def;
                 // A finding raised from a script's answer is filed under its rule's id all the same.
                 let of = d.alert_ref.strip_prefix(crate::scan::passive::SCRIPT_ANSWER_PREFIX).unwrap_or(d.alert_ref);
@@ -1010,7 +1078,7 @@ impl Store {
                         d.wasc,
                         msg.host,
                         msg.method,
-                        msg.url,
+                        url,
                         f.param,
                         truncate(&f.evidence, 2000),
                         truncate(&f.other_info, 4000),

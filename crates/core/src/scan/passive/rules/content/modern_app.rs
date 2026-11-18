@@ -44,6 +44,10 @@ impl PassiveRule for ModernApp {
         &ALERTS
     }
 
+    fn page_level(&self) -> bool {
+        true
+    }
+
     fn scan(&self, msg: &Message, out: &mut Vec<Finding>) {
         if !msg.is_html() {
             return;
