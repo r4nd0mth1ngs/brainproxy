@@ -14,6 +14,8 @@ import { optionsProblem } from "./replayOptions";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import {
   arrow,
+  connectionMessages,
+  HANDOFF_MAX,
   joinMessages,
   messagesSummary,
   payloadPreview,
@@ -126,18 +128,14 @@ export function WebSockets({ active }: { active: boolean }) {
     open(ev, [
       {
         label: "Send to Replay",
-        // The first 20 text and binary messages it sent, in order (`--opcode` takes one type).
+        // `--opcode` takes one type: each type's first ones, merged in order.
         action: () =>
           Promise.all(
             ["text", "binary"].map((op) =>
-              run<{ items: WsMessage[] }>(["ws", "messages", String(c.id), "--direction", "to-server", "--opcode", op, "--limit", "20", "--max-body", "2000000"]),
+              run<{ items: WsMessage[] }>(["ws", "messages", String(c.id), "--direction", "to-server", "--opcode", op, "--limit", String(HANDOFF_MAX), "--max-body", "2000000"]),
             ),
           )
-            .then(([text, binary]) => {
-              const items = [...text.items, ...binary.items].sort((a, b) => a.id! - b.id!).slice(0, 20);
-              items.forEach((m) => requireWhole(m.payload, `Message #${m.id}`));
-              return toReplay(c, items.map(replayMessage));
-            })
+            .then(([text, binary]) => toReplay(c, connectionMessages(text.items, binary.items)))
             .catch((e) => app.toast(e.message, "error")),
       },
       { label: "Copy URL", action: () => navigator.clipboard.writeText(c.url) },

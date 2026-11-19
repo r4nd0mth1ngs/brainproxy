@@ -854,6 +854,8 @@ fn replay_tabs_are_saved_in_the_project() {
     let project = tmp_project("replay-tabs");
     let (code, v) = run(&["replay", "tabs", "list"], &project, None);
     assert_eq!((code, v["data"]["count"].as_u64()), (0, Some(0)), "{v}");
+    // None saved yet is format 1, which 0.9.0 saves over.
+    assert_eq!(v["data"]["v"], 1, "{v}");
 
     let req = "GET /?k=«auth:app:query:k» HTTP/1.1\nHost: 127.0.0.1\n\n";
     let set = serde_json::json!({"tabs": [

@@ -192,7 +192,8 @@ pub fn replay(project: &Path, cmd: ReplayCmd, out: &Out) -> Result<(), Error> {
             let tabs = saved["tabs"].as_array().cloned().unwrap_or_default();
             let rev = saved["rev"].as_u64().unwrap_or(0);
             // The app shows a newer format's tabs but doesn't save over them.
-            let v = saved["v"].as_u64().unwrap_or(VERSION);
+            // A set without one (none saved yet) is format 1, as `current` reads it.
+            let v = saved["v"].as_u64().unwrap_or(1);
             // Typed or prepared by someone else: shown escaped, stored and in JSON as is.
             let line = |i: usize, t: &Value| {
                 let kind = escape_controls(t["kind"].as_str().unwrap_or("http"));
@@ -213,7 +214,9 @@ pub fn replay(project: &Path, cmd: ReplayCmd, out: &Out) -> Result<(), Error> {
                         let (kind, text) = match m {
                             Value::String(t) => ("", t.as_str()),
                             _ if m["hex"].is_string() => ("[hex] ", m["hex"].as_str().unwrap_or_default()),
-                            _ => ("[base64] ", m["base64"].as_str().unwrap_or_default()),
+                            _ if m["base64"].is_string() => ("[base64] ", m["base64"].as_str().unwrap_or_default()),
+                            // A newer format's kind of message.
+                            _ => ("[unknown]", ""),
                         };
                         lines.push(format!("--- {kind}{}", escape_controls(text)));
                     }

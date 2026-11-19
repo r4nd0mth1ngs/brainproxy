@@ -1,7 +1,7 @@
 // WebSocket shapes from the CLI (`ws list`, `ws messages`, `ws send`) and the helpers the
 // WebSockets tab and Replay's WebSocket mode share.
 
-import { bodyText, isBinary, textBytes, type Body } from "../api.ts";
+import { bodyText, isBinary, requireWhole, textBytes, type Body } from "../api.ts";
 import { optionArgs, type ReplayOptions } from "./replayOptions.ts";
 
 export interface WsConnection {
@@ -60,8 +60,12 @@ export type BinaryKind = "hex" | "base64";
 
 /** The line that separates messages in Replay's message box. */
 export const SEPARATOR = "---";
-/** A separator line; `--- hex` or `--- base64` makes the message after it binary, written that way. */
-const SEPARATOR_LINE = /^---(?:[ \t]+(text|hex|base64))?$/i;
+/**
+ * A separator line, or with backslashes before it a message line that looks like one (an
+ * escape: the box holds `\---` for a text line `---`). `--- hex` or `--- base64` makes the
+ * message after it binary, written that way; `--- text` makes it text.
+ */
+const SEPARATOR_LIKE = /^(\\*)---(?:[ \t]+(text|hex|base64))?$/i;
 
 /** Whether `m` is a message as saved (a string, or one hex or base64 string), not something else. */
 export function isWsOut(m: unknown): m is WsOut {
@@ -77,37 +81,59 @@ const binaryText = (m: Exclude<WsOut, string>): string => ("hex" in m ? m.hex : 
 
 /**
  * Messages typed in Replay, one per block between separator lines: `---` before a text
- * message (the first needs none), `--- hex` or `--- base64` before a binary one. Blank blocks
- * are skipped.
+ * message (the first needs none), `--- hex` or `--- base64` before a binary one, `--- text`
+ * before a text one. A blank block after a plain `---` (or before the first) is skipped, so a
+ * stray separator adds nothing; after a named one it is an empty message. A line that only
+ * looks like a separator is written with a backslash before it (`\---`), which is taken off.
  */
 export function splitMessages(text: string): WsOut[] {
   const out: WsOut[] = [];
   let cur: string[] = [];
-  let kind = "text";
+  let kind: string | null = null;
   const flush = () => {
     const m = cur.join("\n");
-    if (m.trim()) out.push(kind === "hex" ? { hex: m } : kind === "base64" ? { base64: m } : m);
+    if (kind === "hex") out.push({ hex: m });
+    else if (kind === "base64") out.push({ base64: m });
+    else if (kind === "text" || m.trim()) out.push(m);
     cur = [];
   };
   for (const line of text.replace(/\r\n/g, "\n").split("\n")) {
-    const sep = SEPARATOR_LINE.exec(line.trim());
-    if (!sep) {
-      cur.push(line);
-      continue;
+    const t = line.trim();
+    const sep = SEPARATOR_LIKE.exec(t);
+    if (!sep) cur.push(line);
+    else if (sep[1]) {
+      // Escaped: one backslash fewer, as message text.
+      const at = line.length - line.trimStart().length;
+      cur.push(line.slice(0, at) + line.slice(at + 1));
+    } else {
+      flush();
+      kind = sep[2]?.toLowerCase() ?? null;
     }
-    flush();
-    kind = (sep[1] ?? "text").toLowerCase();
   }
   flush();
   return out;
 }
 
+/** The box's text for `messages`; [splitMessages] gives them back exactly. */
 export function joinMessages(messages: WsOut[]): string {
+  // A message line that would read as a separator gets one more backslash.
+  const escape = (m: string) =>
+    m
+      .split("\n")
+      .map((line) => {
+        if (!SEPARATOR_LIKE.test(line.trim())) return line;
+        const at = line.length - line.trimStart().length;
+        return `${line.slice(0, at)}\\${line.slice(at)}`;
+      })
+      .join("\n");
   return messages
     .map((m, i) => {
       const kind = binaryKind(m);
-      if (kind) return `${SEPARATOR} ${kind}\n${binaryText(m as Exclude<WsOut, string>)}`;
-      return i === 0 ? m : `${SEPARATOR}\n${m}`;
+      if (kind) return `${SEPARATOR} ${kind}\n${escape(binaryText(m as Exclude<WsOut, string>))}`;
+      const text = escape(m as string);
+      // A blank text message needs its kind named, or it would be skipped.
+      if (!text.trim()) return `${SEPARATOR} text\n${text}`;
+      return i === 0 ? text : `${SEPARATOR}\n${text}`;
     })
     .join("\n");
 }
@@ -117,7 +143,8 @@ export function joinMessages(messages: WsOut[]): string {
  * `0x`. Throws saying what is wrong.
  */
 export function hexBytes(text: string): Uint8Array {
-  let s = text.replace(/[\s:]/g, "");
+  // ASCII whitespace only, as `ws send` strips it: a no-break space isn't hex.
+  let s = text.replace(/[ \t\n\f\r:]/g, "");
   if (s.startsWith("0x")) s = s.slice(2);
   const bad = /[^0-9a-fA-F]/.exec(s);
   if (bad) throw new Error(`“${bad[0]}” isn't a hex digit`);
@@ -129,7 +156,7 @@ export function hexBytes(text: string): Uint8Array {
 
 /** Bytes of base64, standard or URL-safe, padded or not, whitespace ignored. Throws saying what is wrong. */
 export function base64Bytes(text: string): Uint8Array {
-  const s = text.replace(/\s/g, "");
+  const s = text.replace(/[ \t\n\f\r]/g, "");
   const body = s.replace(/=+$/, "");
   const urlSafe = /[-_]/.test(body);
   const bad = (urlSafe ? /[^A-Za-z0-9\-_]/ : /[^A-Za-z0-9+/]/).exec(body);
@@ -137,6 +164,8 @@ export function base64Bytes(text: string): Uint8Array {
   if (body.length % 4 === 1 || s.length - body.length > 2) throw new Error("its length is wrong for base64; is a character missing?");
   const std = urlSafe ? body.replace(/-/g, "+").replace(/_/g, "/") : body;
   const bin = atob(std + "=".repeat((4 - (std.length % 4)) % 4));
+  // atob ignores bits left over in the last character; `ws send` refuses them (a value cut short).
+  if (btoa(bin).replace(/=+$/, "") !== std) throw new Error("its last character has bits left over; is it cut short?");
   return Uint8Array.from(bin, (c) => c.charCodeAt(0));
 }
 
@@ -203,14 +232,53 @@ export function replayMessage(m: Pick<WsMessage, "opcode" | "payload" | "id">): 
   return bytes.length <= HEX_MAX ? { hex: toHex(bytes) } : { base64: toBase64(bytes) };
 }
 
+/**
+ * The first `n` bytes of a payload, decoding only as much as that takes: a table row's preview
+ * runs for every row, and again in each sort comparison, on payloads of up to 2 MB.
+ */
+export function payloadPrefix(b: Body, n: number): Uint8Array {
+  if (isBinary(b)) {
+    try {
+      const bin = atob(b.content.slice(0, Math.ceil(n / 3) * 4));
+      return Uint8Array.from(bin.slice(0, n), (c) => c.charCodeAt(0));
+    } catch {
+      return new Uint8Array();
+    }
+  }
+  // Every character is at least one byte; by code point, so a surrogate pair isn't split.
+  let text = "";
+  let count = 0;
+  for (const ch of b.content) {
+    if (count++ >= n) break;
+    text += ch;
+  }
+  return textBytes(text).subarray(0, n);
+}
+
+/** How many of a connection's messages Send to Replay takes. */
+export const HANDOFF_MAX = 20;
+
+/**
+ * A connection's Send to Replay: the first text and binary messages it sent (each list as
+ * `ws messages --opcode` gives it, oldest first), in order, at most [HANDOFF_MAX] in all.
+ * Throws when one of them was cut short.
+ */
+export function connectionMessages(text: WsMessage[], binary: WsMessage[]): WsOut[] {
+  const items = [...text, ...binary].sort((a, b) => a.id! - b.id!).slice(0, HANDOFF_MAX);
+  items.forEach((m) => requireWhole(m.payload, `Message #${m.id}`));
+  return items.map(replayMessage);
+}
+
 /** A payload's start for a table row: a binary message as hex, whatever its bytes are. */
 export function payloadPreview(m: Pick<WsMessage, "opcode" | "payload" | "length">, max: number): string {
   if (m.opcode === "binary") {
-    const bytes = textBytes(bodyText(m.payload), isBinary(m.payload));
-    const shown = Math.min(bytes.length, Math.floor(max / 3));
-    const hex = toHex(bytes.subarray(0, shown)).replace(/\n/g, " ");
+    // Hex then the printable ASCII, so JSON or text sent in binary frames still reads.
+    const bytes = payloadPrefix(m.payload, Math.floor(max / 4));
+    const hex = toHex(bytes).replace(/\n/g, " ");
+    const ascii = Array.from(bytes, (b) => (b >= 32 && b < 127 ? String.fromCharCode(b) : ".")).join("");
     const length = m.length ?? m.payload.length ?? bytes.length;
-    return `(${length} bytes) ${hex}${length > shown ? " …" : ""}`;
+    const more = length > bytes.length ? "…" : "";
+    return `(${length} bytes) ${hex}${more && " …"}  ${ascii}${more}`;
   }
   const t = isBinary(m.payload) ? `(binary, ${m.payload.length ?? "?"} bytes)` : bodyText(m.payload);
   return t.length > max ? t.slice(0, max) + "…" : t;

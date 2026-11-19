@@ -765,3 +765,32 @@ fn message_json(id: Option<i64>, direction: Direction, m: &Message, elapsed_ms: 
     }
     v
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(m: OutMessage) -> Result<(u8, Vec<u8>), String> {
+        m.frame()
+    }
+
+    /// The app checks binary messages before sending them; what it accepts, `ws send` reads as the same bytes.
+    #[test]
+    fn binary_messages_decode_as_the_app_reads_them() {
+        let bytes = vec![0, 159, 146, 150];
+        for hex in ["00 9f 92 96", "0x009f9296", "00:9F:92:96", "00 9f\n92\t96"] {
+            assert_eq!(frame(OutMessage::Hex(hex.into())), Ok((ws::OP_BINARY, bytes.clone())), "{hex}");
+        }
+        for b64 in ["AJ+Slg==", "AJ+Slg", "AJ-Slg", "AJ-Slg==", "AJ+S\nlg=="] {
+            assert_eq!(frame(OutMessage::Base64(b64.into())), Ok((ws::OP_BINARY, bytes.clone())), "{b64}");
+        }
+        assert_eq!(frame(OutMessage::Hex(String::new())), Ok((ws::OP_BINARY, Vec::new())));
+        // What the app refuses, `ws send` refuses too: bits left over, odd hex, a no-break space.
+        for bad in
+            [OutMessage::Base64("AB==".into()), OutMessage::Hex("abc".into()), OutMessage::Hex("00\u{a0}ff".into())]
+        {
+            assert!(frame(bad.clone()).is_err(), "{bad:?}");
+        }
+        assert_eq!(frame(OutMessage::Text("é".into())), Ok((ws::OP_TEXT, "é".as_bytes().to_vec())));
+    }
+}

@@ -148,13 +148,16 @@ export function HttpView(p: {
   binary?: boolean;
   /** Parts of the text (offsets with line breaks as \n) marked as a payload in the Raw view. */
   ranges?: Range[];
-  /** The view each new value opens in (Hex for a binary WebSocket message); the person can still switch. */
+  /**
+   * The view to switch to when this changes (Hex when a binary WebSocket message is selected
+   * after a text one, Raw the other way); between messages of one kind the person's choice stays.
+   */
   opensIn?: "raw" | "hex";
 }) {
   const [mode, setMode] = useState<Mode>(p.opensIn ?? "raw");
   useEffect(() => {
     if (p.opensIn) setMode(p.opensIn);
-  }, [p.opensIn, p.value]);
+  }, [p.opensIn]);
   const [query, setQuery] = useState(p.highlight ?? "");
   useEffect(() => setQuery(p.highlight ?? ""), [p.highlight]);
   const back = useRef<HTMLPreElement>(null);

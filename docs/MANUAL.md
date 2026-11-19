@@ -641,10 +641,13 @@ Edit a raw request and send it as often as you like, in separate tabs.
   handshake and the messages to send, separated by a line with `---`, then
   **Connect and send**. A line with `--- hex` or `--- base64` instead starts a binary
   message written that way (hex ignores spaces, line breaks and colons; base64 may be
-  URL-safe or unpadded). The box's toolbar counts the messages, and a binary one that
-  doesn't decode is named there and stops the send before anything goes out. Send to
-  Replay takes text and binary messages, binary ones with their bytes exactly (as hex,
-  or base64 over 16 KB), and binary replies open in the Hex view. brainproxy opens a new connection (with a fresh key), sends the
+  URL-safe or unpadded), and `--- text` a text one. A blank message after a plain `---`
+  is skipped; after a named separator it is sent empty. A message line that would read as
+  a separator is written with a backslash before it (`\---`), which isn't sent. The box's
+  toolbar counts the messages, and a binary one that doesn't decode is named there and
+  stops the send before anything goes out. Send to Replay takes text and binary messages,
+  binary ones with their bytes exactly (as hex, or base64 over 16 KB); binary messages are
+  listed as hex and their printable ASCII, and open in the Hex view. brainproxy opens a new connection (with a fresh key), sends the
   messages, and lists what comes back for **Listen** seconds after the last one, or until a
   reply matches **Until**. Each run is recorded like proxied traffic, as it happens; with
   **Don't record** on, only the handshake gets a row, without its content. Their Options are

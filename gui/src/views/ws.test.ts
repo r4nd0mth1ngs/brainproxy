@@ -2,6 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   base64Bytes,
+  connectionMessages,
+  HANDOFF_MAX,
+  payloadPrefix,
   hexBytes,
   isWsOut,
   joinMessages,
@@ -15,6 +18,8 @@ import {
   wsSendArgs,
   wsSendInput,
   HEX_MAX,
+  type WsMessage,
+  type WsOut,
 } from "./ws.ts";
 
 test("messages are split on lines holding only ---", () => {
@@ -46,8 +51,23 @@ test("--- hex and --- base64 make the next message binary, kept as typed", () =>
   assert.deepEqual(splitMessages(joinMessages(msgs)), msgs);
   assert.equal(joinMessages(["a", "b"]), "a\n---\nb");
   assert.equal(joinMessages(["a", { hex: "00" }]), "a\n--- hex\n00");
-  // A separator with nothing after it adds no message.
-  assert.deepEqual(splitMessages("a\n--- hex\n  \n"), ["a"]);
+  // A plain separator with nothing after it adds no message; a named one is an empty message.
+  assert.deepEqual(splitMessages("a\n---\n  \n---"), ["a"]);
+  assert.deepEqual(splitMessages("a\n--- hex\n--- text\n---\nb"), ["a", { hex: "" }, "", "b"]);
+});
+
+test("every message comes back from the box as it went in, separator-like lines and empty ones included", () => {
+  const cases: WsOut[][] = [
+    // Saved as text by 0.9.0: lines that now read as separators stay text.
+    ["title: x\n--- hex\nbody", "---", "  --- BASE64  ", "\\--- text", "a\n\\\\---\nb"],
+    [{ hex: "" }, "", "  ", { base64: "" }, "x"],
+    ["", { hex: "00\n---\nff" }],
+    [{ base64: "AP8=" }],
+  ];
+  for (const msgs of cases) assert.deepEqual(splitMessages(joinMessages(msgs)), msgs, JSON.stringify(msgs));
+  // Typed by hand: a backslash keeps a separator-like line as text, and is taken off.
+  assert.deepEqual(splitMessages("a\n\\--- hex\nb"), ["a\n--- hex\nb"]);
+  assert.equal(joinMessages(["title\n--- hex"]), "title\n\\--- hex");
 });
 
 test("hex and base64 are read as ws send reads them, with a reason when they aren't", () => {
@@ -55,6 +75,12 @@ test("hex and base64 are read as ws send reads them, with a reason when they are
   assert.deepEqual([...hexBytes("")], []);
   assert.throws(() => hexBytes("0g"), /“g” isn't a hex digit/);
   assert.throws(() => hexBytes("abc"), /odd number of hex digits \(3\)/);
+  // Only ASCII whitespace is skipped, as ws send skips it.
+  assert.throws(() => hexBytes("00\u00a0ff"), /isn't a hex digit/);
+  assert.throws(() => base64Bytes("AP8\u00a0="), /isn't a base64 character/);
+  // Bits left over in the last character: ws send refuses them, so the app does too.
+  assert.throws(() => base64Bytes("AB=="), /bits left over/);
+  assert.throws(() => base64Bytes("AP9"), /bits left over/);
   assert.deepEqual([...base64Bytes("AJ+S\nlg==")], [0, 159, 146, 150]);
   assert.deepEqual([...base64Bytes("AJ-Slg")], [0, 159, 146, 150]);
   assert.deepEqual([...base64Bytes("AP8")], [0, 255]);
@@ -92,10 +118,45 @@ test("a recorded message goes to Replay with its bytes exactly", () => {
   assert.deepEqual(sent.messages, [{ base64: "AJ+Slg==" }]);
 });
 
-test("a binary message's preview is hex, whatever its bytes are", () => {
-  assert.equal(payloadPreview({ opcode: "binary", payload: { encoding: "base64", content: "AJ+Slg==", length: 4 }, length: 4 }, 300), "(4 bytes) 00 9f 92 96");
-  assert.equal(payloadPreview({ opcode: "binary", payload: { encoding: "utf8", content: "abcd", length: 40, truncated: true }, length: 40 }, 9), "(40 bytes) 61 62 63 …");
+test("a binary message's preview is hex and its printable ASCII, whatever its bytes are", () => {
+  assert.equal(payloadPreview({ opcode: "binary", payload: { encoding: "base64", content: "AJ+Slg==", length: 4 }, length: 4 }, 300), "(4 bytes) 00 9f 92 96  ....");
+  assert.equal(payloadPreview({ opcode: "binary", payload: { encoding: "utf8", content: '{"a":1}', length: 40, truncated: true }, length: 40 }, 12), '(40 bytes) 7b 22 61 …  {"a…');
   assert.equal(payloadPreview({ opcode: "text", payload: { encoding: "utf8", content: "x".repeat(10) } }, 4), "xxxx…");
+});
+
+test("a preview decodes only the bytes it shows", () => {
+  const big = Uint8Array.from({ length: 2_000_000 }, (_, i) => i % 256);
+  const b64 = { encoding: "base64" as const, content: toBase64(big) };
+  const started = performance.now();
+  for (let i = 0; i < 200; i++) payloadPreview({ opcode: "binary", payload: b64, length: big.length }, 300);
+  assert.ok(performance.now() - started < 500, "200 previews of 2 MB payloads");
+  assert.deepEqual([...payloadPrefix(b64, 5)], [0, 1, 2, 3, 4]);
+  assert.deepEqual([...payloadPrefix({ encoding: "base64", content: "AP8=" }, 10)], [0, 255]);
+  // Text by code point: a character outside the BMP isn't split into a bad surrogate.
+  assert.deepEqual([...payloadPrefix({ encoding: "utf8", content: "😀é" }, 4)], [0xf0, 0x9f, 0x98, 0x80]);
+  assert.deepEqual([...payloadPrefix({ encoding: "utf8", content: "aé" }, 2)], [0x61, 0xc3]);
+});
+
+test("a connection goes to Replay with its first text and binary messages, in order", () => {
+  const msg = (id: number, opcode: "text" | "binary", content: string, truncated = false): WsMessage => ({
+    id,
+    direction: "to-server",
+    opcode,
+    compressed: false,
+    payload: opcode === "text" ? { encoding: "utf8", content, truncated } : { encoding: "base64", content, truncated },
+  });
+  const text = [msg(1, "text", "a"), msg(4, "text", "b")];
+  const binary = [msg(2, "binary", "AP8="), msg(3, "binary", "AA==")];
+  assert.deepEqual(connectionMessages(text, binary), ["a", { hex: "00 ff" }, { hex: "00" }, "b"]);
+  // One limit across both types.
+  const many = (from: number, op: "text" | "binary") => Array.from({ length: HANDOFF_MAX }, (_, i) => msg(from + i * 2, op, op === "text" ? `t${i}` : "AA=="));
+  const r = connectionMessages(many(1, "text"), many(2, "binary"));
+  assert.equal(r.length, HANDOFF_MAX);
+  assert.deepEqual(r.slice(0, 3), ["t0", { hex: "00" }, "t1"]);
+  // A message cut short is refused, not sent in part.
+  assert.throws(() => connectionMessages([msg(1, "text", "a")], [msg(2, "binary", "AA==", true)]), /Message #2/);
+  // Beyond the limit, a cut-short message doesn't matter.
+  assert.equal(connectionMessages(many(1, "text"), [msg(1000, "binary", "AA==", true)]).length, HANDOFF_MAX);
 });
 
 test("only strings and single hex or base64 fields are saved messages", () => {
