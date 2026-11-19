@@ -36,9 +36,13 @@ pub struct ExportArgs {
     /// Who or what recorded the entry: gui, cli, mcp, or unknown.
     #[arg(long, value_parser = ["gui", "cli", "mcp", "unknown"])]
     origin: Option<String>,
-    /// Text the raw request or response, or a decoded body, contains (case-sensitive, literal).
+    /// Text the raw request or response, or a decoded body, contains (literal; case-sensitive
+    /// unless --ignore-case).
     #[arg(long)]
     contains: Option<String>,
+    /// Make --contains match ASCII letters in any case, as `history list --ignore-case` does.
+    #[arg(long, requires = "contains")]
+    ignore_case: bool,
     /// A query in the filter language, as `history list --filter` takes it.
     #[arg(long)]
     filter: Option<String>,
@@ -77,6 +81,7 @@ pub fn export(project: &Path, a: ExportArgs, out: &Out) -> Result<(), Error> {
         tag: a.tag,
         origin: a.origin,
         contains: a.contains,
+        ignore_case: a.ignore_case,
         filter: a.filter,
         after_id: a.after,
         limit: Some(a.limit.saturating_add(1)),

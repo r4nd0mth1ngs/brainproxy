@@ -17,7 +17,9 @@ use crate::output::{escape_controls, Out};
 /// The meta key holding the saved set (JSON): `{"v", "rev", "filters"}`.
 const KEY: &str = "traffic.filters";
 /// Format of the saved set. A build refuses to save over a newer one, whose fields it would drop.
-const VERSION: u64 = 1;
+/// 2 added `ignoreCase`; a set is saved as 2 only when a filter turns it on, so a build that
+/// knows only 1 can still save over a set that holds nothing it would lose.
+const VERSION: u64 = 2;
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_FILTERS: usize = 200;
 /// The most an agent can bring the set to through MCP, so a person always has room for theirs.
@@ -37,7 +39,8 @@ pub enum FiltersCmd {
     /// Replace the saved Traffic filters with the JSON on stdin (or add to them with --append).
     #[command(after_help = "Reads JSON from stdin: {\"filters\": [{\"name\": \"server errors\", \"filter\": \
         {\"text\": \"status:5xx NOT path:/health\", \"query\": true, \"sources\": [\"proxy\"], \"hideAssets\": true}}]}. \
-        A filter's fields: text, contents (search inside requests and responses), query (text is a \
+        A filter's fields: text, contents (search inside requests and responses), ignoreCase (the contents \
+        search matches ASCII letters in any case, as `history list --ignore-case`), query (text is a \
         `history list --filter` query, which must parse), sources (empty: every source), hideErrors (2xx/3xx \
         only), hideAssets, hideRefused (out-of-scope rows; true when left out). contents and query can't both be \
         on. Names are unique, at most 100 characters; at most 200 filters. An empty list leaves none. Through MCP \
@@ -58,6 +61,11 @@ const fn yes() -> bool {
     true
 }
 
+// serde's skip_serializing_if passes a reference.
+const fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Filter {
@@ -65,6 +73,11 @@ struct Filter {
     text: String,
     #[serde(default)]
     contents: bool,
+    /// The contents search matches ASCII letters in any case (`history list --ignore-case`).
+    /// Left out of the stored JSON when off, so a filter saved before it existed compares
+    /// equal to the same filter saved again.
+    #[serde(default, skip_serializing_if = "is_false")]
+    ignore_case: bool,
     #[serde(default)]
     query: bool,
     #[serde(default)]
@@ -106,7 +119,7 @@ pub fn filters(project: &Path, cmd: FiltersCmd, out: &Out) -> Result<(), Error> 
             let saved = load(&Store::open(project)?)?;
             let list = saved["filters"].as_array().cloned().unwrap_or_default();
             let rev = saved["rev"].as_u64().unwrap_or(0);
-            let v = saved["v"].as_u64().unwrap_or(VERSION);
+            let v = saved["v"].as_u64().unwrap_or(1);
             let listed: Vec<Value> = list
                 .iter()
                 .map(|s| {
@@ -304,7 +317,8 @@ fn build(
         };
         filters.push(v);
     }
-    let json = serde_json::to_string(&json!({"v": VERSION, "rev": rev, "filters": filters}))
+    let v = if filters.iter().any(|f| f["filter"]["ignoreCase"] == true) { VERSION } else { 1 };
+    let json = serde_json::to_string(&json!({"v": v, "rev": rev, "filters": filters}))
         .map_err(|e| Error::InvalidInput(e.to_string()))?;
     if json.len() > MAX_BYTES {
         return Err(too_big());
@@ -405,9 +419,40 @@ mod tests {
 
     #[test]
     fn a_newer_format_is_not_saved_over() {
-        assert_eq!(current(Some(r#"{"v": 2, "rev": 4, "filters": []}"#), false).unwrap_err().kind(), "conflict");
+        assert_eq!(current(Some(r#"{"v": 3, "rev": 4, "filters": []}"#), false).unwrap_err().kind(), "conflict");
+        assert_eq!(current(Some(r#"{"v": 2, "rev": 4, "filters": []}"#), false).unwrap().0, 4);
         assert_eq!(current(Some("not json"), false).unwrap().0, 0);
         assert!(current(Some("not json"), true).is_err());
         assert_eq!(current(Some(r#"{"v": 1, "rev": 4, "filters": [{}]}"#), true).unwrap().0, 4);
+    }
+
+    #[test]
+    fn ignore_case_is_kept_and_raises_the_format_only_when_on() {
+        let save = |input: &[u8], stored: &[Value]| {
+            let (json, _) = build(parse(input).unwrap(), Vec::new(), stored, "gui", 2, MAX_FILTERS).unwrap();
+            serde_json::from_str::<Value>(&json).unwrap()
+        };
+        let on = save(
+            br#"{"filters": [{"name": "t", "filter": {"text": "Token", "contents": true, "ignoreCase": true}}]}"#,
+            &[],
+        );
+        assert_eq!(on["v"], 2, "a build that knows only format 1 would drop it");
+        assert_eq!(on["filters"][0]["filter"]["ignoreCase"], true);
+        let off = save(
+            br#"{"filters": [{"name": "t", "filter": {"text": "Token", "contents": true, "ignoreCase": false}}]}"#,
+            &[],
+        );
+        assert_eq!(off["v"], 1);
+        assert!(off["filters"][0]["filter"].get("ignoreCase").is_none());
+        // A filter an older build saved, sent back by the app with ignoreCase off, is unchanged: it keeps its origin.
+        let older =
+            vec![json!({"name": "t", "filter": {"text": "Token", "contents": true, "query": false, "sources": [],
+            "hideErrors": false, "hideAssets": false, "hideRefused": true}, "origin": "mcp"})];
+        let again = save(
+            br#"{"filters": [{"name": "t", "filter": {"text": "Token", "contents": true, "ignoreCase": false}}]}"#,
+            &older,
+        );
+        assert_eq!(again["filters"][0]["origin"], "mcp");
+        assert_eq!(mode(&on["filters"][0]["filter"]), "contents");
     }
 }

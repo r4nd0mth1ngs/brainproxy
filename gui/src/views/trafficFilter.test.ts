@@ -180,11 +180,44 @@ const ids = (s: ContentSearch) => [...s.matches.keys()];
 test("a contents search needs text and passes a single source to the CLI", () => {
   assert.equal(searchFor(filter({ text: "token" })), null);
   assert.equal(searchFor(filter({ contents: true })), null);
-  assert.deepEqual(searchFor(cf("token", { sources: ["send", "proxy"] })), { kind: "contains", text: "token", source: null });
+  assert.deepEqual(searchFor(cf("token", { sources: ["send", "proxy"] })), { kind: "contains", text: "token", source: null, ignoreCase: false });
   assert.deepEqual(searchArgs(ns("token", { sources: ["send", "proxy"] })), ["history", "list", "--contains=token", "--after=0", `--limit=${SEARCH_PAGE}`]);
   const s = { ...ns("-x y", { sources: ["send"] }), cursor: 41 };
   assert.deepEqual(searchArgs(s), ["history", "list", "--contains=-x y", "--source=send", `--after=41`, `--limit=${SEARCH_PAGE}`]);
   assert.deepEqual(searchArgs(ns("a")), ["history", "list", "--contains=a", "--after=0", `--limit=${SEARCH_PAGE}`]);
+});
+
+test("ignoring case adds --ignore-case to a contents search, and changing it is a new search", () => {
+  assert.equal(DEFAULT_FILTER.ignoreCase, false, "case-sensitive unless turned off");
+  const s = { ...ns("Token", { ignoreCase: true, sources: ["send"] }), cursor: 7 };
+  assert.deepEqual(searchArgs(s), ["history", "list", "--contains=Token", "--ignore-case", "--source=send", "--after=7", `--limit=${SEARCH_PAGE}`]);
+  const sent = row(1, { source: "send" });
+  const matched: ContentSearch = { ...s, matches: new Map([[1, sent]]) };
+  assert.deepEqual(visibleRows([sent], cf("Token", { ignoreCase: true, sources: ["send"] }), matched), [sent]);
+  // Flipping it makes the search the app holds an old one: its matches don't show, a new one runs.
+  assert.deepEqual(visibleRows([sent], cf("Token", { sources: ["send"] }), matched), []);
+  assert.equal(isCurrent(matched, cf("Token", { sources: ["send"] })), false);
+  assert.notEqual(JSON.stringify(searchFor(cf("Token"))), JSON.stringify(searchFor(cf("Token", { ignoreCase: true }))));
+  // The filter language folds ASCII case itself: a query search ignores the setting and isn't rerun by it.
+  assert.deepEqual(searchFor(qf("resp:token", { ignoreCase: true })), searchFor(qf("resp:token")));
+  assert.deepEqual(searchArgs(newSearch(searchFor(qf("resp:token", { ignoreCase: true }))!)), ["history", "list", "--filter=resp:token", "--after=0", `--limit=${SEARCH_PAGE}`]);
+  // Outside the CLI searches the URL filter is already case-insensitive and doesn't read it.
+  assert.equal(searchFor(filter({ text: "token", ignoreCase: true })), null);
+});
+
+test("a saved filter keeps whether its contents search ignores case", () => {
+  const on = cf("Token", { ignoreCase: true });
+  assert.equal(parseFilter(JSON.parse(JSON.stringify(on))).ignoreCase, true);
+  // One saved before the setting existed (or by the CLI, which leaves it out when off) reads as case-sensitive.
+  const older: Record<string, unknown> = { ...on };
+  delete older.ignoreCase;
+  assert.equal(parseFilter(older).ignoreCase, false);
+  assert.equal(parseFilter({ ...older, ignoreCase: "yes" }).ignoreCase, false);
+  // Saved with and without it, the two are different saved filters.
+  const list = withSaved([], "tokens", on);
+  assert.equal(savedMatching(list, on), "tokens");
+  assert.equal(savedMatching(list, cf("Token")), null);
+  assert.equal(JSON.parse(savedBody(list)).filters[0].filter.ignoreCase, true);
 });
 
 // ---------------- Saved filters in the project ----------------
@@ -312,7 +345,7 @@ const qf = (text: string, patch: Partial<TrafficFilter> = {}) => filter({ query:
 
 test("query mode sends the text as --filter, and is its own search", () => {
   assert.equal(searchFor(qf("  ")), null);
-  assert.deepEqual(searchFor(qf("status:5xx", { sources: ["send"] })), { kind: "filter", text: "status:5xx", source: "send" });
+  assert.deepEqual(searchFor(qf("status:5xx", { sources: ["send"] })), { kind: "filter", text: "status:5xx", source: "send", ignoreCase: false });
   const s = { ...newSearch(searchFor(qf('-x resp.body:"a b"'))!), cursor: 9 };
   assert.deepEqual(searchArgs(s), ["history", "list", '--filter=-x resp.body:"a b"', "--after=9", `--limit=${SEARCH_PAGE}`]);
   // The same text as a contents search is another search.

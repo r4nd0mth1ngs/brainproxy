@@ -806,8 +806,11 @@ impl Binder<'_> {
 }
 
 /// `expr` contains `p`, ASCII letters in any case. instr reads every byte, where LIKE would stop
-/// at a NUL in a binary body.
-fn contains(expr: &str, p: &str) -> String {
+/// at a NUL in a binary body. lower() folds ASCII only (SQLite is built without ICU) and keeps
+/// every byte, so a body that isn't UTF-8 is searched in full; instr walks a folded body by UTF-8
+/// lead bytes, which loses no match because a needle (a Rust string) never starts with a
+/// continuation byte.
+pub(crate) fn contains(expr: &str, p: &str) -> String {
     format!("instr(lower({expr}), lower({p})) > 0")
 }
 

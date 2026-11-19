@@ -183,7 +183,7 @@ const QUERY_HELP =
 const MODE_HELP: Record<SearchMode, string> = {
   text: "The text filters the URL, title and method of the rows shown",
   contents:
-    "Search inside requests and responses: headers and bodies, compressed bodies included. Case-sensitive and literal: the text must appear as stored (URL-encoded or JSON-escaped text included). Runs history list --contains.",
+    "Search inside requests and responses: headers and bodies, compressed bodies included. Literal: the text must appear as stored (URL-encoded or JSON-escaped text included), in the same case unless Aa is off. Runs history list --contains.",
   query: QUERY_HELP,
 };
 
@@ -564,6 +564,23 @@ function History({ active }: { active: boolean }) {
           <option value="contents">Contents</option>
           <option value="query">Query</option>
         </select>
+        {modeOf(filter) === "contents" && (
+          <div className="seg">
+            <button
+              className={filter.ignoreCase ? "" : "on"}
+              aria-pressed={!filter.ignoreCase}
+              aria-label="Match case"
+              title={
+                filter.ignoreCase
+                  ? "Match case is off: A-Z and a-z match in any case (history list --ignore-case). Letters outside ASCII (é, É) and other bytes still match only as stored."
+                  : "Match case is on: the text must match in the case it was recorded. Click to match ASCII letters in any case."
+              }
+              onClick={() => setFilter({ ...filter, ignoreCase: !filter.ignoreCase })}
+            >
+              Aa
+            </button>
+          </div>
+        )}
         <div className="seg">
           {SOURCES.map((s) => (
             <button key={s} className={filter.sources.includes(s) ? "on" : ""} onClick={() => toggleSource(s)}>
