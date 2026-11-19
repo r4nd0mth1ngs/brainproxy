@@ -1089,6 +1089,34 @@ select {
 .curl-dialog .curl-warnings ul {
   padding-left: 20px;
 }
+/* Settings › TLS / CA › Install in system trust store (views/SystemTrust.tsx). */
+.trust-dialog {
+  width: min(640px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+.trust-dialog .trust-list {
+  margin: 0 0 12px;
+  padding-left: 20px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.trust-dialog p.trust-error {
+  color: var(--high);
+  white-space: pre-wrap;
+}
+.trust-dialog .trust-commands,
+.trust-dialog .trust-undo {
+  margin: 0 0 14px;
+}
+.trust-dialog pre.code {
+  margin: 0 0 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.trust-dialog .trust-undo p {
+  margin: 6px 0;
+}
 /* Findings › New finding (views/NewFinding.tsx). */
 .finding-dialog {
   width: min(720px, 100%);
