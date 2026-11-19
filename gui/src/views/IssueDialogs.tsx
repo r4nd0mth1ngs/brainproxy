@@ -4,9 +4,9 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { run, type FindingItem } from "../api";
 import { useDialogFocus } from "../ui/dialogFocus";
-import { BASE_PICKER, cvssCommand, extraMetrics, metricsOf, START_VECTOR, vectorProblem, withMetric } from "./cvss.ts";
+import { BASE_PICKER, cvssCommand, extraMetrics, metricsOf, saveProblem, START_VECTOR, vectorProblem, withMetric } from "./cvss.ts";
 import { STATES } from "./findingsFilter";
-import { filterIssues, type IssueInfo, issueLabel, mergeCommand, mergeWarning, splitCommand, splitProblem, splitStart } from "./issueTools.ts";
+import { filterIssues, type IssueInfo, issueLabel, mergeCommands, mergeWarning, splitCommand, splitProblem, splitStart, staleSplit } from "./issueTools.ts";
 
 /** The frame the three dialogs share: modal, Tab kept inside, Esc closes unless a command is running. */
 function IssueDialog({ title, busy, onClose, className, children }: { title: string; busy: boolean; onClose: () => void; className?: string; children: ReactNode }) {
@@ -39,15 +39,15 @@ function Actions({ error, children }: { error: string; children: ReactNode }) {
   );
 }
 
-/** Runs a dialog's command: busy while it runs, its error shown in the dialog. */
+/** Runs a dialog's work: busy while it runs, its error shown in the dialog. */
 function useCommand() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const go = async <T,>(args: string[], done: (data: T) => void) => {
+  const go = async <T,>(work: () => Promise<T>, done: (data: T) => void) => {
     setBusy(true);
     setError("");
     try {
-      done(await run<T>(args));
+      done(await work());
     } catch (e: any) {
       setError(e.message);
       setBusy(false);
@@ -63,9 +63,10 @@ export function CvssDialog({ issue, onClose, onSaved }: { issue: IssueInfo; onCl
   const [text, setText] = useState(issue.cvss?.vector ?? START_VECTOR);
   const { busy, error, go } = useCommand();
   const problem = vectorProblem(text);
+  const blocked = saveProblem(text, issue.cvss != null);
   const picked = metricsOf(text);
   const extra = extraMetrics(text);
-  const save = (vector: string) => go<{ cvss: Cvss }>(cvssCommand(issue.id, vector), (r) => onSaved(r.cvss));
+  const save = (vector: string) => go(() => run<{ cvss: Cvss }>(cvssCommand(issue.id, vector)), (r) => onSaved(r.cvss));
   return (
     <IssueDialog title={`CVSS 4.0 rating · issue #${issue.id}`} busy={busy} onClose={onClose} className="cvss-dialog">
       <p>
@@ -82,7 +83,7 @@ export function CvssDialog({ issue, onClose, onSaved }: { issue: IssueInfo; onCl
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          if (!problem && text.trim() && !busy) save(text);
+          if (!blocked && !busy) save(text);
         }}
       >
         <label className="cvss-vector">
@@ -108,6 +109,7 @@ export function CvssDialog({ issue, onClose, onSaved }: { issue: IssueInfo; onCl
           ))}
         </div>
         {extra.length > 0 && <p className="muted cvss-extra">Also set, and kept as typed: {extra.join(" ")}</p>}
+        {!problem && blocked && <p className="muted cvss-extra">{blocked}.</p>}
         <Actions error={error}>
           {issue.cvss && (
             <button type="button" className="btn" disabled={busy} onClick={() => save("")} title="Take the rating off this issue">
@@ -117,7 +119,7 @@ export function CvssDialog({ issue, onClose, onSaved }: { issue: IssueInfo; onCl
           <button type="button" className="btn" disabled={busy} onClick={onClose}>
             Cancel
           </button>
-          <button type="submit" className="btn primary" disabled={busy || !!problem || !text.trim()}>
+          <button type="submit" className="btn primary" disabled={busy || !!blocked} title={blocked || undefined}>
             {busy ? "Saving…" : "Save"}
           </button>
         </Actions>
@@ -153,7 +155,14 @@ export function MergeDialog({ from, targets, onClose, onMerged }: { from: IssueI
   const [filter, setFilter] = useState("");
   const { busy, error, go } = useCommand();
   const keep = targets.find((i) => i.id === into);
-  const cmd = into == null ? null : mergeCommand(into, from.map((i) => i.id));
+  const cmds = into == null ? [] : mergeCommands(into, from.map((i) => i.id));
+  // Batch after batch; one that fails stops there, and what moved before it stays moved.
+  const merge = () =>
+    go(async () => {
+      let moved = 0;
+      for (const cmd of cmds) moved += (await run<{ moved: number }>(cmd)).moved;
+      return moved;
+    }, (moved) => into != null && onMerged(into, moved));
   const warning = mergeWarning(keep, from);
   const shown = filterIssues(targets, filter);
   const one = from.length === 1;
@@ -182,8 +191,9 @@ export function MergeDialog({ from, targets, onClose, onMerged }: { from: IssueI
         <button type="button" className="btn" disabled={busy} onClick={onClose}>
           Cancel
         </button>
-        <button type="button" className="btn primary" disabled={busy || !cmd} onClick={() => cmd && go<{ into: number; moved: number }>(cmd, (r) => onMerged(r.into, r.moved))}>
-          {busy ? "Merging…" : "Merge"}
+        {/* The issue picked may be filtered out of the list; the button names it. */}
+        <button type="button" className="btn primary" disabled={busy || !cmds.length} onClick={merge}>
+          {busy ? "Merging…" : into != null && cmds.length ? `Merge into #${into}` : "Merge"}
         </button>
       </Actions>
     </IssueDialog>
@@ -198,9 +208,10 @@ export function SplitDialog({ issue, checked, onClose, onSplit }: { issue: Issue
   const [title, setTitle] = useState("");
   const { busy, error, go } = useCommand();
   const [loadError, setLoadError] = useState("");
+  const read = () => run<{ findings: FindingItem[] }>(["findings", "issue", "show", String(issue.id)]);
   useEffect(() => {
     let live = true;
-    run<{ findings: FindingItem[] }>(["findings", "issue", "show", String(issue.id)]).then(
+    read().then(
       (i) => {
         if (!live) return;
         setFindings(i.findings);
@@ -215,6 +226,20 @@ export function SplitDialog({ issue, checked, onClose, onSplit }: { issue: Issue
   }, [issue.id]);
   const ids = (findings ?? []).filter((f) => picked.has(f.id)).map((f) => f.id);
   const problem = findings ? splitProblem(ids.length, findings.length) : "";
+  // The issue as it is now: findings moved elsewhere meanwhile would be split out of that issue.
+  // ponytail: a move between this read and the split still slips through; closing that needs
+  // `findings issue split` to take the issue the findings come from and check it in its transaction.
+  const split = () =>
+    go(async () => {
+      const now = (await read()).findings;
+      const stale = staleSplit(issue.id, ids, now);
+      if (stale) {
+        setFindings(now);
+        setPicked((p) => new Set([...p].filter((id) => now.some((f) => f.id === id))));
+        throw new Error(stale);
+      }
+      return (await run<{ issue: number }>(splitCommand(ids, title))).issue;
+    }, (created) => onSplit(created, ids));
   const toggle = (id: number) =>
     setPicked((p) => {
       const s = new Set(p);
@@ -247,7 +272,7 @@ export function SplitDialog({ issue, checked, onClose, onSplit }: { issue: Issue
         <button type="button" className="btn" disabled={busy} onClick={onClose}>
           Cancel
         </button>
-        <button type="button" className="btn primary" disabled={busy || !findings || !!problem} onClick={() => go<{ issue: number }>(splitCommand(ids, title), (r) => onSplit(r.issue, ids))}>
+        <button type="button" className="btn primary" disabled={busy || !findings || !!problem} onClick={split}>
           {busy ? "Splitting…" : ids.length ? `Move ${ids.length} to a new issue` : "Move to a new issue"}
         </button>
       </Actions>

@@ -83,6 +83,16 @@ export function vectorProblem(text: string): string {
   return missing ? `The base metric ${missing[0]} is missing` : "";
 }
 
+/**
+ * Why Save is off, or "": the vector is refused, or the issue has no rating yet and the vector
+ * is still the picker's starting one (no impact: a 0.0 that would go in reports by a stray Enter).
+ */
+export function saveProblem(text: string, rated: boolean): string {
+  if (!text.trim()) return "Type a vector or pick its metrics";
+  if (!rated && text.trim() === START_VECTOR) return "Pick the impact before saving: as it stands, this vector scores 0.0";
+  return vectorProblem(text);
+}
+
 /** The metrics of `text` that are well formed (the picker reads them even while the rest is being typed). */
 export function metricsOf(text: string): Map<string, string> {
   const out = new Map<string, string>();

@@ -23,12 +23,13 @@ export interface FindingFilter {
 
 export const NO_FILTER: FindingFilter = { text: "", source: "all", host: "" };
 
-export function matchesFinding(f: FindingItem, filter: FindingFilter): boolean {
+/** `also`: more text the search looks in, such as the title the finding's issue was given. */
+export function matchesFinding(f: FindingItem, filter: FindingFilter, also = ""): boolean {
   if (filter.source !== "all" && f.source !== filter.source) return false;
   if (filter.host && f.host !== filter.host) return false;
   const words = filter.text.toLowerCase().split(/\s+/).filter(Boolean);
   if (!words.length) return true;
-  const hay = [f.name, f.alert_ref, f.method, f.url, f.param, f.evidence, f.state.replace("_", " "), `#${f.id}`].join("\n").toLowerCase();
+  const hay = [f.name, f.alert_ref, f.method, f.url, f.param, f.evidence, f.state.replace("_", " "), `#${f.id}`, also].join("\n").toLowerCase();
   return words.every((w) => hay.includes(w));
 }
 
@@ -39,13 +40,15 @@ export interface ListView {
   filter: FindingFilter;
   /** Compared with a scan: what each finding is to it (new, still, gone) and which of those shows. */
   compare?: { seen: ReadonlyMap<number, string>; want: string } | null;
+  /** Titles issues were given (`findings issue title`), by issue: the search finds a renamed issue by its title. */
+  issueTitles?: ReadonlyMap<number, string>;
 }
 
 /** Whether the list shows `f`, whatever its risk. */
 export function inView(f: FindingItem, v: ListView): boolean {
   if (v.hideClosed && CLOSED.has(f.state)) return false;
   if (v.compare && v.compare.seen.get(f.id) !== v.compare.want) return false;
-  return matchesFinding(f, v.filter);
+  return matchesFinding(f, v.filter, f.issue_id != null ? (v.issueTitles?.get(f.issue_id) ?? "") : "");
 }
 
 /** The findings per risk that the list would show with that risk's toggle on: the chips' counts. */

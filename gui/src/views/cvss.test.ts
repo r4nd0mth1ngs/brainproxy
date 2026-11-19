@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { BASE_PICKER, cvssCommand, extraMetrics, METRICS, metricsOf, START_VECTOR, vectorOf, vectorProblem, withMetric } from "./cvss.ts";
+import { readFileSync } from "node:fs";
+import { BASE_PICKER, cvssCommand, extraMetrics, METRICS, metricsOf, saveProblem, START_VECTOR, vectorOf, vectorProblem, withMetric } from "./cvss.ts";
 
 const FULL = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N";
 
@@ -15,7 +16,7 @@ test("a whole base vector, or nothing, is taken", () => {
   assert.equal(vectorProblem("CVSS:4.0/SA:N/SI:N/SC:N/VA:H/VI:H/VC:H/UI:N/PR:N/AT:N/AC:L/AV:N"), "");
 });
 
-test("each refusal says what the CLI would say", () => {
+test("each refusal says why, in the order the CLI checks", () => {
   assert.match(vectorProblem("AV:N/AC:L"), /starts with CVSS:4\.0\//);
   assert.match(vectorProblem("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"), /CVSS 3/);
   assert.equal(vectorProblem(FULL.replace("/SA:N", "")), "The base metric SA is missing");
@@ -67,4 +68,21 @@ test("the picker offers each base metric with the values the CLI takes", () => {
 test("the CVSS command passes the vector after --, trimmed; empty removes the rating", () => {
   assert.deepEqual(cvssCommand(4, ` ${FULL} `), ["findings", "issue", "cvss", "4", "--", FULL]);
   assert.deepEqual(cvssCommand(4, ""), ["findings", "issue", "cvss", "4", "--", ""]);
+});
+
+test("the metrics and values are the CLI's own, so the dialog takes what `findings issue cvss` takes", () => {
+  const rust = readFileSync(new URL("../../../crates/core/src/scan/cvss.rs", import.meta.url), "utf8");
+  const table = rust.slice(rust.indexOf("const METRICS"), rust.indexOf("const BASE"));
+  const rows = [...table.matchAll(/\("(\w+)", &\[([^\]]*)\]\)/g)].map((m) => [m[1], [...m[2].matchAll(/"(\w+)"/g)].map((v) => v[1])]);
+  assert.ok(rows.length > 11);
+  assert.deepEqual(rows, METRICS.map(([m, v]) => [m, [...v]]));
+  assert.match(rust, /const BASE: usize = 11;/);
+});
+
+test("Save is off for a refused or empty vector, and for an unrated issue's untouched starting vector", () => {
+  assert.match(saveProblem("", false), /Type a vector/);
+  assert.match(saveProblem(START_VECTOR, false), /scores 0\.0/);
+  assert.equal(saveProblem(START_VECTOR, true), "");
+  assert.equal(saveProblem(withMetric(START_VECTOR, "VC", "H"), false), "");
+  assert.equal(saveProblem("CVSS:4.0/AV:N", true), "The base metric AC is missing");
 });
