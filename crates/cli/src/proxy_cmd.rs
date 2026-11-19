@@ -116,7 +116,7 @@ pub enum CaCmd {
         force: bool,
     },
     /// Add the CA to the system trust store. Debian/Kali: update-ca-certificates, needs root. Windows: the
-    /// current user's Trusted Root store (certutil -user), no admin needed.
+    /// current user's Trusted Root store (certutil -user), no admin needed. Not through MCP.
     InstallSystem,
 }
 
@@ -817,6 +817,14 @@ pub fn ca(home: &Path, cmd: CaCmd, out: &Out) -> Result<(), Error> {
                         "spki_sha256_base64": ca.spki_sha256_base64()});
                 out.ok(data, || ca.cert_pem().to_string());
             }
+        }
+        // Every program that uses the system store would trust whatever the CA signs, for any site.
+        CaCmd::InstallSystem if crate::mcp::in_tool_call() => {
+            return Err(Error::InvalidInput(
+                "ca install-system is refused through MCP: it changes what the whole system trusts; a person runs it \
+                 from the app (Settings > TLS / CA) or a terminal"
+                    .into(),
+            ));
         }
         #[cfg(windows)]
         CaCmd::InstallSystem => {

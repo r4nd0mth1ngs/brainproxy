@@ -113,6 +113,9 @@ const EXCLUDED: &[&str] = &[
     "findings suppress remove",
     // A person's rating in place of the scanner's; an agent suggests one. It refuses a tool call too.
     "findings rate",
+    // Every program on the machine would trust whatever the CA signs: a person decides that, in
+    // the app or a terminal. It refuses a tool call too.
+    "ca install-system",
 ];
 
 /// Set on every command a tool call runs, so a command can refuse what an agent must not
