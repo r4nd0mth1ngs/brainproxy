@@ -1104,6 +1104,65 @@ select {
 .finding-dialog-actions {
   margin-top: 16px;
 }
+/* Findings › an issue's CVSS rating, Merge and Split (views/IssueDialogs.tsx). */
+.issue-dialog {
+  width: min(620px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+.issue-dialog .error {
+  padding: 8px 0 0;
+}
+.issue-dialog-actions {
+  margin-top: 16px;
+}
+.issue-dialog .label {
+  display: block;
+  margin-bottom: 4px;
+}
+.cvss-vector .input,
+.merge-filter,
+.split-title .input {
+  width: 100%;
+}
+.issue-dialog p.cvss-problem,
+.issue-dialog p.cvss-extra {
+  margin: 6px 0 0;
+}
+.cvss-picker {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  align-items: center;
+  gap: 6px 12px;
+  margin-top: 14px;
+}
+.cvss-picker .label {
+  margin: 0;
+}
+.cvss-picker .seg {
+  justify-self: start;
+}
+.issue-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 260px;
+  overflow: auto;
+  margin: 8px 0 12px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.issue-pick .check {
+  gap: 7px;
+  color: var(--text);
+  min-width: 0;
+  padding: 3px 2px;
+}
+.issue-pick .ellipsis {
+  flex: 1;
+  min-width: 0;
+}
 /* Settings › Match & replace › Edit rule (views/MatchReplace.tsx). */
 .rule-dialog {
   width: min(960px, 100%);
