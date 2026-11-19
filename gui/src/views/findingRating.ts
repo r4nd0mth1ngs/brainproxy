@@ -52,7 +52,11 @@ export function ratable(f: Pick<FindingItem, "source" | "state">): boolean {
   return f.source !== "manual" && f.state !== "removed";
 }
 
-/** The rating dialog's fields. "" leaves that part of each finding's rating as it is. */
+/**
+ * The rating dialog's fields. "" leaves that part of each finding's rating as it is. With
+ * `wholeIssue` they are the issue's own rating, which `findings rate --issue` stores as sent: a
+ * part left out is stored as none, so findings found later keep their own.
+ */
 export interface RateForm {
   risk: Risk | "";
   confidence: Confidence | "";
@@ -63,6 +67,8 @@ export interface RateForm {
   start?: { risk: Risk; confidence: Confidence | "" };
 }
 
+const asConfidence = (c: string | null | undefined): Confidence | "" => RATE_CONFIDENCES.find((k) => k === c) ?? "";
+
 /**
  * The form a rating starts from. One finding: its rating now (a person's, with their reason,
  * or the scanner's to change). Several: each part left as it is until one is picked.
@@ -70,17 +76,28 @@ export interface RateForm {
 export function rateFormFor(findings: (Pick<FindingItem, "risk" | "confidence"> & RatedColumns)[]): RateForm {
   if (findings.length !== 1) return { risk: "", confidence: "", reason: "", wholeIssue: false };
   const f = findings[0];
-  const confidence = RATE_CONFIDENCES.find((c) => c === f.confidence) ?? "";
+  const confidence = asConfidence(f.confidence);
   return { risk: f.risk, confidence, reason: ratingOf(f)?.reason ?? "", wholeIssue: false, start: { risk: f.risk, confidence } };
 }
 
 /**
- * The risk and confidence to send: only the parts changed from where one finding's form
- * started, so rating its whole issue's risk doesn't also give every finding of it this one's
- * confidence. With nothing changed (a new reason, or keeping the scanner's rating as the
- * person's), both.
+ * One finding's form with "the whole issue" ticked or not. Ticked, the parts become the issue's
+ * own rating as it is now ("" for a part it doesn't set, or for both when it isn't rated), so
+ * neither this finding's rating nor a part left untouched overwrites the rest of the issue, and
+ * a part the issue already sets is sent again rather than dropped. Unticked, the finding's own.
+ */
+export function withWholeIssue(f: RateForm, on: boolean, issue: IssueRating | null): RateForm {
+  if (on) return { ...f, wholeIssue: true, risk: issue?.risk ?? "", confidence: asConfidence(issue?.confidence), reason: issue?.reason ?? f.reason };
+  return { ...f, wholeIssue: false, risk: f.start?.risk ?? "", confidence: f.start?.confidence ?? "" };
+}
+
+/**
+ * The risk and confidence to send. For one finding, only the parts changed from where its form
+ * started; with nothing changed (a new reason, or keeping the scanner's rating as the person's),
+ * both. For several findings or a whole issue, as picked.
  */
 export function ratingParts(f: RateForm): { risk: Risk | ""; confidence: Confidence | "" } {
+  if (f.wholeIssue) return { risk: f.risk, confidence: f.confidence };
   const s = f.start;
   if (!s || (f.risk === s.risk && f.confidence === s.confidence)) return { risk: f.risk, confidence: f.confidence };
   return { risk: f.risk === s.risk ? "" : f.risk, confidence: f.confidence === s.confidence ? "" : f.confidence };
@@ -90,6 +107,8 @@ export function ratingParts(f: RateForm): { risk: Risk | ""; confidence: Confide
 export function rateProblem(f: RateForm): string | null {
   if (!f.risk && !f.confidence) return "Pick a risk, a confidence or both";
   if (!f.reason.trim()) return "Say why: reports print the reason beside the rating";
+  // The timeline tells a cleared rating by this text alone (the event has nothing else to go by).
+  if (f.reason.trim().toLowerCase() === SCANNER_AGAIN) return "That's the text the timeline shows for a cleared rating: put the reason another way";
   return null;
 }
 
@@ -108,6 +127,40 @@ export function rateCommands(ids: number[], f: RateForm, issue?: number | null):
 export function clearCommands(ids: number[], issue?: number | null): string[][] {
   if (issue != null) return [["findings", "rate", "--issue", String(issue), "--clear"]];
   return batches(ids).map((b) => ["findings", "rate", ...b.map(String), "--clear"]);
+}
+
+/** How many finding ids a rating call names (they come right after `findings rate`). */
+function idsIn(cmd: string[]): number {
+  let n = 0;
+  for (const a of cmd.slice(2)) {
+    if (!/^\d+$/.test(a)) break;
+    n++;
+  }
+  return n;
+}
+
+/**
+ * Runs rating calls in turn, stopping at the first that fails. `sent` counts the ids of the calls
+ * that went through only, so a failed batch and the ones after it aren't counted as findings that
+ * already had the rating.
+ */
+export async function runRating(
+  cmds: string[][],
+  call: (args: string[]) => Promise<{ ids: number[] }>,
+): Promise<{ changed: number; sent: number; done: number; error: string | null }> {
+  let changed = 0;
+  let sent = 0;
+  let done = 0;
+  for (const cmd of cmds) {
+    try {
+      changed += (await call(cmd)).ids.length;
+    } catch (e) {
+      return { changed, sent, done, error: e instanceof Error ? e.message : String(e) };
+    }
+    sent += idsIn(cmd);
+    done++;
+  }
+  return { changed, sent, done, error: null };
 }
 
 function batches(ids: number[]): number[][] {
@@ -166,9 +219,14 @@ export function ratedEventText(e: Pick<FindingEvent, "old" | "new" | "text">): s
   return `Rated ${words(e.new)}${was}${e.text ? `: ${e.text}` : ""}`;
 }
 
-/** The toast once rating calls went through: how many changed, and how many already had it. */
-export function ratedToast(changed: number, sent: number, cleared: boolean, skipped = 0): string {
+/**
+ * The toast once rating calls went through: how many changed, and how many already had it (of
+ * the ones sent). With `issue`, the issue was rated as a whole, which holds even when none of its
+ * findings changed.
+ */
+export function ratedToast(changed: number, sent: number, cleared: boolean, skipped = 0, issue: number | null = null): string {
   const n = (k: number) => `${k} finding${k === 1 ? "" : "s"}`;
+  if (issue != null) return `Issue #${issue} is rated as a whole: ${n(changed)} of it changed, and findings a later scan adds take the rating.`;
   const head = cleared ? (changed ? `${n(changed)} ${changed === 1 ? "has" : "have"} the scanner's rating again.` : "No finding was rated: nothing changed.") : `Rated ${n(changed)}.`;
   const same = !cleared && sent > changed ? ` ${n(sent - changed)} already had this rating.` : "";
   const left = skipped ? ` ${n(skipped)} added by hand ${skipped === 1 ? "was left out: edit its" : "were left out: edit their"} risk instead.` : "";

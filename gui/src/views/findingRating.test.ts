@@ -20,6 +20,8 @@ import {
   ratingOf,
   ratingParts,
   type RateForm,
+  runRating,
+  withWholeIssue,
 } from "./findingRating.ts";
 
 const form = (p: Partial<RateForm>): RateForm => ({ risk: "", confidence: "", reason: "", wholeIssue: false, ...p });
@@ -79,6 +81,8 @@ test("a rating needs a part and a reason", () => {
   assert.match(rateProblem(form({ risk: "low", reason: "  " }))!, /why/i);
   assert.equal(rateProblem(form({ risk: "low", reason: "x" })), null);
   assert.equal(rateProblem(form({ confidence: "low", reason: "x" })), null);
+  // The timeline reads this text as a cleared rating, so a rating doesn't get it as its reason.
+  assert.match(rateProblem(form({ risk: "low", reason: " The scanner's rating again " }))!, /cleared/);
 });
 
 test("only the parts changed from where one finding started are sent", () => {
@@ -103,9 +107,48 @@ test("rating commands carry the ids in batches, the parts given and the reason a
   assert.equal(cmds[0].length, 2 + RATE_BATCH + 3);
   assert.deepEqual(cmds[1], ["findings", "rate", String(RATE_BATCH + 1), String(RATE_BATCH + 2), "--risk", "info", "--reason=noise"]);
   // A whole issue: by issue, not by id, so findings it gets later take the rating too.
-  assert.deepEqual(rateCommands([4], form({ risk: "high", confidence: "medium", reason: "r", start: { risk: "medium", confidence: "medium" } }), 7), [
-    ["findings", "rate", "--issue", "7", "--risk", "high", "--reason=r"],
-  ]);
+  assert.deepEqual(rateCommands([4], form({ risk: "high", reason: "r", wholeIssue: true }), 7), [["findings", "rate", "--issue", "7", "--risk", "high", "--reason=r"]]);
+});
+
+test("ticking the whole issue starts from the issue's own rating, never the finding's", () => {
+  const one = rateFormFor([{ risk: "medium", confidence: "high", rated_origin: "gui", rated_reason: "mine" }]);
+  // Not rated as a whole: each part left as it is, so a reason alone sends nothing of this
+  // finding's rating to the rest of the issue (it's refused until a part is picked).
+  const fresh = withWholeIssue(one, true, null);
+  assert.deepEqual([fresh.risk, fresh.confidence, fresh.reason, fresh.wholeIssue], ["", "", "mine", true]);
+  assert.match(rateProblem(fresh)!, /Pick/);
+  // Already rated low as a whole: changing the confidence sends the risk too, so set_rating,
+  // which stores what it is sent, keeps the issue's risk for findings found later.
+  const issue = { risk: "low" as const, confidence: null, reason: "staging", origin: "gui", at: null };
+  const rated = withWholeIssue(one, true, issue);
+  assert.deepEqual([rated.risk, rated.confidence, rated.reason], ["low", "", "staging"]);
+  assert.deepEqual(rateCommands([1], { ...rated, confidence: "high" }, 7), [["findings", "rate", "--issue", "7", "--risk", "low", "--confidence", "high", "--reason=staging"]]);
+  // Even when what's picked equals where the finding started, the whole issue gets exactly that.
+  assert.deepEqual(ratingParts({ ...rated, risk: "medium", confidence: "" }), { risk: "medium", confidence: "" });
+  // Unticked: the finding's own rating again.
+  const back = withWholeIssue(rated, false, issue);
+  assert.deepEqual([back.risk, back.confidence, back.wholeIssue], ["medium", "high", false]);
+});
+
+test("rating calls stop at the first failure and count only the findings of the calls that went through", async () => {
+  const cmds = rateCommands(
+    Array.from({ length: RATE_BATCH + 3 }, (_, i) => i + 1),
+    form({ risk: "low", reason: "r" }),
+  );
+  const calls: string[][] = [];
+  const r = await runRating(cmds, async (args) => {
+    calls.push(args);
+    if (calls.length === 2) throw new Error("finding 501 was removed");
+    return { ids: [1, 2, 3] };
+  });
+  assert.deepEqual(r, { changed: 3, sent: RATE_BATCH, done: 1, error: "finding 501 was removed" });
+  // So the toast doesn't count the unsent findings as ones that already had the rating.
+  assert.equal(ratedToast(r.changed, r.sent, false), `Rated 3 findings. ${RATE_BATCH - 3} findings already had this rating.`);
+  const first = await runRating(cmds, async () => Promise.reject(new Error("no")));
+  assert.deepEqual(first, { changed: 0, sent: 0, done: 0, error: "no" });
+  // An issue's call names no ids: nothing is counted as sent, but it went through.
+  const whole = await runRating(rateCommands([], form({ risk: "low", reason: "r", wholeIssue: true }), 7), async () => ({ ids: [4] }));
+  assert.deepEqual(whole, { changed: 1, sent: 0, done: 1, error: null });
 });
 
 test("clearing gives the scanner's rating back by id, or ends an issue's rating", () => {
@@ -148,6 +191,8 @@ test("the toast counts what changed, what already had the rating and what was le
   assert.equal(ratedToast(2, 2, false, 3), "Rated 2 findings. 3 findings added by hand were left out: edit their risk instead.");
   assert.equal(ratedToast(1, 4, true), "1 finding has the scanner's rating again.");
   assert.equal(ratedToast(0, 4, true), "No finding was rated: nothing changed.");
+  // A whole issue is rated even when none of its findings changed.
+  assert.equal(ratedToast(0, 0, false, 0, 7), "Issue #7 is rated as a whole: 0 findings of it changed, and findings a later scan adds take the rating.");
 });
 
 test("the rating key is a Findings key that clashes with no triage key", () => {

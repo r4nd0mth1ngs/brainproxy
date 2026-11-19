@@ -6,12 +6,29 @@ import { useRef, useState } from "react";
 import { run, type FindingItem, type Risk } from "../api";
 import { useDialogFocus } from "../ui/dialogFocus";
 import { Choice } from "./NewFinding";
-import { clearCommands, type Confidence, RATE_CONFIDENCES, RATE_RISKS, rateCommands, ratedLine, ratedToast, rateFormFor, rateProblem, ratingOf, type RatedColumns } from "./findingRating.ts";
+import {
+  clearCommands,
+  type Confidence,
+  type IssueRating,
+  issueRatingLine,
+  RATE_CONFIDENCES,
+  RATE_RISKS,
+  rateCommands,
+  ratedLine,
+  ratedToast,
+  rateFormFor,
+  rateProblem,
+  ratingOf,
+  type RatedColumns,
+  runRating,
+  withWholeIssue,
+} from "./findingRating.ts";
 
 export function RateFindings({
   findings,
   skipped,
   issue,
+  issueRating,
   onClose,
   onDone,
 }: {
@@ -21,6 +38,8 @@ export function RateFindings({
   skipped: number;
   /** The one finding's issue, which can be rated as a whole. */
   issue: number | null;
+  /** That issue's rating as a whole, if it has one: what ticking "the whole issue" starts from. */
+  issueRating: IssueRating | null;
   onClose: () => void;
   /** Once calls went through (some, when one failed): the toast to show. */
   onDone: (toast: string, failed?: string) => void;
@@ -36,27 +55,28 @@ export function RateFindings({
   const problem = rateProblem(form);
   const oneRating = one ? ratingOf(one) : null;
 
+  const whole = form.wholeIssue && issue != null ? issue : null;
+  const pick = (p: Partial<typeof form>) => {
+    setForm((f) => ({ ...f, ...p }));
+    setError(null);
+  };
+
   // Every batch, in turn; a failed one stops there, and what went through is still said.
-  const send = async (cmds: string[][], sent: number, cleared: boolean) => {
+  const send = async (cmds: string[][], cleared: boolean) => {
     setBusy(true);
-    let changed = 0;
-    try {
-      for (const cmd of cmds) changed += (await run<{ ids: number[] }>(cmd)).ids.length;
-      onDone(ratedToast(changed, sent, cleared, skipped));
-    } catch (e: any) {
-      if (changed) onDone(ratedToast(changed, sent, cleared, skipped), e.message);
-      else {
-        setError(e.message);
-        setBusy(false);
-      }
+    const r = await runRating(cmds, (args) => run<{ ids: number[] }>(args));
+    if (r.error && !r.done) {
+      setError(r.error);
+      setBusy(false);
+      return;
     }
+    onDone(ratedToast(r.changed, r.sent, cleared, skipped, cleared ? null : whole), r.error ?? undefined);
   };
   const rate = () => {
     if (problem) return setError(problem);
-    const whole = form.wholeIssue && issue != null ? issue : null;
-    send(rateCommands(ids, form, whole), whole != null ? 0 : ids.length, false);
+    send(rateCommands(ids, form, whole), false);
   };
-  const clear = () => send(clearCommands(rated), rated.length, true);
+  const clear = () => send(clearCommands(rated), true);
 
   const keep = (v: string) => (v === "" ? <span className="muted">as it is</span> : v);
   return (
@@ -69,12 +89,18 @@ export function RateFindings({
           {skipped > 0 && ` ${skipped} ticked finding${skipped === 1 ? " was" : "s were"} added by hand and keep${skipped === 1 ? "s" : ""} its own risk (Edit…).`}
         </p>
         {oneRating && <p className="muted">{ratedLine(oneRating)}</p>}
+        {form.wholeIssue && issue != null && (
+          <p className="muted">
+            {issueRating ? issueRatingLine(issue, issueRating) : `Issue #${issue} isn't rated as a whole yet.`} The rating you pick here becomes the issue's: a part left as
+            it is stays each finding's own.
+          </p>
+        )}
         <div className="form">
           <Choice<Risk | "">
             label="Risk"
             value={form.risk}
-            options={one ? RATE_RISKS : ["", ...RATE_RISKS]}
-            onPick={(risk) => setForm((f) => ({ ...f, risk }))}
+            options={one && !form.wholeIssue ? RATE_RISKS : ["", ...RATE_RISKS]}
+            onPick={(risk) => pick({ risk })}
             render={(r) =>
               r === "" ? (
                 keep(r)
@@ -88,8 +114,8 @@ export function RateFindings({
           <Choice<Confidence | "">
             label="Confidence"
             value={form.confidence}
-            options={one && form.start?.confidence ? RATE_CONFIDENCES : ["", ...RATE_CONFIDENCES]}
-            onPick={(confidence) => setForm((f) => ({ ...f, confidence }))}
+            options={one && !form.wholeIssue && form.start?.confidence ? RATE_CONFIDENCES : ["", ...RATE_CONFIDENCES]}
+            onPick={(confidence) => pick({ confidence })}
             render={keep}
           />
           <label className="wide">
@@ -99,16 +125,20 @@ export function RateFindings({
               autoFocus
               value={form.reason}
               placeholder="Why: only reachable from the internal network, the cookie holds no session, ... Reports print it beside the rating."
-              onChange={(e) => {
-                setForm((f) => ({ ...f, reason: e.target.value }));
-                setError(null);
-              }}
+              onChange={(e) => pick({ reason: e.target.value })}
             />
           </label>
         </div>
         {one && issue != null && (
           <label className="check">
-            <input type="checkbox" checked={form.wholeIssue} onChange={(e) => setForm((f) => ({ ...f, wholeIssue: e.target.checked }))} /> Rate the whole issue #{issue}: every
+            <input
+              type="checkbox"
+              checked={form.wholeIssue}
+              onChange={(e) => {
+                setForm((f) => withWholeIssue(f, e.target.checked, issueRating));
+                setError(null);
+              }}
+            /> Rate the whole issue #{issue}: every
             scanner finding of it, and those a later scan finds
           </label>
         )}
@@ -118,7 +148,8 @@ export function RateFindings({
           </div>
         )}
         <div className="row gap finding-dialog-actions">
-          {rated.length > 0 && (
+          {/* Clearing goes by finding; an issue's own rating is ended from the detail (End it). */}
+          {rated.length > 0 && !form.wholeIssue && (
             <button className="btn" disabled={busy} onClick={clear} title="Clear the person's rating: the risk and confidence the scanner gives now come back">
               {one ? "Clear the rating" : `Clear ${rated.length} rating${rated.length === 1 ? "" : "s"}`}
             </button>

@@ -535,7 +535,8 @@ export function FindingsView({ active }: { active: boolean }) {
 
   // The rating dialog, for the open finding or the ticked scanner findings.
   const rateOpen = () => {
-    if (finding && ratable(finding)) setRating({ findings: [finding], skipped: 0, issue: finding.issue_id ?? null, ticked: false });
+    // Not a finding still shown while the one just picked (J, K) loads.
+    if (finding && finding.id === selected && ratable(finding)) setRating({ findings: [finding], skipped: 0, issue: finding.issue_id ?? null, ticked: false });
   };
   const ratePicked = () => {
     const { ids, skipped } = ratableOf(picked.map((id) => byId.get(id)).filter((f): f is FindingItem => f != null));
@@ -1079,7 +1080,7 @@ export function FindingsView({ active }: { active: boolean }) {
       {reporting && <ReportBuilder name={reportName} onClose={() => setReporting(false)} />}
       {app.findingDraft && <NewFinding draft={app.findingDraft} onClose={() => app.newFinding(null)} onAdded={added} />}
       {editing && <NewFinding draft={null} edit={editing} onClose={() => setEditing(null)} onEdited={edited} />}
-      {rating && <RateFindings findings={rating.findings} skipped={rating.skipped} issue={rating.issue} onClose={() => setRating(null)} onDone={rated} />}
+      {rating && <RateFindings findings={rating.findings} skipped={rating.skipped} issue={rating.issue} issueRating={issueRating} onClose={() => setRating(null)} onDone={rated} />}
     </div>
   );
 }
