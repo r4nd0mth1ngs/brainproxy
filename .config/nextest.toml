@@ -16,3 +16,7 @@ browser = { max-threads = 2 }
 [[profile.ci.overrides]]
 filter = 'binary(=browser_crawl) | binary(=login_replay)'
 test-group = 'browser'
+# Even two at a time, a busy runner sometimes takes longer than those 20 seconds ("the browser
+# didn't start: timed out after 20s"), which failed PRs that never touched the crawler. One
+# retry after a short pause covers that; a test that passes on it is reported as flaky.
+retries = { backoff = "fixed", count = 1, delay = "5s" }
