@@ -90,11 +90,13 @@ function cliBridge(): Plugin {
             if (requestFiles?.length) {
               requestDir = mkdtempSync(join(tmpdir(), "brainproxy-race-"));
               requestFiles.forEach((bytes, i) => {
-                const at = args.indexOf(`--also=@request:${i}`);
-                if (at < 0) throw new Error("missing race request argument");
+                // As the Tauri command: a race's --also, or a macro step's --step (with or without ORIGIN=).
+                const marker = `@request:${i}`;
+                const at = args.findIndex((a) => a === `--also=${marker}` || (a.startsWith("--step=") && a.endsWith(`=${marker}`)));
+                if (at < 0) throw new Error("missing request file argument");
                 const path = join(requestDir!, `${i}.http`);
                 writeFileSync(path, Buffer.from(bytes), { flag: "wx", mode: 0o600 });
-                args[at] = `--also=${path}`;
+                args[at] = args[at].slice(0, -marker.length) + path;
               });
             }
           } catch (e) {

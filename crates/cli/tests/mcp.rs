@@ -212,6 +212,41 @@ fn tools_that_read_a_dash_take_stdin() {
     assert_eq!(env["data"]["requests"][0]["name"], "query ping", "{env}");
 }
 
+/// A macro step's text comes on stdin (an agent may not read files from anywhere), and a macro
+/// is renamed with the rules that run it.
+#[test]
+fn an_agent_gives_a_macro_steps_text_on_stdin_and_renames_it() {
+    let mut m = Mcp::start(&tmp_project("macro-stdin"), &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let tools = m.request("tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    for name in ["auth_macro_add", "auth_macro_edit"] {
+        let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+        assert_eq!(tool["inputSchema"]["properties"]["stdin"]["type"], "string", "{name}");
+    }
+    let edit = tools.iter().find(|t| t["name"] == "auth_macro_edit").unwrap();
+    assert_eq!(edit["inputSchema"]["properties"]["rename"]["type"], "string", "{edit}");
+    let (err, env) = m.call("engagement_start", json!({"targets": ["127.0.0.1"]}));
+    assert!(!err, "{env}");
+    let one = "GET /a HTTP/1.1\nHost: 127.0.0.1:9\n\n";
+    let args = json!({"profile": "app", "name": "csrf", "steps": ["http://127.0.0.1:9=-"], "stdin": one});
+    let (err, env) = m.call("auth_macro_add", args);
+    assert!(!err, "{env}");
+    let (err, env) = m.call("auth_rule_add", json!({"profile": "app", "actions": ["macro:csrf"]}));
+    assert!(!err, "{env}");
+    let two = "POST /b HTTP/1.1\nHost: 127.0.0.1:9\n\ncsrf={{csrf}}";
+    let args = json!({"profile": "app", "name": "csrf", "steps": ["step:1", "http://127.0.0.1:9=-"], "stdin": two,
+        "rename": "token"});
+    let (err, env) = m.call("auth_macro_edit", args);
+    assert!(!err, "{env}");
+    let requests = json!(["GET http://127.0.0.1:9/a", "POST http://127.0.0.1:9/b"]);
+    assert_eq!(
+        (env["data"]["macro"]["name"].clone(), env["data"]["macro"]["requests"].clone()),
+        (json!("token"), requests)
+    );
+    let (err, env) = m.call("auth_rule_list", json!({"profile": "app"}));
+    assert!(!err && env["data"]["rules"][0]["actions"][0]["macro"] == "token", "{env}");
+}
+
 #[test]
 fn an_agent_can_prepare_replay_tabs() {
     let mut m = Mcp::start(&tmp_project("replay-tabs"), &[]);

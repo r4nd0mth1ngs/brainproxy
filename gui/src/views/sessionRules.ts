@@ -2,6 +2,10 @@
 // `auth show` returns, and the `auth macro` / `auth rule` / `auth sign` arguments the Settings
 // view builds.
 
+// With their extensions, so node --test can load this module (as the tests import theirs).
+import { textBytes } from "../api.ts";
+import { withBody } from "../ui/message.ts";
+
 export type Tool = "proxy" | "send" | "fuzz" | "crawl" | "scan" | "checks";
 export const TOOLS: Tool[] = ["proxy", "send", "fuzz", "crawl", "scan", "checks"];
 
@@ -118,15 +122,34 @@ export function parseParams(text: string): [string, string][] {
     });
 }
 
-/** `auth macro add` arguments: steps are history ids, in order. Values go as --flag=value, names after "--". */
-export function macroAddArgs(profile: string, name: string, steps: number[], extract: ExtractRow[]): string[] {
-  const args = ["auth", "macro", "add"];
-  for (const id of steps) args.push(`--step=${id}`);
+/** A CLI call with the request files its `--step=…@request:I` arguments name (see `CliInput.requestFiles`). */
+export interface MacroCall {
+  args: string[];
+  requestFiles: Uint8Array[];
+}
+
+/**
+ * The `--step` value of a step: step:N for one of the macro's own, a history id for a Traffic
+ * row, and for a request given as text ORIGIN=@request:I, where I is the private file the app
+ * stages its bytes in (added to `files`). The origin is said, so it goes where it went before
+ * rather than where its Host header and one scheme for every step would send it.
+ */
+function stepArg(s: EditorStep, files: Uint8Array[]): string {
+  if (s.kind === "kept") return `--step=step:${s.n}`;
+  if (s.kind === "history") return `--step=${s.id}`;
+  files.push(textBytes(s.request));
+  return `--step=${s.target}=@request:${files.length - 1}`;
+}
+
+/** `auth macro add` arguments: steps in order (Traffic rows, or requests given as text). Values go as --flag=value, names after "--". */
+export function macroAddArgs(profile: string, name: string, steps: EditorStep[], extract: ExtractRow[]): MacroCall {
+  const requestFiles: Uint8Array[] = [];
+  const args = ["auth", "macro", "add", ...steps.map((s) => stepArg(s, requestFiles))];
   for (const x of extract) {
     if (x.var.trim() && x.expr) args.push(`--extract=${x.step}:${x.var.trim()}=${x.from}:${x.expr}`);
   }
   args.push("--", profile, name.trim());
-  return args;
+  return { args, requestFiles };
 }
 
 /** A macro as `auth macro show` gives it, with the revision an edit passes back. */
@@ -136,8 +159,16 @@ export interface MacroDetail {
   origin?: string;
 }
 
-/** A step in the macro editor: one of the macro's own (`n`, from 1) or a Traffic row to add. `key` stays with it as it moves. */
-export type EditorStep = { key: string; line: string } & ({ kind: "kept"; n: number } | { kind: "history"; id: number });
+/**
+ * A step in the macro editor: one of the macro's own (`n`, from 1), a Traffic row to add, or a
+ * request given as text (one of those edited, or one pasted) that goes to `target`, an origin.
+ * `key` stays with it as it moves, and as its text is edited, so its extractors stay with it.
+ */
+export type EditorStep = { key: string; line: string } & (
+  | { kind: "kept"; n: number }
+  | { kind: "history"; id: number }
+  | { kind: "text"; target: string; request: string }
+);
 
 /** An extractor in the editor, on the step whose `key` it names. */
 export interface EditorExtract {
@@ -161,7 +192,8 @@ export function macroEditor(m: MacroDetail): { steps: EditorStep[]; extract: Edi
 }
 
 /** Why the edited macro can't be saved yet; null when it can. The CLI checks the rest. */
-export function macroEditProblem(steps: EditorStep[], extract: EditorExtract[]): string | null {
+export function macroEditProblem(steps: EditorStep[], extract: EditorExtract[], name?: string): string | null {
+  if (name !== undefined && !name.trim()) return "Give the macro a name.";
   if (!steps.length) return "A macro needs at least one step.";
   if (extract.some((x) => !steps.some((s) => s.key === x.key))) return "An extractor is on a step that was taken out.";
   if (extract.some((x) => !x.var.trim() || !x.expr)) return "Give each extractor a variable and what to look for, or take it out.";
@@ -169,10 +201,11 @@ export function macroEditProblem(steps: EditorStep[], extract: EditorExtract[]):
 }
 
 /**
- * `auth macro edit` for the editor's steps and extractors, or null when they are what `start`
- * was. Every step and extractor is said, so the result doesn't depend on what is carried: a
- * kept step as step:N, a Traffic row as its history id. The revision makes a macro changed
- * elsewhere since the editor opened fail rather than be overwritten.
+ * `auth macro edit` for the editor's steps, extractors and name, or null when they are what
+ * `start` was. Every step and extractor is said, so the result doesn't depend on what is
+ * carried: a kept step as step:N, a Traffic row as its history id, a request given as text in
+ * a staged file. The revision makes a macro changed elsewhere since the editor opened fail
+ * rather than be overwritten. A new name (`rename`, trimmed) goes as --rename.
  */
 export function macroEditArgs(
   profile: string,
@@ -181,15 +214,103 @@ export function macroEditArgs(
   steps: EditorStep[],
   extract: EditorExtract[],
   revision?: string,
-): string[] | null {
-  const body = (st: EditorStep[], ex: EditorExtract[]) => {
-    const args = st.map((s) => `--step=${s.kind === "kept" ? `step:${s.n}` : s.id}`);
+  rename?: string,
+): MacroCall | null {
+  const body = (st: EditorStep[], ex: EditorExtract[], files: Uint8Array[]) => {
+    const args = st.map((s) => stepArg(s, files));
     const rows = ex.map((x) => `--extract=${st.findIndex((s) => s.key === x.key) + 1}:${x.var.trim()}=${x.from}:${x.expr}`);
     return [...args, ...(rows.length ? rows : ["--no-extract"])];
   };
-  const now = body(steps, extract);
-  if (now.join("\n") === body(start.steps, start.extract).join("\n")) return null;
-  return ["auth", "macro", "edit", ...now, ...(revision ? [`--if-revision=${revision}`] : []), "--", profile, name];
+  const requestFiles: Uint8Array[] = [];
+  const now = body(steps, extract, requestFiles);
+  const renamed = rename !== undefined && rename.trim() !== name ? [`--rename=${rename.trim()}`] : [];
+  // A step given as text is always a change: the editor makes one only when the text changed.
+  if (!renamed.length && !requestFiles.length && now.join("\n") === body(start.steps, start.extract, []).join("\n")) return null;
+  return { args: ["auth", "macro", "edit", ...now, ...renamed, ...(revision ? [`--if-revision=${revision}`] : []), "--", profile, name], requestFiles };
+}
+
+/** A step's request to edit: its origin and text. */
+export interface StepText {
+  target: string;
+  request: string;
+}
+
+/**
+ * The step after its request was edited to `now`: as it was when that is still `was` (its
+ * original text, so a step opened and saved unchanged stays one of the macro's own or a Traffic
+ * row), and otherwise a step given as text, with the same key so its extractors stay on it.
+ */
+export function editedStep(s: EditorStep, now: StepText, was: StepText | null): EditorStep {
+  if (was && s.kind !== "text" && now.target === was.target && now.request === was.request) return s;
+  return { key: s.key, kind: "text", target: now.target, request: now.request, line: stepLine(now) };
+}
+
+/** The origin ("https://host:port") a raw request goes to: its absolute URL's, or its Host header's over `scheme`; "" when it names neither. */
+export function inferOrigin(request: string, scheme = "https"): string {
+  const lines = request.split(/\r?\n/);
+  const path = (lines[0] ?? "").split(" ")[1] ?? "";
+  try {
+    if (/^https?:\/\//i.test(path)) return new URL(path).origin;
+  } catch {
+    return "";
+  }
+  for (const line of lines.slice(1)) {
+    if (!line) break;
+    const m = /^host:\s*(\S+)\s*$/i.exec(line);
+    if (!m) continue;
+    try {
+      return new URL(`${scheme}://${m[1]}`).origin;
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+/** `text` as an origin ("https://app.test:8443"): lower-cased, with a default port or a trailing slash dropped; trimmed as it is when it isn't one. */
+export function cleanOrigin(text: string): string {
+  const s = text.trim();
+  try {
+    const u = new URL(s);
+    const bare = u.pathname === "/" && !u.search && !u.hash && !u.username && !u.password && !/[?#]$/.test(s);
+    if (/^https?:$/.test(u.protocol) && u.hostname && bare) return u.origin;
+  } catch {
+    // Not a URL: said by stepTextProblem.
+  }
+  return s;
+}
+
+/** Why a step's origin and request can't be used; null when they can. The CLI checks the rest. */
+export function stepTextProblem(t: StepText): string | null {
+  if (!/^https?:\/\/[^/?#@\s]+$/i.test(t.target) || cleanOrigin(t.target) !== t.target)
+    return "Give the origin the request goes to, such as https://app.test or http://127.0.0.1:8000.";
+  const line = t.request.split(/\r?\n/, 1)[0] ?? "";
+  if (!/^\S+ \S+ HTTP\/\d(\.\d)?$/.test(line.trim())) return "The request starts with a request line, such as GET /path HTTP/1.1.";
+  return null;
+}
+
+/**
+ * The variables a step can use as {{name}}: those extracted by the steps before `key` (every
+ * step for one not in the list yet, a new one going last), then the profile's username and
+ * password.
+ */
+export function varsBefore(steps: EditorStep[], extract: { key: string; var: string }[], key: string | null): string[] {
+  const at = key === null ? -1 : steps.findIndex((s) => s.key === key);
+  const before = new Set((at < 0 ? steps : steps.slice(0, at)).map((s) => s.key));
+  const vars = extract.filter((x) => before.has(x.key)).map((x) => x.var.trim()).filter(Boolean);
+  return [...new Set([...vars, "username", "password"])];
+}
+
+/**
+ * `value` (as the message editor holds it) with {{name}} put over the textarea's selection
+ * `start`..`end`, whose offsets count line breaks as \n (the textarea shows CRLF as \n), and
+ * where the caret goes after it.
+ */
+export function insertVar(value: string, start: number, end: number, name: string): { value: string; caret: number } {
+  const text = value.replace(/\r\n/g, "\n");
+  const [a, b] = [Math.max(0, Math.min(start, text.length)), Math.max(0, Math.min(end, text.length))];
+  const put = `{{${name}}}`;
+  return { value: withBody(text.slice(0, Math.min(a, b)) + put + text.slice(Math.max(a, b)), value), caret: Math.min(a, b) + put.length };
 }
 
 export interface RuleForm {

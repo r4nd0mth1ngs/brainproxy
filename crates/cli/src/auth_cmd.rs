@@ -120,7 +120,7 @@ pub enum MacroCmd {
     /// Add or replace a macro. A profile that doesn't exist yet is made, with no login.
     #[command(after_help = "Steps run in the order given, with the profile's session; cookies carry \
         through. --step takes a history id, a raw request FILE (sent to its Host over --scheme), or \
-        ORIGIN=FILE (e.g. https://app.test:8443=req.txt).\n\
+        ORIGIN=FILE (e.g. https://app.test:8443=req.txt). FILE - is the request on stdin (one step only).\n\
         --extract STEP:VAR=KIND:EXPR takes a value from step STEP's response into VAR. KIND is regex \
         (group 1), json (a path like data.token or items.0.id), header, cookie (a Set-Cookie), or input \
         (an HTML <input name=EXPR>, or <meta name=EXPR content=...>).\n\
@@ -131,7 +131,8 @@ pub enum MacroCmd {
         profile: String,
         /// Macro name.
         name: String,
-        /// A step: history id, FILE, or ORIGIN=FILE. Repeatable, in order. Through MCP only a file in the project's folder.
+        /// A step: history id, FILE, or ORIGIN=FILE, where FILE - is the request on stdin (one step
+        /// only). Repeatable, in order. Through MCP only a file in the project's folder, or stdin.
         #[arg(long = "step", required = true)]
         steps: Vec<String>,
         /// STEP:VAR=KIND:EXPR. Repeatable.
@@ -145,22 +146,26 @@ pub enum MacroCmd {
         #[arg(long)]
         host_header_test: bool,
     },
-    /// Change a macro in place: its steps, its extractors, or both. It keeps its name and its
+    /// Change a macro in place: its steps, its extractors, its name, or all of them. It keeps its
     /// place among the profile's macros, and session rules that run it go on running it.
     #[command(after_help = "--step replaces the steps, in order. It takes what `auth macro add` takes, and \
         step:N for the macro's step N as it is (with its extractors, unless --extract or --no-extract is \
-        given): reorder with --step step:2 --step step:1, add a step with --step step:1 --step 42. --extract \
-        replaces every extractor (STEP is a step of the edited macro) and --no-extract removes them all; \
-        without them, steps kept with step:N keep theirs. The macro is checked as `auth macro add` checks one: \
-        a step's Host the scope doesn't list is refused through MCP without --host-header-test, unless the \
+        given): reorder with --step step:2 --step step:1, add a step with --step step:1 --step 42. To change \
+        a step's request, give its new text in its place: --step step:1 --step https://app.test=- with the \
+        request on stdin (or a FILE). --extract replaces every extractor (STEP is a step of the edited macro) \
+        and --no-extract removes them all; without them, steps kept with step:N keep theirs, and a step given \
+        as text has none. --rename gives the macro a new name, and the session rules that run it run it under \
+        that name (they record whoever renamed it as their origin). The macro is checked as `auth macro add` \
+        checks one: a step's Host the scope doesn't list is refused through MCP without --host-header-test, unless the \
         macro already sent that one. A changed macro records whoever edited it as its origin. --if-revision \
         takes the macro's revision from `auth macro show` and refuses (kind conflict) a macro changed since.")]
     Edit {
         profile: String,
         /// Macro name.
         name: String,
-        /// A step: history id, FILE, ORIGIN=FILE, or step:N (the macro's step N). Repeatable, in
-        /// order; replaces the steps. Through MCP a FILE only in the project's folder.
+        /// A step: history id, FILE, ORIGIN=FILE, or step:N (the macro's step N); FILE - is the
+        /// request on stdin (one step only). Repeatable, in order; replaces the steps. Through MCP
+        /// a FILE only in the project's folder, or stdin.
         #[arg(long = "step")]
         steps: Vec<String>,
         /// STEP:VAR=KIND:EXPR. Repeatable; replaces every extractor.
@@ -169,6 +174,9 @@ pub enum MacroCmd {
         /// Remove every extractor.
         #[arg(long)]
         no_extract: bool,
+        /// A new name for the macro; the session rules that run it follow.
+        #[arg(long, value_name = "NAME")]
+        rename: Option<String>,
         /// Scheme for FILE steps whose request line has no absolute URL.
         #[arg(long, default_value = "https")]
         scheme: String,
@@ -1542,7 +1550,6 @@ fn step_line(s: &MacroStep) -> String {
     }
 }
 
-/// A macro step from `--step`: a history id, FILE, or ORIGIN=FILE.
 /// The values of the Host headers among `headers`.
 fn host_values<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>) -> impl Iterator<Item = &'a str> {
     headers.into_iter().filter(|(k, _)| k.trim().eq_ignore_ascii_case("host")).map(|(_, v)| v)
@@ -1605,7 +1612,19 @@ fn check_macro_hosts(
     Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
 }
 
-fn read_step(project: &Path, store: &Store, spec: &str, scheme: &str) -> Result<MacroStep, Error> {
+/// Most bytes a macro step read from stdin may have.
+const MAX_STEP_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A macro step from `--step`: a history id, FILE, or ORIGIN=FILE, where FILE `-` is stdin.
+/// `stdin_taken` says whether an earlier step of the same command already read stdin: there is
+/// only one, so a second `-` is refused rather than read as an empty request.
+fn read_step(
+    project: &Path,
+    store: &Store,
+    spec: &str,
+    scheme: &str,
+    stdin_taken: &mut bool,
+) -> Result<MacroStep, Error> {
     if let Ok(id) = spec.trim().parse::<i64>() {
         let h = store.get(id)?;
         return Ok(MacroStep {
@@ -1619,19 +1638,42 @@ fn read_step(project: &Path, store: &Store, spec: &str, scheme: &str) -> Result<
         Some((o, f)) if o.starts_with("http://") || o.starts_with("https://") => (Some(o), f),
         _ => (None, spec),
     };
-    // The step is sent as it is, and stored: through MCP only a file in the project's folder.
-    let path = crate::mcp::local_disk_file(
-        project,
-        "--step",
-        file,
-        "give the step as a history id (send the request first, or find it with `query`)",
-    )?;
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| Error::InvalidInput(format!("cannot read macro step {file:?}: {e}")))?;
+    let text = if file == "-" {
+        if std::mem::replace(stdin_taken, true) {
+            return Err(Error::InvalidInput(
+                "--step -: only one step can be read from stdin; give the others as files, history ids or step:N"
+                    .into(),
+            ));
+        }
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(std::io::stdin(), MAX_STEP_BYTES + 1), &mut buf)?;
+        if buf.len() as u64 > MAX_STEP_BYTES {
+            return Err(Error::InvalidInput(format!("--step -: the request on stdin is over {MAX_STEP_BYTES} bytes")));
+        }
+        String::from_utf8(buf).map_err(|_| Error::InvalidInput("--step -: the request on stdin is not UTF-8".into()))?
+    } else {
+        // The step is sent as it is, and stored: through MCP only a file in the project's folder.
+        let path = crate::mcp::local_disk_file(
+            project,
+            "--step",
+            file,
+            "give the step as a history id (send the request first, or find it with `query`), or its text on \
+             stdin (-)",
+        )?;
+        std::fs::read_to_string(path)
+            .map_err(|e| Error::InvalidInput(format!("cannot read macro step {file:?}: {e}")))?
+    };
+    // Stored with its head's line endings mended, as a macro run sends every step: a request
+    // typed in the app or an editor has bare \n, which the Host check would otherwise take for
+    // a head servers read differently, though it never goes out so.
+    let raw = RawRequest::from_bytes(text.into_bytes()).normalize_line_endings();
     let target = match origin {
         Some(o) => Target::from_url(o)?,
-        None => RawRequest::from_bytes(text.clone().into_bytes()).infer_target(scheme)?,
+        None => raw.infer_target(scheme)?,
     };
+    // Valid UTF-8 still: only \r went in, before \n.
+    let text = String::from_utf8(raw.into_bytes())
+        .map_err(|_| Error::InvalidInput(format!("macro step {file:?} is not UTF-8")))?;
     Ok(MacroStep { target: target.origin(), request: text, history_id: None, extract: vec![] })
 }
 
@@ -1652,9 +1694,13 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
     match cmd {
         MacroCmd::Add { profile, name, steps, extract, scheme, host_header_test } => {
             let (stored, mut h) = store.auth_handling_as_stored(&profile)?;
+            let mut stdin_taken = false;
             let mut m = Macro {
                 name: name.clone(),
-                steps: steps.iter().map(|s| read_step(project, &store, s, &scheme)).collect::<Result<_, _>>()?,
+                steps: steps
+                    .iter()
+                    .map(|s| read_step(project, &store, s, &scheme, &mut stdin_taken))
+                    .collect::<Result<_, _>>()?,
                 origin: Some(brainproxy_core::provenance::origin().to_string()),
             };
             for spec in &extract {
@@ -1696,7 +1742,7 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
                 )
             });
         }
-        MacroCmd::Edit { profile, name, steps, extract, no_extract, scheme, host_header_test, if_revision } => {
+        MacroCmd::Edit { profile, name, steps, extract, no_extract, rename, scheme, host_header_test, if_revision } => {
             store.auth_profile(&profile)?;
             // Saved only if nobody else changed the profile's macros and rules meanwhile.
             let (stored, mut h) = store.auth_handling_as_stored(&profile)?;
@@ -1715,10 +1761,30 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
                     )));
                 }
             }
-            if steps.is_empty() && extract.is_empty() && !no_extract {
-                return Err(Error::InvalidInput("auth macro edit: give --step, --extract or --no-extract".into()));
+            if steps.is_empty() && extract.is_empty() && !no_extract && rename.is_none() {
+                return Err(Error::InvalidInput(
+                    "auth macro edit: give --step, --extract, --no-extract or --rename".into(),
+                ));
             }
             let mut m = old.clone();
+            if let Some(new) = rename.as_deref().filter(|n| *n != name) {
+                if h.macros.iter().any(|o| o.name == new) {
+                    return Err(Error::InvalidInput(format!(
+                        "--rename {new:?}: profile {profile:?} already has a macro named so"
+                    )));
+                }
+                m.name = new.to_string();
+                // Rules name the macro they run: they follow it, so none is left running a macro
+                // that is gone (or one added later under the old name).
+                for a in h.rules.iter_mut().flat_map(|r| &mut r.actions) {
+                    if let Action::RunMacro { name: n, .. } = a {
+                        if *n == name {
+                            n.clone_from(&m.name);
+                        }
+                    }
+                }
+            }
+            let mut stdin_taken = false;
             if !steps.is_empty() {
                 let n = old.steps.len();
                 m.steps = steps
@@ -1727,7 +1793,7 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
                         Some(k) => old.steps.get(k.wrapping_sub(1)).cloned().ok_or_else(|| {
                             Error::InvalidInput(format!("--step {spec:?}: the macro has steps 1 to {n}"))
                         }),
-                        None => read_step(project, &store, spec, &scheme),
+                        None => read_step(project, &store, spec, &scheme, &mut stdin_taken),
                     })
                     .collect::<Result<_, _>>()?;
             }
@@ -1749,12 +1815,13 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
             let guard = store.guard()?;
             let host_warning = check_macro_hosts(&guard, &m, Some(&old), host_header_test, out)?;
             let changed = m != old;
+            let m_name = m.name.clone();
             if changed {
                 h.macros[i] = m;
                 store.auth_save_handling(&profile, stored.as_deref(), &h)?;
             }
-            let saved = store.auth_handling(&profile)?.macros.into_iter().find(|x| x.name == name);
-            let saved = saved.ok_or_else(|| Error::Conflict(format!("macro {name:?} was removed meanwhile")))?;
+            let saved = store.auth_handling(&profile)?.macros.into_iter().find(|x| x.name == m_name);
+            let saved = saved.ok_or_else(|| Error::Conflict(format!("macro {m_name:?} was removed meanwhile")))?;
             let revision = brainproxy_core::store::revision(&saved);
             let mut data = json!({
                 "profile": profile,
@@ -1767,7 +1834,8 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
             }
             out.ok(data, || {
                 let what = if changed { "edited" } else { "unchanged" };
-                format!("macro {name:?} of {profile} {what} ({} steps)", saved.steps.len())
+                let renamed = if m_name == name { String::new() } else { format!(", now named {m_name:?}") };
+                format!("macro {name:?} of {profile} {what}{renamed} ({} steps)", saved.steps.len())
             });
         }
         MacroCmd::List { profile } => {

@@ -4,7 +4,7 @@
 // Line endings are shown and edited as \n; `send` turns the head's back into CRLF and an
 // edit keeps the body's own (see message.ts).
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { decode, encodeAll } from "./urlencode";
 import { RENDER_CAP, renderable } from "./render";
 import { textBytes } from "../api";
@@ -148,6 +148,8 @@ export function HttpView(p: {
   binary?: boolean;
   /** Parts of the text (offsets with line breaks as \n) marked as a payload in the Raw view. */
   ranges?: Range[];
+  /** Also given the Raw editor's textarea, to read its selection (offsets with line breaks as \n). */
+  editorRef?: RefObject<HTMLTextAreaElement | null>;
 }) {
   const [mode, setMode] = useState<Mode>("raw");
   const [query, setQuery] = useState(p.highlight ?? "");
@@ -257,7 +259,10 @@ export function HttpView(p: {
               {"\n"}
             </pre>
             <textarea
-              ref={editor}
+              ref={(el) => {
+                editor.current = el;
+                if (p.editorRef) p.editorRef.current = el;
+              }}
               className="code editor"
               onKeyDown={(e) => {
                 const chord = chordOf(e.nativeEvent, MAC);

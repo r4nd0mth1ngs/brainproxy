@@ -1,8 +1,16 @@
-//! Private request files for one CLI call, held until it exits (including cancellation).
+//! Private request files for one CLI call, held until it exits (including cancellation): the
+//! extra requests of a race (`send --also=@request:I`) and macro steps given as text (`auth macro
+//! add|edit --step=@request:I` or `--step=ORIGIN=@request:I`).
 use std::io::Write;
 use std::path::PathBuf;
 
 pub struct RaceFiles(Option<PathBuf>);
+
+/// Whether `arg` is the placeholder for request file `i`: `--also=@request:I`, or a `--step=`
+/// whose FILE is `@request:I`. Only these, so a file can't be put into any other argument.
+fn is_marker(arg: &str, i: usize) -> bool {
+    arg == format!("--also=@request:{i}") || (arg.starts_with("--step=") && arg.ends_with(&format!("=@request:{i}")))
+}
 
 impl RaceFiles {
     pub fn stage(args: &mut [String], files: Vec<Vec<u8>>) -> std::io::Result<Self> {
@@ -30,11 +38,10 @@ impl RaceFiles {
         }
         let dir = held.0.as_ref().ok_or_else(|| std::io::Error::other("cannot allocate race request directory"))?;
         for (i, bytes) in files.iter().enumerate() {
-            let marker = format!("--also=@request:{i}");
             let arg = args
                 .iter_mut()
-                .find(|arg| **arg == marker)
-                .ok_or_else(|| std::io::Error::other("missing race request argument"))?;
+                .find(|arg| is_marker(arg, i))
+                .ok_or_else(|| std::io::Error::other("missing request file argument"))?;
             let path = dir.join(format!("{i}.http"));
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
@@ -44,7 +51,8 @@ impl RaceFiles {
                 options.mode(0o600);
             }
             options.open(&path)?.write_all(bytes)?;
-            *arg = format!("--also={}", path.display());
+            let keep = arg.len() - format!("@request:{i}").len();
+            *arg = format!("{}{}", &arg[..keep], path.display());
         }
         Ok(held)
     }
@@ -113,6 +121,27 @@ mod tests {
         assert!(RaceFiles::stage(&mut args, vec![b"first".to_vec(), b"second".to_vec()]).is_err());
         let path = PathBuf::from(args[0].strip_prefix("--also=").unwrap());
         assert!(!path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn macro_steps_take_files_with_or_without_an_origin() {
+        let mut args: Vec<String> =
+            vec!["--step=step:1".into(), "--step=https://app.test:8443=@request:1".into(), "--step=@request:0".into()];
+        let held = RaceFiles::stage(&mut args, vec![b"zero".to_vec(), b"one".to_vec()]).unwrap();
+        assert_eq!(args[0], "--step=step:1");
+        let one = args[1].strip_prefix("--step=https://app.test:8443=").unwrap();
+        assert_eq!(std::fs::read(one).unwrap(), b"one");
+        assert_eq!(std::fs::read(args[2].strip_prefix("--step=").unwrap()).unwrap(), b"zero");
+        drop(held);
+    }
+
+    #[test]
+    fn a_marker_in_another_argument_is_not_replaced() {
+        for arg in ["--stepx=@request:0", "--extract=1:a=regex:@request:0", "--also=x=@request:0"] {
+            let mut args = vec![arg.to_string()];
+            assert!(RaceFiles::stage(&mut args, vec![b"raw".to_vec()]).is_err(), "{arg}");
+            assert_eq!(args[0], arg);
+        }
     }
 
     #[test]

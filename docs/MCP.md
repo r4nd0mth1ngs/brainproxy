@@ -230,7 +230,9 @@ Some arguments need a person, so a command run for a tool call (the server sets
   where it is sent, and one its replacement writes is refused when it is saved, unless
   `host_header_test`; `auth_macro_edit` and `auth_macro_add` check every step's Host the scope
   doesn't list (a host the macro they replace already sent excepted, but no new one behind it),
-  take step files only from the project's folder, and record `mcp` as the macro's origin. Each edit
+  take step files only from the project's folder (a step's edited text goes in the call's `stdin`,
+  with `steps: ["step:1", "https://app.test=-"]`), and record `mcp` as the macro's origin;
+  `auth_macro_edit`'s `rename` also makes the rules that run the macro record `mcp`. Each edit
   takes `if_revision` (from `rules_list`'s `revisions`, `findings_show`'s or
   `auth_macro_show`'s `revision`) and fails with a conflict when the record changed since.
 - `findings_verify` with a `request` other than `-`: the edited attack is sent and recorded as it
@@ -256,12 +258,13 @@ Some arguments need a person, so a command run for a tool call (the server sets
   `intercept_forward`'s `file`, `findings_compare`'s `baseline` and `current`, and a template
   file for `checks_validate`, `checks_list` or `scan_active`'s `checks`, whose bytes are sent to
   the target and recorded as they are, or come back in the reply. A `..` in the path counts only
-  for where it leads, and where `-` is a file name (`steps`, `login_request`, `baseline`,
-  `current`, templates) a file named `-` is checked like any other. The refusal names the path,
+  for where it leads, and where `-` is a file name (`login_request`, `baseline`,
+  `current`, templates) a file named `-` is checked like any other (a macro step's `-` is the
+  call's `stdin`). The refusal names the path,
   never the file's content. An agent passes the text as the call's `stdin` where the tool reads
   it (`-` for a document, request, handshake or intercept edit; `file:-` for payloads), puts the
   file in the project's folder, or uses what else the tool takes: an http(s) URL for a document
-  (checked against the scope as usual), `url` for a request, a history id for a macro step,
+  (checked against the scope as usual), `url` for a request, a history id or `-` for a macro step,
   `scan` for a comparison. A `baseline` that doesn't exist is refused too, `allow_missing_baseline`
   or not. A project kept in the home folder, in a folder above it, or at `/` opens no local file
   to these tools: a person puts the project in a folder of its own. Inside the folder, the

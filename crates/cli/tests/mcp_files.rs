@@ -324,7 +324,7 @@ fn an_agent_names_template_files_only_in_the_projects_folder_and_no_folders() {
     person(&s.project, &["checks", "validate", folder]);
 }
 
-/// Where `-` is a file name, not stdin (a macro step, a login request, a report, a template), a
+/// Where `-` is a file name, not stdin (a login request, a report, a template), a
 /// file named `-` in the server's folder is checked like any other.
 #[test]
 fn an_agent_s_dash_is_a_file_where_a_command_reads_no_stdin() {
@@ -333,7 +333,6 @@ fn an_agent_s_dash_is_a_file_where_a_command_reads_no_stdin() {
     s.write("elsewhere/-", &REQUEST.replace("SECRET", SECRET));
     let login_url = format!("http://127.0.0.1:{}/login", s.server.port);
     for args in [
-        vec!["auth", "macro", "add", "app", "m", "--scheme", "http", "--step", "-"],
         vec!["auth", "add", "app", "--login-url", &login_url, "--login-request", "-"],
         vec!["findings", "compare", "--baseline", "-"],
         vec!["checks", "validate", "-"],
@@ -341,14 +340,23 @@ fn an_agent_s_dash_is_a_file_where_a_command_reads_no_stdin() {
     ] {
         s.refused_in(&args, Some(&elsewhere));
     }
-    // A person's `-` is the file it names, as before.
+    // A macro step's `-` is stdin (the agent's own text, here none), for an agent and a person
+    // alike: never the file named `-`. A person names that file as ./-.
+    let dash = ["auth", "macro", "add", "app", "m", "--scheme", "http", "--step", "-"];
+    for agent in [true, false] {
+        let o = run_in(&s.project, &dash, agent, Some(&elsewhere));
+        assert_eq!(o.code, 2, "{}", o.all);
+        assert!(!o.all.contains(SECRET) && !s.server.sent(SECRET), "{}", o.all);
+    }
     let o = run_in(
         &s.project,
-        &["auth", "macro", "add", "app", "m", "--scheme", "http", "--step", "-"],
+        &["auth", "macro", "add", "app", "m", "--scheme", "http", "--step", "./-"],
         false,
         Some(&elsewhere),
     );
     assert_eq!(o.code, 0, "{}", o.all);
+    let o = run_in(&s.project, &["auth", "macro", "add", "app", "m", "--step", "./-"], true, Some(&elsewhere));
+    assert!(o.code == 2 && o.all.contains("project's folder"), "{}", o.all);
 }
 
 /// A person may name a store's folder that isn't there yet, as before: it is an empty store,

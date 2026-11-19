@@ -100,7 +100,7 @@ async fn cli(
     }
     let _requests = match race_files::RaceFiles::stage(&mut args, request_files.unwrap_or_default()) {
         Ok(files) => files,
-        Err(e) => return failure(format!("cannot stage race requests: {e}")),
+        Err(e) => return failure(format!("cannot stage request files: {e}")),
     };
     let Some(call) = call else { return run(&project, &args, stdin, &env).await };
     let mut child = match spawn(&project, &args, stdin, &env) {

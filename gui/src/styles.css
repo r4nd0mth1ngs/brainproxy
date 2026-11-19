@@ -2679,6 +2679,19 @@ button.chip {
   margin: 4px 0;
   flex-wrap: wrap;
 }
+/* A step's request, in the message editor: tall enough to read a request whole. */
+.sh-text-dialog {
+  width: min(900px, 100%);
+}
+.sh-request {
+  display: flex;
+  height: min(420px, 50vh);
+  margin: 8px 0;
+}
+.sh-vars {
+  flex-wrap: wrap;
+  margin: 4px 0;
+}
 .sh-card .row {
   flex-wrap: wrap;
   min-width: 0;
