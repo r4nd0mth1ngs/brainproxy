@@ -13,12 +13,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::output::{escape_controls, Out};
-use crate::ws_cmd::MAX_WAIT_SECS;
+use crate::ws_cmd::{OutMessage, MAX_WAIT_SECS};
 
 /// The meta key holding the saved set (JSON): `{"v", "rev", "tabs", "active"}`.
 const KEY: &str = "replay.tabs";
 /// Format of the saved set. A build refuses to save over a newer one, whose fields it would drop.
-const VERSION: u64 = 1;
+/// 2 added binary WebSocket messages; a set without one is still written as 1, so 0.9.0 and
+/// older keep saving it, and never drop a binary message they can't read.
+const VERSION: u64 = 2;
 /// Largest saved set, in bytes of JSON.
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TABS: usize = 500;
@@ -56,9 +58,10 @@ pub enum TabsCmd {
     #[command(after_help = "Reads JSON from stdin: {\"tabs\": [{\"kind\": \"http\", \"title\": \"login\", \
         \"target\": \"https://app.example.com\", \"request\": \"POST /login HTTP/1.1\\nHost: ...\"}, \
         {\"kind\": \"ws\", \"title\": \"feed\", \"target\": \"wss://app.example.com\", \"request\": \"GET /ws HTTP/1.1\\n...\", \
-        \"messages\": [\"{\\\"op\\\":\\\"sub\\\"}\"], \"wait\": 3, \"until\": \"done\"}], \"active\": 0}. \
+        \"messages\": [\"{\\\"op\\\":\\\"sub\\\"}\", {\"hex\": \"00ff\"}], \"wait\": 3, \"until\": \"done\"}], \"active\": 0}. \
         kind is http (default) or ws; binary marks an http request held one character per byte; messages, \
-        wait (seconds, at most 86400) and until (regex) are for ws tabs; options holds how a tab sends: \
+        wait (seconds, at most 86400) and until (regex) are for ws tabs; a message is a string (text) or \
+        {\"hex\": \"...\"} or {\"base64\": \"...\"} (binary, kept as typed and decoded when sent); options holds how a tab sends: \
         {\"http2\", \"http3\", \"verbatim\", \"crlfBody\" (http tabs), \"sni\", \"timeout\" (seconds, at most 86400), \
         \"verifyTls\"}, never noStore; marks (http tabs, at most 20) are parts of the request the app \
         highlights, [{\"at\": N, \"text\": \"...\"}] (at: where it started, in UTF-16 units with line breaks as \\n; the app finds the text again if it moved), and finding \
@@ -100,7 +103,7 @@ struct Tab {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     binary: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    messages: Option<Vec<String>>,
+    messages: Option<Vec<OutMessage>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wait: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,7 +210,12 @@ pub fn replay(project: &Path, cmd: ReplayCmd, out: &Out) -> Result<(), Error> {
                     let text = tab["request"].as_str().unwrap_or_default();
                     lines.extend(text.split('\n').map(|l| escape_controls(l.trim_end_matches('\r')).into_owned()));
                     for m in tab["messages"].as_array().into_iter().flatten() {
-                        lines.push(format!("--- {}", escape_controls(m.as_str().unwrap_or_default())));
+                        let (kind, text) = match m {
+                            Value::String(t) => ("", t.as_str()),
+                            _ if m["hex"].is_string() => ("[hex] ", m["hex"].as_str().unwrap_or_default()),
+                            _ => ("[base64] ", m["base64"].as_str().unwrap_or_default()),
+                        };
+                        lines.push(format!("--- {kind}{}", escape_controls(text)));
                     }
                     lines.join("\n")
                 });
@@ -341,7 +349,12 @@ fn parse(input: &[u8]) -> Result<Tabs, Error> {
             Kind::Http if t.messages.is_some() || t.wait.is_some() || t.until.is_some() => {
                 return Err(bad("messages, wait and until are for WebSocket tabs (kind ws)".into()));
             }
-            Kind::Ws if t.binary => return Err(bad("WebSocket tabs hold text only, not binary".into())),
+            Kind::Ws if t.binary => {
+                return Err(bad(
+                    "binary is for http tabs; a WebSocket tab's binary message is {\"hex\": ...} or {\"base64\": ...}"
+                        .into(),
+                ))
+            }
             Kind::Ws if t.marks.is_some() || t.finding.is_some() => {
                 return Err(bad("marks and finding are for http tabs".into()));
             }
@@ -387,7 +400,9 @@ fn build(set: Tabs, before: Vec<Value>, active: Option<usize>, rev: u64) -> Resu
     for t in set.tabs {
         tabs.push(serde_json::to_value(t).map_err(|e| Error::InvalidInput(e.to_string()))?);
     }
-    let mut stored = json!({"v": VERSION, "rev": rev, "tabs": tabs});
+    // Format 1 unless a tab needs 2: then a build that can't read binary messages won't save over them.
+    let binary = tabs.iter().any(|t| t["messages"].as_array().is_some_and(|m| m.iter().any(|m| !m.is_string())));
+    let mut stored = json!({"v": if binary { VERSION } else { 1 }, "rev": rev, "tabs": tabs});
     if let Some(a) = active {
         stored["active"] = json!(a);
     }
@@ -481,7 +496,12 @@ mod tests {
         assert!(err(r#"{"tabs": [{"request": "", "response": "HTTP/1.1 200"}]}"#).contains("unknown field"));
         assert!(err(r#"{"tabs": [{"request": "", "kind": "grpc"}]}"#).contains("unknown variant"));
         assert!(err(r#"{"tabs": [{"request": "", "messages": ["a"]}]}"#).contains("WebSocket tabs"));
-        assert!(err(r#"{"tabs": [{"request": "", "kind": "ws", "binary": true}]}"#).contains("text only"));
+        assert!(err(r#"{"tabs": [{"request": "", "kind": "ws", "binary": true}]}"#).contains("binary is for http tabs"));
+        // A message is a string or one hex or base64 field; nothing else passes as one.
+        for m in [r#"{"hex": "00", "base64": "AA=="}"#, r#"{"utf16": "x"}"#, r#"{"hex": 1}"#, "1", "null", "[]"] {
+            let e = err(&format!(r#"{{"tabs": [{{"request": "", "kind": "ws", "messages": ["a", {m}]}}]}}"#));
+            assert!(e.contains("a message is a string (sent as text)"), "{m}: {e}");
+        }
         assert!(err(r#"{"tabs": [{"request": "", "kind": "ws", "finding": 3}]}"#).contains("http tabs"));
         assert!(err(r#"{"tabs": [{"request": "x", "marks": [{"at": 0, "text": ""}]}]}"#).contains("mark's text"));
         assert!(err(r#"{"tabs": [{"request": "x", "marks": [{"at": 0}]}]}"#).contains("text"));
@@ -580,7 +600,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(load(&store).unwrap(), json!({"tabs": []}));
         // Saved by a newer version: listed as stored, not re-checked.
-        let newer = json!({"tabs": [{"kind": "grpc", "request": "", "extra": 1}], "active": 0, "v": 2});
+        let newer = json!({"tabs": [{"kind": "grpc", "request": "", "extra": 1}], "active": 0, "v": 3});
         store.meta_set(KEY, Some(&newer.to_string())).unwrap();
         assert_eq!(load(&store).unwrap(), newer);
         store.meta_set(KEY, Some("{")).unwrap();
@@ -617,12 +637,32 @@ mod tests {
         // Before revisions: revision 0; an active past the end is dropped.
         let (rev, tabs, active) = current(Some(r#"{"tabs": [{"request": ""}], "active": 3}"#), true).unwrap();
         assert_eq!((rev, tabs.len(), active), (0, 1, None));
-        let newer = json!({"v": 2, "rev": 9, "tabs": []}).to_string();
+        let newer = json!({"v": 3, "rev": 9, "tabs": []}).to_string();
         let e = current(Some(&newer), false).unwrap_err();
         assert_eq!(e.kind(), "conflict");
-        assert!(e.to_string().contains("newer brainproxy (format 2"), "{e}");
+        assert!(e.to_string().contains("newer brainproxy (format 3"), "{e}");
+        // Format 2 (binary messages) is this build's own.
+        assert_eq!(current(Some(r#"{"v": 2, "rev": 2, "tabs": []}"#), true).unwrap().0, 2);
         // A broken set can only be replaced outright.
         assert_eq!(current(Some("{"), false).unwrap(), (0, Vec::new(), None));
         assert!(current(Some("{"), true).unwrap_err().to_string().contains("without --append"));
+    }
+
+    #[test]
+    fn binary_messages_are_kept_as_typed_in_format_2() {
+        let input =
+            json!({"tabs": [{"kind": "ws", "request": "", "messages": ["text", {"hex": "0a 0"}, {"base64": "AP8="}]}]});
+        let (json, _) = save(input.to_string().as_bytes()).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        // Half-typed hex is a draft, checked when the tab is sent.
+        assert_eq!(v["tabs"][0]["messages"], json!(["text", {"hex": "0a 0"}, {"base64": "AP8="}]));
+        assert_eq!(v["v"], 2);
+        // Text alone stays format 1, which 0.9.0 still saves over.
+        let (json, _) = save(br#"{"tabs": [{"kind": "ws", "request": "", "messages": ["a"]}]}"#).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&json).unwrap()["v"], 1);
+        // An append of text tabs to a set holding a binary message keeps it at 2.
+        let (_, before, _) = current(Some(&json!({"v": 2, "rev": 1, "tabs": v["tabs"]}).to_string()), true).unwrap();
+        let (json, _) = build(parse(br#"{"tabs": [{"request": "x"}]}"#).unwrap(), before, None, 2).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&json).unwrap()["v"], 2);
     }
 }

@@ -18,6 +18,64 @@ use crate::output::{body_value, Out};
 /// Longest `ws send --wait`, in seconds; a saved Replay tab's wait is held to it too.
 pub(crate) const MAX_WAIT_SECS: f64 = 86_400.0;
 
+/// A message to send, as `ws send --input-json` and a saved Replay tab hold it: a JSON string is
+/// a text message, `{"hex": "..."}` or `{"base64": "..."}` a binary one. Kept as written, so a
+/// saved tab's half-typed hex survives a save; [`OutMessage::frame`] decodes it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum OutMessage {
+    Text(String),
+    Hex(String),
+    Base64(String),
+}
+
+const MESSAGE_SHAPE: &str =
+    "a message is a string (sent as text), or {\"hex\": \"...\"} or {\"base64\": \"...\"} (sent as binary)";
+
+impl OutMessage {
+    /// The opcode and payload to send; says why hex or base64 doesn't decode.
+    pub(crate) fn frame(&self) -> Result<(u8, Vec<u8>), String> {
+        let decode = |kind: &str, text: &str| match codec::decode(kind, text.as_bytes()) {
+            Ok(bytes) => Ok((ws::OP_BINARY, bytes)),
+            Err(Error::InvalidInput(m)) => Err(m),
+            Err(e) => Err(e.to_string()),
+        };
+        match self {
+            OutMessage::Text(t) => Ok((ws::OP_TEXT, t.as_bytes().to_vec())),
+            OutMessage::Hex(h) => decode("hex", h),
+            OutMessage::Base64(b) => decode("base64", b),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OutMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        match Value::deserialize(d)? {
+            Value::String(s) => Ok(OutMessage::Text(s)),
+            Value::Object(o) if o.len() == 1 => match o.into_iter().next() {
+                Some((k, Value::String(v))) if k == "hex" => Ok(OutMessage::Hex(v)),
+                Some((k, Value::String(v))) if k == "base64" => Ok(OutMessage::Base64(v)),
+                _ => Err(D::Error::custom(MESSAGE_SHAPE)),
+            },
+            _ => Err(D::Error::custom(MESSAGE_SHAPE)),
+        }
+    }
+}
+
+impl serde::Serialize for OutMessage {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let (key, value) = match self {
+            OutMessage::Text(t) => return s.serialize_str(t),
+            OutMessage::Hex(h) => ("hex", h),
+            OutMessage::Base64(b) => ("base64", b),
+        };
+        let mut m = s.serialize_map(Some(1))?;
+        m.serialize_entry(key, value)?;
+        m.end()
+    }
+}
+
 #[derive(Subcommand)]
 pub enum WsCmd {
     /// List recorded WebSocket connections (proxied and replayed), oldest first.
@@ -128,8 +186,9 @@ pub struct SendArgs {
     /// the process list and limited in size; --input-json has neither problem.
     #[arg(short = 'm', long = "message")]
     messages: Vec<String>,
-    /// Read JSON from stdin: {"messages": ["text", ...], "handshake": "GET / HTTP/1.1..."}. Both are
-    /// optional; messages go out after --resend and --message ones.
+    /// Read JSON from stdin: {"messages": ["text", {"hex": "00ff"}, {"base64": "AP8="}, ...],
+    /// "handshake": "GET / HTTP/1.1..."}. A string is a text message, a hex or base64 object a binary
+    /// one. Both fields are optional; messages go out after --resend and --message ones.
     #[arg(long, conflicts_with = "file")]
     input_json: bool,
     /// Send each --message as a binary frame; the values are base64.
@@ -281,7 +340,7 @@ fn http_url(url: &str) -> String {
 struct Input {
     handshake: Option<String>,
     #[serde(default)]
-    messages: Vec<String>,
+    messages: Vec<OutMessage>,
 }
 
 /// The handshake to send and where to, from the first source given.
@@ -351,7 +410,10 @@ fn outgoing(store: &Store, args: &SendArgs, input: &Input) -> Result<Vec<(u8, Ve
             (ws::OP_TEXT, m.as_bytes().to_vec())
         });
     }
-    list.extend(input.messages.iter().map(|m| (ws::OP_TEXT, m.as_bytes().to_vec())));
+    // All decoded before anything is sent: a bad one fails the command, not the connection.
+    for (i, m) in input.messages.iter().enumerate() {
+        list.push(m.frame().map_err(|e| Error::InvalidInput(format!("--input-json: messages[{i}]: {e}")))?);
+    }
     Ok(list)
 }
 

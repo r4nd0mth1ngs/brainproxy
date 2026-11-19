@@ -61,6 +61,18 @@ test("a tab's send options are kept, but never Don't record", () => {
   assert.deepEqual(agent[1].options, { timeout: "60" });
 });
 
+test("binary WebSocket messages are saved and come back as typed", () => {
+  const ws = ["text", { hex: "00 ff\n0" }, { base64: "AP8=" }];
+  const saved = toSaved([{ key: 1, title: "WS", target: "wss://a.test", raw: "GET / HTTP/1.1\n\n", ws }], 1);
+  assert.deepEqual(saved.tabs[0].messages, ws);
+  // As the CLI lists it (format 2); a message this build can't read isn't opened as something else.
+  const listed = { v: 2, tabs: [{ ...JSON.parse(JSON.stringify(saved.tabs[0])), messages: [...ws, { utf16: "x" }, { hex: "00", base64: "AA==" }] }] };
+  let k = 1;
+  assert.deepEqual(fromSaved(listed, () => k++).tabs[0].ws, ws);
+  // The same text either way, so the app's own save isn't taken for an agent's tab.
+  assert.deepEqual(tabTexts(JSON.stringify(saved)), tabTexts({ tabs: JSON.parse(JSON.stringify(saved.tabs)) }));
+});
+
 test("loading skips what isn't a tab", () => {
   let k = 1;
   const r = fromSaved({ tabs: [null, "x", { title: "no request" }, { request: "GET / HTTP/1.1\n\n", future: 1 }, { kind: "ws", request: "", messages: [1, "m"] }], active: 0 }, () => k++);
@@ -589,13 +601,15 @@ test("coming back to the window shows an agent's tabs without a save", async () 
 });
 
 test("a set saved by a newer version isn't saved over", async () => {
-  assert.equal(newerFormat({ v: 2, tabs: [] }), true);
+  assert.equal(newerFormat({ v: 3, tabs: [] }), true);
+  // 2 is a set holding binary WebSocket messages: this build's own.
+  assert.equal(newerFormat({ v: 2, tabs: [] }), false);
   assert.equal(newerFormat({ v: 1, tabs: [] }), false);
   assert.equal(newerFormat({ tabs: [] }), false);
   const f = fakeCli();
   const a = app(f, ["mine"]);
   a.revs.loaded(await f.cli(["replay", "tabs", "list"]));
-  f.db.set = { v: 2, rev: 5, tabs: [] };
+  f.db.set = { v: 3, rev: 5, tabs: [] };
   await assert.rejects(a.revs.save(a.body()), (e: Error) => e.message === NEWER);
   assert.equal(f.db.set.rev, 5);
   // Other errors are passed on as they are.
