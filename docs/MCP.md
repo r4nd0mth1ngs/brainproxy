@@ -105,8 +105,8 @@ call too); and `findings rate`, since a risk or confidence in place of the scann
 person's call (an agent suggests one with `findings_mark` and `suggest`; the command refuses a
 tool call too); and `ca install-system`, since every program that uses the system trust store
 would then trust whatever the CA signs, a person's decision for their machine (the command
-refuses a tool call too). (`connection review`, `browser open` and the `scan script` commands are left
-out too; see below.)
+refuses a tool call too). (`connection review`, `browser open` and the `scan script` commands
+are left out too; see below.)
 `findings_list` returns a page: `limit` rows from `offset` on, with `total` and `truncated`,
 so an agent works through a large project page by page (`issue` lists one issue's findings).
 `findings_mark` marks the findings an agent names: `id` takes one id or a list, and `issue`

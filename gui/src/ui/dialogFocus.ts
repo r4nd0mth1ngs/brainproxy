@@ -4,7 +4,9 @@
 
 import { useEffect, useState, type RefObject } from "react";
 
-const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
+// A <details> disclosure is reached by its summary.
+export const FOCUSABLE =
+  'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], summary, [tabindex]:not([tabindex="-1"])';
 
 /** Where Tab goes among `count` focusable elements from `current` (-1: none of them has focus). */
 export function nextFocus(current: number, count: number, back: boolean): number {

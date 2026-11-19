@@ -759,11 +759,12 @@ fn an_agent_cannot_replace_a_persons_layouts_or_files() {
 
 #[test]
 fn ca_install_system_refuses_a_tool_call_before_it_touches_anything() {
-    // The refusal comes before the CA is loaded: nothing is created in the home, and no trust
-    // store is written (the command would otherwise try to on this machine).
+    // The home is under a regular file, so no CA can be loaded or made there: were the refusal
+    // gone, the command would fail before reaching any trust store, and this test with it.
     let p = tmp_project("ca-install-system");
-    let home = p.parent().unwrap().join("home");
-    let _ = std::fs::remove_dir_all(&home);
+    let blocker = p.parent().unwrap().join("not-a-dir");
+    std::fs::write(&blocker, "").unwrap();
+    let home = blocker.join("home");
     let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
         .env("BRAINPROXY_MCP_CALL", "1")
         .env("BRAINPROXY_HOME", &home)
@@ -775,7 +776,6 @@ fn ca_install_system_refuses_a_tool_call_before_it_touches_anything() {
     assert!(!o.status.success());
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(out.contains("refused through MCP"), "{out}");
-    assert!(!home.join("ca").exists(), "the CA was loaded before the refusal");
 }
 
 #[test]

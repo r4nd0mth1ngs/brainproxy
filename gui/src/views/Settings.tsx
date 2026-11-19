@@ -1162,7 +1162,7 @@ function Ca() {
             </button>
           </div>
           <pre className="code set-pem">{ca.pem}</pre>
-          {trusting && <SystemTrustDialog certPath={ca.cert_path} sha256={ca.sha256} close={() => setTrusting(false)} />}
+          {trusting && <SystemTrustDialog certPath={ca.cert_path} pem={ca.pem} sha256={ca.sha256} close={() => setTrusting(false)} />}
         </>
       )}
       <h3>Trust it</h3>
