@@ -229,6 +229,8 @@ export interface FindingItem {
   origin?: string | null;
   /** The issue (root cause: alert type and host) it is an instance of. */
   issue_id?: number | null;
+  /** The suppression rule that marked it a false positive; null when none did, or its state changed since. */
+  suppressed_by?: number | null;
 }
 
 /** One change on a finding's timeline (`findings timeline`). */

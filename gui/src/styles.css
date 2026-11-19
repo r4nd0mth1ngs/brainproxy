@@ -2991,6 +2991,50 @@ button.chip {
   padding-left: 20px;
 }
 
+/* Findings › Suppress… and Suppression rules (views/Suppressions.tsx). */
+.suppress-dialog,
+.suppress-rules {
+  width: min(640px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+.suppress-dialog .form {
+  grid-template-columns: 1fr 1fr;
+  max-width: none;
+  margin-bottom: 12px;
+}
+.confirm-dialog p.suppress-error {
+  margin: 0 0 12px;
+  color: var(--high);
+  white-space: pre-wrap;
+}
+.suppress-list {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+}
+.suppress-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+  min-width: 0;
+}
+.suppress-list li > div {
+  overflow-wrap: anywhere;
+}
+.suppress-remove {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+}
+
 /* ---------- command palette (ui/Palette.tsx) and Settings › Keyboard (views/Keyboard.tsx) ---------- */
 
 .kbd {

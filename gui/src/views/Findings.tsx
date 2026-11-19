@@ -64,6 +64,8 @@ import { findingRanges, type FindingRanges, payloadMarks } from "./payloadMarks.
 import type { Verify } from "./verifyFinding.ts";
 import { NewFinding } from "./NewFinding";
 import { ReportBuilder } from "./ReportBuilder";
+import { SuppressDialog, SuppressionRules } from "./Suppressions.tsx";
+import { alertNames, canSuppress, rulesLabel, SUPPRESS_LIST_ARGS, type SuppressionList } from "./suppression.ts";
 
 const RISKS: Risk[] = ["critical", "high", "medium", "low", "info"];
 const NO_RANGES: FindingRanges = { ranges: [], marked: null };
@@ -141,6 +143,15 @@ export function FindingsView({ active }: { active: boolean }) {
   useEffect(refreshSeen, [scan?.id, compare, refreshSeen]);
   const seen = useMemo(() => seenById(compared), [compared]);
   const comparing = compare !== "all" && scan != null;
+  // Suppression rules, with the findings each holds: the toolbar counts them, the dialog lists them.
+  const [rules, refreshRules] = usePoll<SuppressionList>(() => run<SuppressionList>(SUPPRESS_LIST_ARGS), 10000, active);
+  const [suppressing, setSuppressing] = useState<Finding | null>(null);
+  const [showRules, setShowRules] = useState(false);
+  // Read again on opening, so the dialog doesn't wait for the next poll.
+  const openRules = () => {
+    refreshRules();
+    setShowRules(true);
+  };
 
   const view = useMemo<ListView>(() => ({ hideClosed: hideFp, filter, compare: comparing ? { seen, want: compare } : null }), [hideFp, filter, comparing, seen, compare]);
   const groups = useMemo(() => {
@@ -157,6 +168,7 @@ export function FindingsView({ active }: { active: boolean }) {
   }, [data, risks, view]);
 
   const hosts = useMemo(() => hostsOf(data?.items ?? []), [data]);
+  const names = useMemo(() => alertNames(data?.items ?? []), [data]);
   const byId = useMemo(() => new Map((data?.items ?? []).map((f) => [f.id, f])), [data]);
   const shown = useMemo(() => groups.flatMap((g) => g.items.map((f) => f.id)), [groups]);
   const picked = useMemo(() => shown.filter((id) => checked.has(id)), [shown, checked]);
@@ -521,6 +533,14 @@ export function FindingsView({ active }: { active: boolean }) {
     refresh();
   };
 
+  // A rule added or removed changes findings' states: the list, the rules and the open finding are read again.
+  const suppressionChanged = (note: string) => {
+    app.toast(note);
+    refresh();
+    refreshRules();
+    if (openId.current != null) reloadDetail(openId.current);
+  };
+
   const saveNote = async () => {
     if (!finding) return;
     const id = finding.id;
@@ -542,12 +562,24 @@ export function FindingsView({ active }: { active: boolean }) {
   const [reporting, setReporting] = useState(false);
   const reportName = app.temp ? "engagement" : app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
   const noFinding: string | false = finding ? false : "No finding is open";
+  const noSuppress: string | false = noFinding || (finding && !canSuppress(finding) ? "A rule leaves findings added by hand alone" : false);
   const noList: string | false = shown.length ? false : "No findings are shown";
   useActions([
     { ...NEXT_FINDING, hidden: !active, disabled: noList, run: () => select(stepFinding(shown, selected, 1)) },
     { ...PREVIOUS_FINDING, hidden: !active, disabled: noList, run: () => select(stepFinding(shown, selected, -1)) },
     ...TRIAGE_KEYS.map((k) => ({ ...k, hidden: !active, disabled: noFinding, run: () => mark(k.state, true) })),
     { id: "findings.new", title: "New finding…", group: "Findings", keywords: "write up manual issue", run: () => app.newFinding({}) },
+    { id: "findings.suppress", title: "Suppress the open finding…", group: "Findings", keywords: "false positive rule ignore hide", hidden: !active, disabled: noSuppress, run: () => setSuppressing(finding) },
+    {
+      id: "findings.suppressions",
+      title: "Suppression rules…",
+      group: "Findings",
+      keywords: "false positive ignore hide remove",
+      run: () => {
+        app.setTab("findings");
+        openRules();
+      },
+    },
     {
       id: "findings.report",
       title: "Build a report…",
@@ -636,6 +668,9 @@ export function FindingsView({ active }: { active: boolean }) {
               {heldNote(data)}
             </span>
           )}
+          <button className="btn small" onClick={openRules} title="Rules that make an alert on a host a false positive wherever scans find it, with the findings each holds">
+            {rulesLabel(rules?.suppressions)}
+          </button>
           <button className="btn small" onClick={() => app.newFinding({})} title="Write up an issue you found by hand (nothing is sent)">
             New finding…
           </button>
@@ -811,6 +846,11 @@ export function FindingsView({ active }: { active: boolean }) {
                 >
                   Ticket ▾
                 </button>
+                {canSuppress(finding) && (
+                  <button className="btn small" onClick={() => setSuppressing(finding)} title="Make this alert on this host (under a path, of a parameter) a false positive wherever scans find it, now and later">
+                    Suppress…
+                  </button>
+                )}
                 <button className="btn small" onClick={saveRepro} title="Save a JSON repro pack: the request (secrets masked), a curl command, the response around the evidence and how to check it again">
                   Repro pack…
                 </button>
@@ -850,6 +890,16 @@ export function FindingsView({ active }: { active: boolean }) {
                 )}
                 <dt>Confidence</dt>
                 <dd>{finding.confidence}</dd>
+                {finding.suppressed_by != null && (
+                  <>
+                    <dt>Suppressed</dt>
+                    <dd>
+                      <button className="link" onClick={openRules} title="Show the suppression rules">
+                        by rule {finding.suppressed_by}
+                      </button>
+                    </dd>
+                  </>
+                )}
                 {finding.source === "manual" ? (
                   <>
                     <dt>Source</dt>
@@ -992,6 +1042,17 @@ export function FindingsView({ active }: { active: boolean }) {
       {reporting && <ReportBuilder name={reportName} onClose={() => setReporting(false)} />}
       {app.findingDraft && <NewFinding draft={app.findingDraft} onClose={() => app.newFinding(null)} onAdded={added} />}
       {editing && <NewFinding draft={null} edit={editing} onClose={() => setEditing(null)} onEdited={edited} />}
+      {suppressing && (
+        <SuppressDialog
+          finding={suppressing}
+          close={() => setSuppressing(null)}
+          added={(note) => {
+            setSuppressing(null);
+            suppressionChanged(note);
+          }}
+        />
+      )}
+      {showRules && <SuppressionRules rules={rules?.suppressions ?? null} names={names} close={() => setShowRules(false)} changed={suppressionChanged} />}
     </div>
   );
 }
