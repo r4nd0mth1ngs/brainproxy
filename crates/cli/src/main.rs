@@ -380,7 +380,8 @@ enum HistoryCmd {
         contains: Option<String>,
         /// Make --contains match ASCII letters (A-Z, a-z) in any case, as the filter language's
         /// FIELD:VALUE does. Every other byte must still match as stored: letters outside ASCII (é
-        /// and É) aren't folded, and bodies, binary ones too, are searched as bytes, not decoded.
+        /// and É) aren't folded, and bodies, binary ones too, are searched as bytes, not read as
+        /// text in any charset.
         #[arg(long, requires = "contains")]
         ignore_case: bool,
         /// A query in the filter language, e.g. 'status:5xx AND resp.body:"stack trace"' or

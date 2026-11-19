@@ -218,6 +218,22 @@ test("a saved filter keeps whether its contents search ignores case", () => {
   assert.equal(savedMatching(list, on), "tokens");
   assert.equal(savedMatching(list, cf("Token")), null);
   assert.equal(JSON.parse(savedBody(list)).filters[0].filter.ignoreCase, true);
+  // Off, it is left out of what is saved, as the CLI stores it.
+  assert.equal("ignoreCase" in JSON.parse(savedBody(withSaved([], "t", cf("Token")))).filters[0].filter, false);
+});
+
+test("the case setting counts only for a contents search", () => {
+  // Aa turned off in Contents, then the mode switched: the toolbar remembers it for Contents...
+  const switched = withMode(cf("status:5xx", { ignoreCase: true }), "query");
+  assert.equal(switched.ignoreCase, true);
+  assert.equal(withMode(switched, "contents").ignoreCase, true);
+  // ...but a saved query equal in every other way still shows as applied, and saving leaves it out.
+  const list = withSaved([], "errors", qf("status:5xx"));
+  assert.equal(appliedSaved(list, switched, null), "errors");
+  const saved = withSaved([], "errors", switched);
+  assert.equal(saved[0].filter.ignoreCase, false);
+  assert.equal("ignoreCase" in JSON.parse(savedBody(saved)).filters[0].filter, false);
+  assert.equal(parseFilter({ text: "x", ignoreCase: true }).ignoreCase, false, "a URL filter");
 });
 
 // ---------------- Saved filters in the project ----------------
@@ -226,7 +242,8 @@ test("saved filters go to the project as history filters save takes them", () =>
   assert.deepEqual(filtersSaveArgs(3), ["history", "filters", "save", "--if-revision", "3"]);
   const list = [{ name: "errors", filter: filter({ query: true, text: "status:5xx", sources: ["proxy"] }) }];
   const body = JSON.parse(savedBody(list));
-  assert.deepEqual(body, { filters: [{ name: "errors", filter: { ...DEFAULT_FILTER, query: true, text: "status:5xx", sources: ["proxy"] } }] });
+  const { ignoreCase: _off, ...stored } = DEFAULT_FILTER;
+  assert.deepEqual(body, { filters: [{ name: "errors", filter: { ...stored, query: true, text: "status:5xx", sources: ["proxy"] } }] });
   // What `history filters list` returns reads back the same (its mode field is ignored).
   assert.deepEqual(savedFrom([{ ...body.filters[0], mode: "query" }]), list);
   assert.deepEqual(savedFrom(null), []);

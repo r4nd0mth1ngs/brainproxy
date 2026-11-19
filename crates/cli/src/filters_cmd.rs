@@ -32,8 +32,9 @@ const MAX_SOURCE: usize = 32;
 pub enum FiltersCmd {
     /// List the saved Traffic filters: name, what the text searches, the text, sources and checkboxes.
     #[command(after_help = "mode is url (the text filters URL, title and method in the app), contents \
-        (`history list --contains`) or query (`history list --filter`). rev goes up with every save; \
-        `save --if-revision` checks it. origin is who saved a filter (gui, cli or mcp; unknown when an older \
+        (`history list --contains`) or query (`history list --filter`). ignoreCase true is a contents search \
+        with `--ignore-case`; a set holding one is format 2 (v), which older builds list but don't save over. \
+        rev goes up with every save; `save --if-revision` checks it. origin is who saved a filter (gui, cli or mcp; unknown when an older \
         build did); a replace keeps it for a filter saved back unchanged.")]
     List,
     /// Replace the saved Traffic filters with the JSON on stdin (or add to them with --append).
@@ -143,7 +144,8 @@ pub fn filters(project: &Path, cmd: FiltersCmd, out: &Out) -> Result<(), Error> 
                             Some("mcp") => "  (saved by an agent)",
                             _ => "",
                         };
-                        format!("{name}  [{}]  {text}{by}", mode(f))
+                        let case = if f["ignoreCase"] == true { ", any case" } else { "" };
+                        format!("{name}  [{}{case}]  {text}{by}", mode(f))
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -260,6 +262,9 @@ fn parse(input: &[u8]) -> Result<Set, Error> {
         if f.contents && f.query {
             return Err(bad("contents and query can't both be on".into()));
         }
+        // Only the contents search reads it: kept elsewhere it would make two equal URL or
+        // query filters differ, and raise the format for older builds over nothing.
+        f.ignore_case &= f.contents;
         if f.query && !f.text.trim().is_empty() {
             brainproxy_core::filter::Query::parse(&f.text).map_err(|e| bad(e.to_string()))?;
         }
@@ -454,5 +459,23 @@ mod tests {
         );
         assert_eq!(again["filters"][0]["origin"], "mcp");
         assert_eq!(mode(&on["filters"][0]["filter"]), "contents");
+
+        // Outside a contents search it does nothing, so it isn't kept and doesn't raise the format.
+        for other in
+            [r#"{"text": "status:5xx", "query": true, "ignoreCase": true}"#, r#"{"text": "x", "ignoreCase": true}"#]
+        {
+            let v = save(format!(r#"{{"filters": [{{"name": "q", "filter": {other}}}]}}"#).as_bytes(), &[]);
+            assert_eq!(v["v"], 1, "{other}");
+            assert!(v["filters"][0]["filter"].get("ignoreCase").is_none(), "{other}");
+        }
+
+        // An append onto a set that holds one stays format 2; a replace without it goes back to 1.
+        let kept = on["filters"].as_array().unwrap().clone();
+        let set = parse(br#"{"filters": [{"name": "other", "filter": {"text": "x"}}]}"#).unwrap();
+        let (json, _) = build(set, kept.clone(), &kept, "mcp", 3, MAX_FILTERS).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&json).unwrap()["v"], 2);
+        let set = parse(br#"{"filters": [{"name": "other", "filter": {"text": "x"}}]}"#).unwrap();
+        let (json, _) = build(set, Vec::new(), &kept, "gui", 3, MAX_FILTERS).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&json).unwrap()["v"], 1);
     }
 }

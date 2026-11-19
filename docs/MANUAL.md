@@ -423,9 +423,9 @@ The sidebar groups the tools by what you are doing.
     to match ASCII letters in any case (`history list --ignore-case`). Letters outside ASCII
     (`é`, `É`) and other bytes still match only as stored, and binary bodies are searched as
     bytes. Changing **Aa** searches again, as changing the text does. Text that is only spaces
-    is ignored. The other filters still apply, and changing one doesn't search again. New traffic that matches shows up as it arrives. A
-    search stops at the first 10,000 matches the other filters show and says so; narrow it to
-    see later ones.
+    is ignored. The other filters still apply, and changing one doesn't search again. New
+    traffic that matches shows up as it arrives. A search stops at the first 10,000 matches the
+    other filters show and says so; narrow it to see later ones.
   - **Query:** the text is a query in the filter language, run by the CLI (`history list
     --filter`) like a contents search, with the same live updates and 10,000-match stop. For
     example `status:5xx resp.body:"stack trace"`, `host:api.acme.test method=POST NOT
@@ -459,9 +459,11 @@ The sidebar groups the tools by what you are doing.
     - The same language picks what Intercept holds (its filter box, `intercept enable
       --filter`), with the fields known when a message is held.
   - **Saved filters:** *Save…* names the current filters (text and what it searches, sources
-    and the checkboxes, and **Aa** for a contents search); pick one from the list to apply it again, or *Delete* it. They are kept
-    in the project file (`history filters list` and `history filters save`), so they travel
-    with it and an agent can read them, or add one under a new name; an agent can't change or
+    and the checkboxes, and **Aa** for a contents search); pick one from the list to apply it
+    again, or *Delete* it. A set with a contents filter that has **Aa** off is saved in a newer
+    format: 0.9.0 and older still list and apply it, case-sensitively, but can't save over it
+    until updated. They are kept in the project file (`history filters list` and `history
+    filters save`), so they travel with it and an agent can read them, or add one under a new name; an agent can't change or
     remove yours. Each records who saved it (`origin`: gui, cli or mcp; `history filters list`
     marks an agent's). A saved search for a token or password stays in the project until you delete
     it. Filters an older version kept in the app's own storage move into the project the first
@@ -1340,7 +1342,7 @@ brainproxy findings add --title "Order IDOR" --risk high --history-id 42 --param
     --description-file idor.md                # an issue found by hand; nothing is sent
 brainproxy query "SELECT url, status FROM history WHERE status >= 500"
 brainproxy history list --contains apiKey --source proxy   # in requests and responses, bodies decoded; case-sensitive
-brainproxy history list --contains 'stack trace' --ignore-case   # ASCII letters in any case; é and É still differ
+brainproxy history list --contains 'stack trace' --ignore-case   # ASCII letters in any case; é, É differ
 brainproxy history list --filter 'status:5xx resp.body:"stack trace" NOT path:/health'   # the filter language (Traffic's Query)
 brainproxy intercept enable --filter 'method=POST NOT path:/static'   # hold only what the same language matches
 brainproxy history filters list                           # the app's saved Traffic filters, kept in the project

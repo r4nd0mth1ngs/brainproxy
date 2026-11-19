@@ -279,6 +279,16 @@ fn calls_run_the_cli_in_scope() {
 
     let (_, env) = m.call("history_list", json!({"limit": 10}));
     assert_eq!(env["data"]["items"].as_array().map(Vec::len), Some(2), "{env}");
+    // ignore_case is a boolean argument: true adds --ignore-case, false adds nothing, and alone it's a usage error.
+    let n = |env: &Value| env["data"]["items"].as_array().map(Vec::len);
+    let (_, env) = m.call("history_list", json!({"contains": "get /A http", "ignore_case": true}));
+    assert_eq!(n(&env), Some(1), "{env}");
+    let (_, env) = m.call("history_list", json!({"contains": "get /A http", "ignore_case": false}));
+    assert_eq!(n(&env), Some(0), "{env}");
+    let (err, env) = m.call("history_list", json!({"ignore_case": true}));
+    assert!(err && env["error"]["kind"] == "usage", "{env}");
+    let (err, env) = m.call("history_export", json!({"contains": "get /B http", "ignore_case": true}));
+    assert!(!err && env["data"]["entries"] == 1, "{env}");
     let (_, env) = m.call("query", json!({"sql": "SELECT url FROM history ORDER BY id"}));
     assert_eq!(env["data"]["rows"][1][0], format!("http://127.0.0.1:{port}/b"));
 

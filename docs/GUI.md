@@ -58,8 +58,8 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
   - Requests with brainproxy's own `User-Agent` (`brainproxy/...`) are refused as well.
 - Live data is polled (`ui/usePoll.ts`, paused while the window is hidden): history every
   1.5 s with `history list --after <last id>` (with a contents search or a query on, the rows each poll
-  adds are then searched with `history list --contains TEXT [--ignore-case]` or `--filter QUERY` `--after <searched up to>`, so a
-  new row shows only once it is known to match; `views/trafficFilter.ts`), proxy status every 2 s, the intercept queue
+  adds are then searched with `history list --contains TEXT [--ignore-case]` or `--filter QUERY`
+  `--after <searched up to>`, so a new row shows only once it is known to match; `views/trafficFilter.ts`), proxy status every 2 s, the intercept queue
   every second while its tab is open, and in Proxy › Event streams the streams every 2 s (`sse list --newest`) and the
   selected stream's new events every second (`sse events ID --after <last id>`; `views/sse.ts`), so an open stream fills in. Polls can overlap; an older one that answers after a
   newer one's answer is dropped, so a slow poll never puts back a stale state (a failed poll
@@ -775,9 +775,11 @@ arrays whole), so change both when the window changes. The icons are in
 - Traffic's contents search is literal, like `history list --contains`, and stops at the first
   10,000 matches the other filters show (oldest first; the toolbar says so). Its **Aa** toggle
   (match case, on by default) off adds `--ignore-case`, which folds ASCII letters only (SQLite's
-  `lower()`, built without ICU): `é` and `É` still differ. Only a new text, a different
-  single source or a change to **Aa** starts a new search, and the CLI call still running for the old one is stopped (`cancelCli`); the
-  checkboxes and several sources are applied to the matches in the app, searching on only if
+  `lower()`, built without ICU): `é` and `É` still differ. A saved filter keeps **Aa** off only
+  on a contents search, and a set holding one is saved as format 2, which 0.9.0 and older list
+  and apply (case-sensitively) but refuse to save over. Only a new text, a different single
+  source or a change to **Aa** starts a new search, and the CLI call still running for the old
+  one is stopped (`cancelCli`); the checkboxes and several sources are applied to the matches in the app, searching on only if
   the cap no longer applies. Whitespace-only text doesn't search. A failed search is tried
   again after 2 s, doubling up to a minute.
 - Saved Traffic filters are kept by the app (localStorage, per project path, plain text), not

@@ -62,15 +62,21 @@ export interface SavedFilter {
 
 export const savedKey = (project: string) => `traffic-filters:${project}`;
 
-/** A filter from stored JSON: unknown fields are dropped and missing ones take the defaults. */
+/**
+ * A filter from stored JSON: unknown fields are dropped and missing ones take the defaults.
+ * `ignoreCase` is kept only on a contents search, the one that reads it, so a URL or query
+ * filter saved with it left over equals the same filter without it. (The toolbar's own state
+ * keeps it across a mode change: withMode doesn't come through here.)
+ */
 export function parseFilter(v: unknown): TrafficFilter {
   const o = v && typeof v === "object" ? (v as Record<string, unknown>) : {};
   const bool = (k: keyof TrafficFilter) => (typeof o[k] === "boolean" ? (o[k] as boolean) : (DEFAULT_FILTER[k] as boolean));
   const query = bool("query");
+  const contents = query ? false : bool("contents");
   return {
     text: typeof o.text === "string" ? o.text : "",
-    contents: query ? false : bool("contents"),
-    ignoreCase: bool("ignoreCase"),
+    contents,
+    ignoreCase: contents && bool("ignoreCase"),
     query,
     sources: Array.isArray(o.sources) ? [...new Set(o.sources.filter((s): s is string => typeof s === "string"))] : [],
     hideErrors: bool("hideErrors"),
@@ -132,8 +138,18 @@ export function clearLocalSaved(project: string): void {
 export const FILTERS_LIST_ARGS = ["history", "filters", "list"];
 export const filtersSaveArgs = (rev: number) => ["history", "filters", "save", "--if-revision", String(rev)];
 
-/** A save's stdin: the whole list, each filter in its stored form. */
-export const savedBody = (list: SavedFilter[]) => JSON.stringify({ filters: list.map((s) => ({ name: s.name, filter: parseFilter(s.filter) })) });
+/**
+ * A save's stdin: the whole list, each filter in its stored form. ignoreCase is left out when
+ * off, as the CLI stores it: a large set stays within what a save takes, and a build from
+ * before it existed still reads the filters.
+ */
+export function savedBody(list: SavedFilter[]): string {
+  const stored = (f: TrafficFilter) => {
+    const { ignoreCase, ...rest } = parseFilter(f);
+    return ignoreCase ? { ...rest, ignoreCase } : rest;
+  };
+  return JSON.stringify({ filters: list.map((s) => ({ name: s.name, filter: stored(s.filter) })) });
+}
 
 /**
  * `list` (saved in the project) with the filters an older build kept in localStorage added.

@@ -350,7 +350,7 @@ function History({ active }: { active: boolean }) {
     await searchMore();
   }, 1500);
 
-  // A new search shortly after the text or the single source stops changing. The old one's
+  // A new search shortly after the text, the single source or (for a contents search) Aa stops changing. The old one's
   // CLI call is stopped at once: it may be reading every body in the project.
   const wanted = JSON.stringify(searchFor(filter));
   useEffect(() => {

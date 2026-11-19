@@ -1587,18 +1587,21 @@ fn history_contains_can_ignore_ascii_case() {
     assert_ne!(code, 0, "{v}");
     assert_eq!(v["error"]["kind"], "usage", "{v}");
 
+    let (code, v) = run(&["history", "export", "--ignore-case"], &project, None);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("usage")), "{v}");
+
     // A HAR export takes it too.
     let (code, v) =
         run(&["history", "export", "--contains=STACK trace", "--ignore-case", "--no-redact"], &project, None);
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["data"]["entries"], 3, "{v}");
 
-    // The MCP tool, built from the flag, says what it does with letters outside ASCII.
+    // The flag's help (the history_list tool's description too) says what it does with letters outside ASCII.
     let (code, v) = run(&["capabilities", "history", "list"], &project, None);
     assert_eq!(code, 0, "{v}");
     let arg = v["data"]["args"].as_array().unwrap().iter().find(|a| a["flag"] == "--ignore-case").unwrap();
     let help = arg["help"].as_str().unwrap();
-    assert!(help.contains("outside ASCII") && help.contains("aren't folded"), "{help}");
+    assert!(help.contains("outside ASCII") && help.contains("aren't folded") && help.contains("any charset"), "{help}");
 
     // A saved Traffic filter keeps the setting.
     let set = br#"{"filters": [{"name": "traces", "filter": {"text": "stack trace", "contents": true, "ignoreCase": true}}]}"#;
