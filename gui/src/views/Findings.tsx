@@ -63,6 +63,8 @@ import { openVerifyDiff, verifyFinding, VerifyStrip } from "./PayloadCompare.tsx
 import { findingRanges, type FindingRanges, payloadMarks } from "./payloadMarks.ts";
 import type { Verify } from "./verifyFinding.ts";
 import { NewFinding } from "./NewFinding";
+import { RateFindings } from "./RateFindings";
+import { clearCommands, issueRatingLine, type IssueRating, RATE_FINDING, ratable, ratableOf, ratedLine, ratedTitle, ratingOf } from "./findingRating.ts";
 import { ReportBuilder } from "./ReportBuilder";
 
 const RISKS: Risk[] = ["critical", "high", "medium", "low", "info"];
@@ -120,6 +122,11 @@ export function FindingsView({ active }: { active: boolean }) {
   const [events, setEvents] = useState<FindingEvent[]>([]);
   // The issue's write-up and the agent trail of the open finding.
   const [narrative, setNarrative] = useState<Narrative | null>(null);
+  // A person's rating of the open finding's whole issue (`findings rate --issue`), if any.
+  const [issueRating, setIssueRating] = useState<IssueRating | null>(null);
+  // The findings the rating dialog is open for, the ticked ones it left out, the issue it may
+  // rate, and whether they are the ticked ones (then the ticks go once rated).
+  const [rating, setRating] = useState<{ findings: FindingItem[]; skipped: number; issue: number | null; ticked: boolean } | null>(null);
   const [trail, setTrail] = useState<Trail | null>(null);
   const [retesting, setRetesting] = useState(false);
   // The finding added by hand being edited, as it was when the dialog opened.
@@ -172,6 +179,7 @@ export function FindingsView({ active }: { active: boolean }) {
     setVerified(null);
     setEvents([]);
     setNarrative(null);
+    setIssueRating(null);
     setTrail(null);
     run<{ events: FindingEvent[] }>(["findings", "timeline", String(selected)]).then((t) => live && setEvents(t.events), () => {});
     run<Trail>(["findings", "trail", String(selected)]).then((t) => live && setTrail(t), () => {});
@@ -265,10 +273,11 @@ export function FindingsView({ active }: { active: boolean }) {
 
   // An issue's write-up, unless another finding was opened meanwhile.
   const loadNarrative = (issue: number, live: () => boolean = () => true) =>
-    run<{ narrative: Narrative | null }>(["findings", "issue", "show", String(issue)]).then(
-      (i) => live() && setNarrative((cur) => (same(cur, i.narrative) ? cur : i.narrative)),
-      () => {},
-    );
+    run<{ narrative: Narrative | null; rating?: IssueRating | null }>(["findings", "issue", "show", String(issue)]).then((i) => {
+      if (!live()) return;
+      setNarrative((cur) => (same(cur, i.narrative) ? cur : i.narrative));
+      setIssueRating((cur) => (same(cur, i.rating ?? null) ? cur : (i.rating ?? null)));
+    }, () => {});
 
   // The recorded request and response, read again only when the finding points at another one.
   const shownEntry = useRef<number | null>(null);
@@ -294,7 +303,10 @@ export function FindingsView({ active }: { active: boolean }) {
       if (!live()) return;
       setFinding((cur) => (same(cur, f) ? cur : f));
       if (f.issue_id != null) loadNarrative(f.issue_id, live);
-      else setNarrative(null);
+      else {
+        setNarrative(null);
+        setIssueRating(null);
+      }
       loadEntry(f.history_id, live);
     }, () => {});
     run<{ events: FindingEvent[] }>(["findings", "timeline", String(id)]).then((t) => {
@@ -521,6 +533,45 @@ export function FindingsView({ active }: { active: boolean }) {
     refresh();
   };
 
+  // The rating dialog, for the open finding or the ticked scanner findings.
+  const rateOpen = () => {
+    if (finding && ratable(finding)) setRating({ findings: [finding], skipped: 0, issue: finding.issue_id ?? null, ticked: false });
+  };
+  const ratePicked = () => {
+    const { ids, skipped } = ratableOf(picked.map((id) => byId.get(id)).filter((f): f is FindingItem => f != null));
+    if (!ids.length) return app.toast("The ticked findings were all added by hand: edit their risk instead.", "error");
+    setRating({ findings: ids, skipped, issue: null, ticked: true });
+  };
+  const rated = (toast: string, failed?: string) => {
+    // As a bulk mark does: the ticks stay when a batch failed, so it can be tried again.
+    if (rating?.ticked && !failed) setChecked(new Set());
+    setRating(null);
+    app.toast(failed ? `${toast}\nThen: ${failed}` : toast, failed ? "error" : undefined);
+    // The open finding takes its new rating, timeline and issue rating; the list its risk counts.
+    if (openId.current != null) reloadDetail(openId.current);
+    refresh();
+  };
+  // Ends the rating of the open finding's whole issue: its findings get the scanner's rating back.
+  const endIssueRating = async () => {
+    const issue = finding?.issue_id;
+    if (issue == null) return;
+    const ok = await confirm(
+      `End issue #${issue}'s rating?`,
+      "Every scanner finding of this issue gets the scanner's rating back, including any you rated one by one, and findings found later keep the scanner's.",
+      "End it",
+      "Cancel",
+    );
+    if (!ok) return;
+    try {
+      await run(clearCommands([], issue)[0]);
+      app.toast(`Issue #${issue} has the scanner's rating again.`);
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+    if (openId.current != null) reloadDetail(openId.current);
+    refresh();
+  };
+
   const saveNote = async () => {
     if (!finding) return;
     const id = finding.id;
@@ -547,6 +598,7 @@ export function FindingsView({ active }: { active: boolean }) {
     { ...NEXT_FINDING, hidden: !active, disabled: noList, run: () => select(stepFinding(shown, selected, 1)) },
     { ...PREVIOUS_FINDING, hidden: !active, disabled: noList, run: () => select(stepFinding(shown, selected, -1)) },
     ...TRIAGE_KEYS.map((k) => ({ ...k, hidden: !active, disabled: noFinding, run: () => mark(k.state, true) })),
+    { ...RATE_FINDING, hidden: !active, disabled: noFinding || (finding && !ratable(finding) ? "A finding added by hand has its own risk: Edit… it" : false), run: rateOpen },
     { id: "findings.new", title: "New finding…", group: "Findings", keywords: "write up manual issue", run: () => app.newFinding({}) },
     {
       id: "findings.report",
@@ -655,6 +707,9 @@ export function FindingsView({ active }: { active: boolean }) {
               </button>
             ))}
           </div>
+          <button className="btn small" disabled={busy} onClick={ratePicked} title="Rate the ticked scanner findings' risk and/or confidence yourself, or give them the scanner's rating back">
+            Rate…
+          </button>
           {picked.length < shown.length && (
             <button className="btn small" disabled={busy} onClick={() => setChecked(new Set(shown))}>
               Select all {shown.length} shown
@@ -747,6 +802,11 @@ export function FindingsView({ active }: { active: boolean }) {
                             unsaved note
                           </span>
                         )}
+                        {f.rated && (
+                          <span className="tag" title={ratedTitle(f, f.rated)}>
+                            rated
+                          </span>
+                        )}
                         {f.state !== "open" && <span className="tag">{STATES.find((s) => s.id === f.state)?.label ?? f.state}</span>}
                       </button>
                     </div>
@@ -760,6 +820,11 @@ export function FindingsView({ active }: { active: boolean }) {
             <div className="detail">
               <div className="detail-head">
                 <RiskBadge risk={finding.risk} />
+                {ratingOf(finding)?.scanner_risk && (
+                  <span className="tag" title={ratedTitle(finding, ratingOf(finding)!)}>
+                    rated · scanner said {ratingOf(finding)!.scanner_risk}
+                  </span>
+                )}
                 <h2>{finding.name}</h2>
               </div>
               {isScriptAnswer(finding.alert_ref) && (
@@ -783,6 +848,11 @@ export function FindingsView({ active }: { active: boolean }) {
                 {entry && (
                   <button className="btn small" onClick={sendToReplay} title={finding.attack ? "Open the attack in Replay, its payload highlighted" : undefined}>
                     Send to Replay
+                  </button>
+                )}
+                {ratable(finding) && (
+                  <button className="btn small" onClick={rateOpen} title="Rate this finding's risk and confidence yourself, with a reason, or give it the scanner's rating back (Shift+R)">
+                    Rate…
                   </button>
                 )}
                 {canVerify(finding) && (
@@ -850,6 +920,23 @@ export function FindingsView({ active }: { active: boolean }) {
                 )}
                 <dt>Confidence</dt>
                 <dd>{finding.confidence}</dd>
+                {ratingOf(finding) && (
+                  <>
+                    <dt>Rating</dt>
+                    <dd>{ratedLine(ratingOf(finding)!)}</dd>
+                  </>
+                )}
+                {issueRating && finding.issue_id != null && finding.source !== "manual" && (
+                  <>
+                    <dt>Issue rating</dt>
+                    <dd>
+                      {issueRatingLine(finding.issue_id, issueRating)}{" "}
+                      <button className="btn small" onClick={endIssueRating} title="Give every scanner finding of this issue the scanner's rating back">
+                        End it
+                      </button>
+                    </dd>
+                  </>
+                )}
                 {finding.source === "manual" ? (
                   <>
                     <dt>Source</dt>
@@ -992,6 +1079,7 @@ export function FindingsView({ active }: { active: boolean }) {
       {reporting && <ReportBuilder name={reportName} onClose={() => setReporting(false)} />}
       {app.findingDraft && <NewFinding draft={app.findingDraft} onClose={() => app.newFinding(null)} onAdded={added} />}
       {editing && <NewFinding draft={null} edit={editing} onClose={() => setEditing(null)} onEdited={edited} />}
+      {rating && <RateFindings findings={rating.findings} skipped={rating.skipped} issue={rating.issue} onClose={() => setRating(null)} onDone={rated} />}
     </div>
   );
 }

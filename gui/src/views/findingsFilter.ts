@@ -2,6 +2,7 @@
 // it can be tested without a window.
 
 import type { FindingEvent, FindingItem } from "../api";
+import { ratedEventText } from "./findingRating.ts";
 
 export type Source = "all" | "passive" | "active" | "authz" | "manual";
 
@@ -136,6 +137,8 @@ export function eventText(e: FindingEvent): string {
       return editedText(e);
     case "suggested":
       return suggestionText(e);
+    case "rated":
+      return ratedEventText(e);
     default:
       return `${e.kind} ${said(e.new)}`.trim();
   }

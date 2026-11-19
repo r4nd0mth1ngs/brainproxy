@@ -1104,6 +1104,10 @@ select {
 .finding-dialog-actions {
   margin-top: 16px;
 }
+/* A checkbox under the form (Rate…'s whole issue, New finding's replace text). */
+.finding-dialog > .check {
+  margin-top: 10px;
+}
 /* Settings › Match & replace › Edit rule (views/MatchReplace.tsx). */
 .rule-dialog {
   width: min(960px, 100%);

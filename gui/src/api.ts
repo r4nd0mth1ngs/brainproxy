@@ -229,6 +229,20 @@ export interface FindingItem {
   origin?: string | null;
   /** The issue (root cause: alert type and host) it is an instance of. */
   issue_id?: number | null;
+  /** A person's rating (`findings rate`), with the scanner's beside it; null while the scanner's stands. */
+  rated?: Rated | null;
+}
+
+/** A person's rating of a scanner finding, as `findings list --all` gives it. */
+export interface Rated {
+  scanner_risk: Risk | null;
+  scanner_confidence: string | null;
+  reason: string | null;
+  /** Who, in words ("from the desktop app"). */
+  by?: string;
+  /** gui or cli. */
+  origin: string;
+  at: string | null;
 }
 
 /** One change on a finding's timeline (`findings timeline`). */
@@ -274,6 +288,12 @@ export interface Finding extends FindingItem {
   revision?: string;
   /** An active finding: the request its attack was built from (`findings verify` sends both). */
   base_history_id?: number | null;
+  /** While a person's rating holds (`findings rate`): who, why, when, and the scanner's own rating. */
+  rated_origin?: string | null;
+  rated_reason?: string | null;
+  rated_at?: string | null;
+  scanner_risk?: Risk | null;
+  scanner_confidence?: string | null;
 }
 
 /** True when a body came as base64, i.e. `bodyText` gives one char per byte (Latin-1). */
