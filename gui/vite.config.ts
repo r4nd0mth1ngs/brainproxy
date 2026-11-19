@@ -6,6 +6,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
+import { requestFileArg, withRequestFile } from "./src/requestFiles.ts";
 
 // Dev-only bridge so the UI also runs in a plain browser (`npm run dev`): POST /api/cli runs
 // the brainproxy CLI the same way the Tauri `cli` command does. It answers only requests
@@ -90,13 +91,11 @@ function cliBridge(): Plugin {
             if (requestFiles?.length) {
               requestDir = mkdtempSync(join(tmpdir(), "brainproxy-race-"));
               requestFiles.forEach((bytes, i) => {
-                // As the Tauri command: a race's --also, or a macro step's --step (with or without ORIGIN=).
-                const marker = `@request:${i}`;
-                const at = args.findIndex((a) => a === `--also=${marker}` || (a.startsWith("--step=") && a.endsWith(`=${marker}`)));
+                const at = requestFileArg(args, i);
                 if (at < 0) throw new Error("missing request file argument");
                 const path = join(requestDir!, `${i}.http`);
                 writeFileSync(path, Buffer.from(bytes), { flag: "wx", mode: 0o600 });
-                args[at] = args[at].slice(0, -marker.length) + path;
+                args[at] = withRequestFile(args[at], i, path);
               });
             }
           } catch (e) {

@@ -22,13 +22,16 @@ import {
   TOOLS,
   actionLabel,
   cleanOrigin,
-  editedStep,
+  historyOrigin,
   inferOrigin,
   insertVar,
+  latestOnly,
   macroAddArgs,
   macroEditArgs,
   macroEditProblem,
   macroEditor,
+  macroSavedWarning,
+  moved,
   parseParams,
   ruleAddArgs,
   ruleProblems,
@@ -36,8 +39,10 @@ import {
   signerForm,
   signerLabel,
   signerProblems,
+  stepNote,
   stepTextProblem,
   varsBefore,
+  withStepText,
   type Action,
   type EditorExtract,
   type EditorStep,
@@ -378,17 +383,21 @@ function TrafficPicker(p: { place: (id: number) => number; onPick: (h: Picked) =
   );
 }
 
-/** A step's request being edited: which step (null for a new one), its text when the dialog opened, and its original text. */
+/**
+ * A step's request being edited: which step (null for a new one), its text when the dialog
+ * opened, its original text, and which opening this is (each gets a fresh dialog).
+ */
 interface Editing {
   key: string | null;
   start: StepText;
   was: StepText | null;
+  n: number;
 }
 
 /**
  * The text of a step to edit: the macro's own from `detail`, a Traffic row's from history, or
- * the text it was given. Null, with a message, for a Traffic row whose body is binary: a macro
- * step is text.
+ * the text it was given. Throws, with what to say, for a Traffic row whose body is binary: a
+ * step's text is UTF-8, so such a row can be a step only as it is.
  */
 async function stepText(s: EditorStep, detail: MacroDetail | null): Promise<StepText> {
   if (s.kind === "text") return { target: s.target, request: s.request };
@@ -398,25 +407,33 @@ async function stepText(s: EditorStep, detail: MacroDetail | null): Promise<Step
     return { target: d.target, request: d.request };
   }
   const h = await historyRequest(s.id);
-  if (h.binary) throw new Error(`Request #${s.id} has a binary body; a macro step is text. Use auth macro add with a file.`);
-  return { target: new URL(h.entry.url).origin, request: h.raw };
+  if (h.binary) throw new Error(`Request #${s.id} has a binary body: it can be a step as it is, but a step's request is edited as text.`);
+  return { target: historyOrigin(h.entry.url), request: h.raw };
 }
 
 /** Opens a step's request in the editor dialog (`editing`), or reports why it can't. */
 function useStepEditor(detail: MacroDetail | null) {
   const app = useApp();
   const [editing, setEditing] = useState<Editing | null>(null);
+  // A Traffic row is read first: one that answers after another step was opened, or a paste
+  // started, is dropped rather than retarget the dialog open now.
+  const [lookups] = useState(latestOnly);
   const open = async (s: EditorStep) => {
+    const n = lookups.next();
     try {
       const t = await stepText(s, detail);
       // The original text, so saving it unchanged keeps the step what it was.
-      setEditing({ key: s.key, start: t, was: s.kind === "text" ? null : t });
+      if (lookups.isLatest(n)) setEditing({ key: s.key, start: t, was: s.kind === "text" ? null : t, n });
     } catch (e: any) {
-      app.toast(e.message, "error");
+      if (lookups.isLatest(n)) app.toast(e.message, "error");
     }
   };
-  const paste = () => setEditing({ key: null, start: { target: "", request: "" }, was: null });
-  return { editing, open, paste, close: () => setEditing(null) };
+  const paste = () => setEditing({ key: null, start: { target: "", request: "" }, was: null, n: lookups.next() });
+  const close = () => {
+    lookups.next();
+    setEditing(null);
+  };
+  return { editing, open, paste, close };
 }
 
 /**
@@ -433,6 +450,11 @@ function StepTextDialog(p: { title: string; start: StepText; vars: string[]; onC
   const editor = useRef<HTMLTextAreaElement>(null);
   const dialog = useRef<HTMLDivElement>(null);
   useDialogFocus(dialog);
+  // A value put in before the request is clicked goes at its end, not before its method.
+  useEffect(() => {
+    const el = editor.current;
+    el?.setSelectionRange(el.value.length, el.value.length);
+  }, []);
   const put = (name: string) => {
     const el = editor.current;
     const r = insertVar(request, el?.selectionStart ?? request.length, el?.selectionEnd ?? request.length, name);
@@ -523,15 +545,6 @@ function StepList(p: {
   );
 }
 
-/** `steps` with step `i` moved `by` places, or as they were at either end. */
-function moved<T>(steps: T[], i: number, by: number): T[] {
-  const j = i + by;
-  if (j < 0 || j >= steps.length) return steps;
-  const out = [...steps];
-  [out[i], out[j]] = [out[j], out[i]];
-  return out;
-}
-
 export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved: () => void }) {
   const app = useApp();
   const [name, setName] = useState("");
@@ -548,17 +561,16 @@ export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved
   const saveText = (t: StepText) => {
     const e = ed.editing;
     if (!e) return;
-    if (e.key === null) {
-      const key = `text${++pasted.current}`;
-      setSteps((s) => [...s, editedStep({ key, kind: "text", target: "", request: "", line: "" }, t, null)]);
-    } else setSteps((s) => s.map((x) => (x.key === e.key ? editedStep(x, t, e.was) : x)));
+    const newKey = e.key === null ? `text${++pasted.current}` : "";
+    setSteps((s) => withStepText(s, e.key, t, e.was, newKey));
     ed.close();
   };
 
   const save = async () => {
     const call = macroAddArgs(p.profile, name, steps, extract);
     try {
-      await run(call.args, { requestFiles: call.requestFiles });
+      const warning = macroSavedWarning(await run<{ host_warning?: string }>(call.args, { requestFiles: call.requestFiles }));
+      if (warning) app.toast(warning, "error");
       p.onSaved();
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -582,7 +594,7 @@ export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved
           <h4>Steps</h4>
           <StepList
             steps={steps}
-            note={(s) => (s.kind === "text" ? "edited" : "")}
+            note={stepNote}
             move={(i, by) => setSteps((s) => moved(s, i, by))}
             edit={ed.open}
             takeOut={(s) => setSteps((all) => all.filter((x) => x.key !== s.key))}
@@ -635,6 +647,7 @@ export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved
       </div>
       {ed.editing && (
         <StepTextDialog
+          key={ed.editing.n}
           title={ed.editing.key === null ? "Add a raw request" : `Edit step ${steps.findIndex((s) => s.key === ed.editing!.key) + 1}'s request`}
           start={ed.editing.start}
           vars={varsBefore(
@@ -655,6 +668,7 @@ export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved
  * requests edited), its extractors and its name.
  */
 function MacroEditor(p: { profile: string; name: string; onClose: () => void; onSaved: () => void }) {
+  const app = useApp();
   const [start, setStart] = useState<{ steps: EditorStep[]; extract: EditorExtract[] } | null>(null);
   const [detail, setDetail] = useState<MacroDetail | null>(null);
   const [revision, setRevision] = useState<string | undefined>();
@@ -697,10 +711,8 @@ function MacroEditor(p: { profile: string; name: string; onClose: () => void; on
   const saveText = (t: StepText) => {
     const e = ed.editing;
     if (!e) return;
-    if (e.key === null) {
-      const key = `text${++pasted.current}`;
-      setSteps((s) => [...s, editedStep({ key, kind: "text", target: "", request: "", line: "" }, t, null)]);
-    } else setSteps((s) => s.map((x) => (x.key === e.key ? editedStep(x, t, e.was) : x)));
+    const newKey = e.key === null ? `text${++pasted.current}` : "";
+    setSteps((s) => withStepText(s, e.key, t, e.was, newKey));
     ed.close();
   };
   const problem = start ? macroEditProblem(steps, extract, name) : "Reading the macro…";
@@ -712,7 +724,8 @@ function MacroEditor(p: { profile: string; name: string; onClose: () => void; on
     setBusy(true);
     setError(null);
     try {
-      await run(call.args, { requestFiles: call.requestFiles });
+      const warning = macroSavedWarning(await run<{ host_warning?: string }>(call.args, { requestFiles: call.requestFiles }));
+      if (warning) app.toast(warning, "error");
       p.onSaved();
     } catch (e: any) {
       setError(e.message);
@@ -725,7 +738,7 @@ function MacroEditor(p: { profile: string; name: string; onClose: () => void; on
       <div ref={dialog} className="confirm-dialog finding-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-macro-title">
         <h2 id="edit-macro-title">Edit macro {p.name}</h2>
         <p>
-          It keeps its place, and session rules that run it go on running it, under a new name too. Saving a change records you as the one who set it. An extractor moves with its step.
+          It keeps its place, and session rules that run it go on running it, under a new name too. Saving a change records you as the one who set it (after a rename, of those rules too). An extractor moves with its step.
         </p>
         <div className="form">
           <label>
@@ -736,7 +749,7 @@ function MacroEditor(p: { profile: string; name: string; onClose: () => void; on
         <h4>Steps</h4>
         <StepList
           steps={steps}
-          note={(s) => (s.kind === "history" ? `new, from #${s.id}` : s.kind === "text" ? "edited" : "")}
+          note={stepNote}
           move={(i, by) => setSteps((s) => moved(s, i, by))}
           edit={ed.open}
           takeOut={(s) => takeOut(s.key)}
@@ -802,6 +815,7 @@ function MacroEditor(p: { profile: string; name: string; onClose: () => void; on
         </div>
         {ed.editing && (
           <StepTextDialog
+            key={ed.editing.n}
             title={ed.editing.key === null ? "Add a raw request" : `Edit step ${steps.findIndex((s) => s.key === ed.editing!.key) + 1}'s request`}
             start={ed.editing.start}
             vars={varsBefore(steps, extract, ed.editing.key)}

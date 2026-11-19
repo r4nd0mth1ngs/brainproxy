@@ -36,7 +36,7 @@ impl RaceFiles {
                 Err(e) => return Err(e),
             }
         }
-        let dir = held.0.as_ref().ok_or_else(|| std::io::Error::other("cannot allocate race request directory"))?;
+        let dir = held.0.as_ref().ok_or_else(|| std::io::Error::other("cannot allocate a request file directory"))?;
         for (i, bytes) in files.iter().enumerate() {
             let arg = args
                 .iter_mut()

@@ -8,12 +8,16 @@ import {
   actionSpec,
   cleanOrigin,
   editedStep,
+  historyOrigin,
   inferOrigin,
   insertVar,
+  latestOnly,
   macroAddArgs,
   macroEditArgs,
   macroEditProblem,
   macroEditor,
+  macroSavedWarning,
+  moved,
   parseParams,
   ruleAddArgs,
   ruleProblems,
@@ -22,8 +26,10 @@ import {
   signerLabel,
   signerProblems,
   stepLine,
+  stepNote,
   stepTextProblem,
   varsBefore,
+  withStepText,
   type Action,
   type EditorStep,
   type MacroDetail,
@@ -260,8 +266,10 @@ const decode = (b: Uint8Array) => new TextDecoder().decode(b);
 test("an edited step's request goes in a staged file, to its origin, with its extractors", () => {
   const start = macroEditor(login);
   const was = { target: login.steps[0].target, request: login.steps[0].request };
-  // Opened and saved unchanged, a step stays the macro's own.
+  // Opened and saved unchanged, a step stays the macro's own, also when an edit undone gave the
+  // head back with \n (as any keystroke in the editor does).
   assert.equal(editedStep(start.steps[0], was, was), start.steps[0]);
+  assert.equal(editedStep(start.steps[0], { ...was, request: was.request.replace(/\r\n/g, "\n") }, was), start.steps[0]);
   const edited = editedStep(start.steps[1], { target: "https://app.test:8443", request: "POST /login HTTP/1.1\nHost: app.test:8443\n\ncsrf={{csrf}}" }, {
     target: login.steps[1].target,
     request: login.steps[1].request,
@@ -327,7 +335,9 @@ test("a pasted request's origin comes from its URL or Host, and a bad one says w
   );
   for (const target of ["", "app.test", "ftp://app.test", "https://app.test/path", "https://app.test?x=1", "https://App.test", "https://u@app.test"])
     assert.match(stepTextProblem({ target, request: "GET / HTTP/1.1\n\n" }) ?? "", /origin/, target);
-  for (const request of ["", "Host: app.test", "GET /\n\n", "GET / HTTP/1.1 extra"])
+  // No "=" in an origin (the CLI splits ORIGIN=FILE at the first), and a request line as it is.
+  assert.match(stepTextProblem({ target: "https://a=b", request: "GET / HTTP/1.1" }) ?? "", /origin/);
+  for (const request of ["", "Host: app.test", "GET /\n\n", "GET / HTTP/1.1 extra", " GET / HTTP/1.1", "{{csrf}}GET / HTTP/1.1"])
     assert.match(stepTextProblem({ target: "https://app.test", request }) ?? "", /request line/, request);
 });
 
@@ -343,12 +353,54 @@ test("a step can use the values earlier steps extract, and {{name}} goes at the 
   assert.deepEqual(varsBefore(steps, extract, "c"), ["csrf", "tok", "username", "password"]);
   // A new step goes last: every step is before it.
   assert.deepEqual(varsBefore(steps, extract, null), ["csrf", "tok", "late", "username", "password"]);
-  // Offsets count CRLF as one; a body that kept CRLF keeps it.
-  const value = "POST / HTTP/1.1\r\nHost: a\r\n\r\nx=1\r\ny=";
-  const at = "POST / HTTP/1.1\nHost: a\n\nx=1\ny=".length;
-  assert.deepEqual(insertVar(value, at, at, "csrf"), { value: "POST / HTTP/1.1\nHost: a\n\nx=1\r\ny={{csrf}}", caret: at + 8 });
-  // A selection is replaced.
+  // Offsets count CRLF as one, and every other byte stays: CRLF, and a body's bare LF.
+  const value = "POST / HTTP/1.1\r\nHost: a\r\n\r\nx=1\ny=2\r\nz=";
+  const at = "POST / HTTP/1.1\nHost: a\n\nx=1\ny=2\nz=".length;
+  assert.deepEqual(insertVar(value, at, at, "csrf"), { value: value + "{{csrf}}", caret: at + 8 });
+  const mid = "POST / HTTP/1.1\nHost: a\n\nx=".length;
+  assert.equal(insertVar(value, mid, mid + 1, "v").value, "POST / HTTP/1.1\r\nHost: a\r\n\r\nx={{v}}\ny=2\r\nz=");
+  // A selection is replaced, whichever way it was made, and offsets past the end are the end.
   assert.deepEqual(insertVar("GET /?t=old HTTP/1.1", 8, 11, "tok"), { value: "GET /?t={{tok}} HTTP/1.1", caret: 15 });
+  assert.deepEqual(insertVar("GET /?t=old HTTP/1.1", 11, 8, "tok"), { value: "GET /?t={{tok}} HTTP/1.1", caret: 15 });
+  assert.deepEqual(insertVar("ab", 9, 9, "x"), { value: "ab{{x}}", caret: 7 });
+});
+
+test("a Traffic row's origin survives an OPTIONS * URL", () => {
+  assert.equal(historyOrigin("http://app.test*"), "http://app.test");
+  assert.equal(historyOrigin("http://127.0.0.1:8080*"), "http://127.0.0.1:8080");
+  assert.equal(historyOrigin("HTTPS://App.Test:443/login?x=1"), "https://app.test");
+  assert.equal(historyOrigin("https://[::1]:8443/x"), "https://[::1]:8443");
+  assert.equal(historyOrigin("not a url"), "");
+});
+
+test("steps are edited, pasted and moved by key, and say what they are", () => {
+  const steps = macroEditor(login).steps;
+  const t = { target: "https://app.test", request: "GET /new HTTP/1.1\n\n" };
+  const edited = withStepText(steps, "step2", t, null, "");
+  assert.deepEqual(edited.map((s) => [s.key, s.kind]), [["step1", "kept"], ["step2", "text"]]);
+  const pasted = withStepText(edited, null, t, null, "text1");
+  assert.deepEqual(pasted.map((s) => [s.key, stepNote(s)]), [["step1", ""], ["step2", "edited"], ["text1", "pasted"]]);
+  assert.equal(stepNote({ key: "history9", kind: "history", id: 9, line: "" }), "new, from #9");
+  assert.deepEqual(moved([1, 2, 3], 2, -1), [1, 3, 2]);
+  const same = [1, 2];
+  assert.equal(moved(same, 0, -1), same);
+  assert.equal(moved(same, 1, 1), same);
+});
+
+test("a macro saved with a Host the scope doesn't list says so", () => {
+  assert.equal(macroSavedWarning({ host_warning: "macro m step 2 sets Host e.test" }), "Saved, but macro m step 2 sets Host e.test");
+  assert.equal(macroSavedWarning({}), null);
+  assert.equal(macroSavedWarning(undefined), null);
+});
+
+test("only the latest lookup's answer is used", () => {
+  const l = latestOnly();
+  const first = l.next();
+  const second = l.next();
+  assert.equal(l.isLatest(first), false);
+  assert.equal(l.isLatest(second), true);
+  l.next();
+  assert.equal(l.isLatest(second), false);
 });
 
 test("an edited macro that can't be saved says why", () => {

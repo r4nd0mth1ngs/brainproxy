@@ -500,10 +500,20 @@ fn a_macro_steps_text_is_edited_from_stdin_and_runs_with_earlier_values() {
     let echoed = sent["response"]["body"]["content"].as_str().unwrap_or_default();
     assert!(echoed.starts_with("GET /b?csrf=abc HTTP/1.1\r\n"), "{sent}");
 
-    // Only one step can come from stdin.
+    // Only one step can come from stdin, and it is text.
     let two = ["auth", "macro", "edit", "app", "login", "--step", &spec, "--step", "-"];
     let (kind, msg) = env.fails(&[], &two, Some(text.as_bytes()));
     assert!(kind == "invalid_input" && msg.contains("only one step"), "{kind}: {msg}");
+    let one = ["auth", "macro", "edit", "app", "login", "--step", &spec];
+    let (kind, msg) = env.fails(&[], &one, Some(b"POST / HTTP/1.1\nHost: 127.0.0.1\n\n\xff\xfe"));
+    assert!(kind == "invalid_input" && msg.contains("not UTF-8"), "{kind}: {msg}");
+    // A FILE step is stored with its head's line endings mended too.
+    let lf = env.file("lf.txt", &format!("GET /lf HTTP/1.1\nHost: 127.0.0.1:{port}\n\nbody\nline"));
+    let d = env.ok(&["auth", "macro", "add", "app", "filed", "--scheme", "http", "--step", &lf]);
+    assert_eq!(d["macro"]["requests"][0], format!("GET {origin}/lf"), "{d}");
+    let shown = env.ok(&["auth", "macro", "show", "app", "filed"]);
+    let want = format!("GET /lf HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\nbody\nline");
+    assert_eq!(shown["macro"]["steps"][0]["request"], want, "the body is left as it is");
     // `auth macro add` takes a step from stdin too; its target comes from the Host and --scheme.
     let (code, v) = env.run_as(
         &[],

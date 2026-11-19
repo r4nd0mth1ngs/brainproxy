@@ -594,13 +594,16 @@ The record keeps its id (a rule its number, a macro its name unless renamed) and
   that it follows as the step moves. A step's *Edit request* opens its request in the message
   editor Replay uses (`ui/HttpView.tsx`), with the origin it goes to (a pasted request's follows
   its Host header until one is typed) and a button per value it can use (`{{csrf}}` for an
-  earlier step's extractor, `{{username}}`, `{{password}}`), put in at the caret. A step saved
-  unchanged stays what it was; an edited one is marked *edited*. It runs `auth macro edit` with
+  earlier step's extractor, `{{username}}`, `{{password}}`), put in at the caret (at the end
+  before the request is clicked), changing no other byte. A step saved unchanged (line endings
+  aside) stays what it was; an edited one is marked *edited*, a pasted one *pasted*. A save the
+  CLI warns about (a step's Host the scope doesn't list) says so in a toast. It runs `auth macro edit` with
   every step (`--step step:N` for one of its own, a history id for a new one, `ORIGIN=FILE` for
   one given as text, its bytes staged as a private file for the call, as Replay's race group
   members are), every extractor (or `--no-extract`), and `--rename` when the name changed. *New
   macro* (`MacroBuilder`) takes Traffic rows and pasted requests the same way, each with *Edit
-  request*, and runs `auth macro add`.
+  request*, and runs `auth macro add`. The dev bridge stages request files as the Tauri shell
+  does (`src/requestFiles.ts`, `src-tauri/src/race_files.rs`).
 
 ## Look
 
@@ -758,8 +761,8 @@ arrays whole), so change both when the window changes. The icons are in
 - A literal auth password goes to `auth add` in `BRAINPROXY_SECRET_PASSWORD`, not argv. The
   login body is a template (`{{password}}` is filled at login), so it stays an argument.
 - A macro's Traffic picker lists the 500 most recent entries; an older one is pasted as a raw
-  request. A step's request is text: a Traffic row with a binary body can't be a step from the
-  app (`auth macro add` with a file can). *New macro profile* starts a profile with no login
+  request. A step's request is edited as text: a Traffic row with a binary body can be a step
+  as it is, but *Edit request* refuses it. *New macro profile* starts a profile with no login
   from its first macro, since `auth add` refuses a profile with nothing to do.
 - Traffic's Query mode runs `history list --filter` through the same paging as the contents
   search. A query the CLI refuses as invalid input isn't tried again until the text changes

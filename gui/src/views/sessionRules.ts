@@ -2,9 +2,8 @@
 // `auth show` returns, and the `auth macro` / `auth rule` / `auth sign` arguments the Settings
 // view builds.
 
-// With their extensions, so node --test can load this module (as the tests import theirs).
+// With its extension, so node --test can load this module (as the tests import theirs).
 import { textBytes } from "../api.ts";
-import { withBody } from "../ui/message.ts";
 
 export type Tool = "proxy" | "send" | "fuzz" | "crawl" | "scan" | "checks";
 export const TOOLS: Tool[] = ["proxy", "send", "fuzz", "crawl", "scan", "checks"];
@@ -235,14 +234,71 @@ export interface StepText {
   request: string;
 }
 
+/** `text` with CRLF as LF: the message editor shows and gives a request so. */
+const lf = (text: string) => text.replace(/\r\n/g, "\n");
+
 /**
  * The step after its request was edited to `now`: as it was when that is still `was` (its
  * original text, so a step opened and saved unchanged stays one of the macro's own or a Traffic
  * row), and otherwise a step given as text, with the same key so its extractors stay on it.
+ * Line endings don't count: any keystroke gives the head back with \n, and a step is sent with
+ * CRLF either way.
  */
 export function editedStep(s: EditorStep, now: StepText, was: StepText | null): EditorStep {
-  if (was && s.kind !== "text" && now.target === was.target && now.request === was.request) return s;
+  if (was && s.kind !== "text" && now.target === was.target && lf(now.request) === lf(was.request)) return s;
   return { key: s.key, kind: "text", target: now.target, request: now.request, line: stepLine(now) };
+}
+
+/**
+ * `steps` with the request of the step `key` edited to `now` (see `editedStep`), or, for a new
+ * step (`key` null), with a pasted request added last under `newKey`.
+ */
+export function withStepText(steps: EditorStep[], key: string | null, now: StepText, was: StepText | null, newKey: string): EditorStep[] {
+  if (key === null) return [...steps, editedStep({ key: newKey, kind: "text", target: "", request: "", line: "" }, now, null)];
+  return steps.map((x) => (x.key === key ? editedStep(x, now, was) : x));
+}
+
+/** `steps` with step `i` moved `by` places, or as they were when that would leave the list. */
+export function moved<T>(steps: T[], i: number, by: number): T[] {
+  const j = i + by;
+  if (j < 0 || j >= steps.length) return steps;
+  const out = [...steps];
+  [out[i], out[j]] = [out[j], out[i]];
+  return out;
+}
+
+/**
+ * The origin a history row was sent to, from its URL (origin + path): not by parsing the URL
+ * whole, since an `OPTIONS *` row's is the origin with `*` right after it ("http://app.test*").
+ */
+export function historyOrigin(url: string): string {
+  const m = /^(https?:\/\/(?:\[[^\]]*\](?::\d+)?|[^/?#*\[]+))/i.exec(url);
+  return m ? cleanOrigin(m[1]) : "";
+}
+
+/** What a step shows beside its request line in the macro editor. */
+export function stepNote(s: EditorStep): string {
+  if (s.kind === "history") return `new, from #${s.id}`;
+  if (s.kind === "text") return s.key.startsWith("text") ? "pasted" : "edited";
+  return "";
+}
+
+/**
+ * The toast for a macro just saved: the CLI's warning when a step's Host (or a head servers may
+ * read differently) is one the scope doesn't list, which it saves anyway for a person; null
+ * when there is none.
+ */
+export function macroSavedWarning(data: { host_warning?: string } | null | undefined): string | null {
+  return data?.host_warning ? `Saved, but ${data.host_warning}` : null;
+}
+
+/**
+ * Hands out a number per lookup and says whether one is still the latest, so the answer to a
+ * lookup that was overtaken (a slow Traffic row, then another step opened) is dropped.
+ */
+export function latestOnly(): { next: () => number; isLatest: (n: number) => boolean } {
+  let last = 0;
+  return { next: () => ++last, isLatest: (n) => n === last };
 }
 
 /** The origin ("https://host:port") a raw request goes to: its absolute URL's, or its Host header's over `scheme`; "" when it names neither. */
@@ -282,10 +338,12 @@ export function cleanOrigin(text: string): string {
 
 /** Why a step's origin and request can't be used; null when they can. The CLI checks the rest. */
 export function stepTextProblem(t: StepText): string | null {
-  if (!/^https?:\/\/[^/?#@\s]+$/i.test(t.target) || cleanOrigin(t.target) !== t.target)
+  // No "=": the CLI reads ORIGIN=FILE up to the first one.
+  if (!/^https?:\/\/[^/?#@=\s]+$/i.test(t.target) || cleanOrigin(t.target) !== t.target)
     return "Give the origin the request goes to, such as https://app.test or http://127.0.0.1:8000.";
   const line = t.request.split(/\r?\n/, 1)[0] ?? "";
-  if (!/^\S+ \S+ HTTP\/\d(\.\d)?$/.test(line.trim())) return "The request starts with a request line, such as GET /path HTTP/1.1.";
+  // As it is, not trimmed: a space before the method is a head servers read differently.
+  if (!/^[^\s{}]+ \S+ HTTP\/\d(\.\d)?$/.test(line)) return "The request starts with a request line, such as GET /path HTTP/1.1.";
   return null;
 }
 
@@ -301,16 +359,28 @@ export function varsBefore(steps: EditorStep[], extract: { key: string; var: str
   return [...new Set([...vars, "username", "password"])];
 }
 
+/** The offset in `value` of offset `at` in `value` with CRLF shown as \n (as the textarea has it). */
+function rawOffset(value: string, at: number): number {
+  let shown = 0;
+  let i = 0;
+  while (i < value.length && shown < at) {
+    i += value.startsWith("\r\n", i) ? 2 : 1;
+    shown++;
+  }
+  return i;
+}
+
 /**
  * `value` (as the message editor holds it) with {{name}} put over the textarea's selection
- * `start`..`end`, whose offsets count line breaks as \n (the textarea shows CRLF as \n), and
- * where the caret goes after it.
+ * `start`..`end`, whose offsets count CRLF as one \n (the textarea shows it so), and where the
+ * caret goes after it. Only the selection changes: every other byte stays as it was, so a body
+ * with mixed line endings (a signed one, say) keeps them.
  */
 export function insertVar(value: string, start: number, end: number, name: string): { value: string; caret: number } {
-  const text = value.replace(/\r\n/g, "\n");
-  const [a, b] = [Math.max(0, Math.min(start, text.length)), Math.max(0, Math.min(end, text.length))];
+  const len = lf(value).length;
+  const [a, b] = [Math.max(0, Math.min(start, end, len)), Math.max(0, Math.min(Math.max(start, end), len))];
   const put = `{{${name}}}`;
-  return { value: withBody(text.slice(0, Math.min(a, b)) + put + text.slice(Math.max(a, b)), value), caret: Math.min(a, b) + put.length };
+  return { value: value.slice(0, rawOffset(value, a)) + put + value.slice(rawOffset(value, b)), caret: a + put.length };
 }
 
 export interface RuleForm {
