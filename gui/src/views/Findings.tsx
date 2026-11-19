@@ -65,7 +65,7 @@ import type { Verify } from "./verifyFinding.ts";
 import { NewFinding } from "./NewFinding";
 import { ReportBuilder } from "./ReportBuilder";
 import { SuppressDialog, SuppressionRules } from "./Suppressions.tsx";
-import { alertNames, canSuppress, rulesLabel, SUPPRESS_LIST_ARGS, type SuppressionList } from "./suppression.ts";
+import { alertNames, canSuppress, rulesLabel, SUPPRESS_LIST_ARGS, suppressedBy, suppressedKey, type SuppressionList } from "./suppression.ts";
 
 const RISKS: Risk[] = ["critical", "high", "medium", "low", "info"];
 const NO_RANGES: FindingRanges = { ranges: [], marked: null };
@@ -143,15 +143,13 @@ export function FindingsView({ active }: { active: boolean }) {
   useEffect(refreshSeen, [scan?.id, compare, refreshSeen]);
   const seen = useMemo(() => seenById(compared), [compared]);
   const comparing = compare !== "all" && scan != null;
-  // Suppression rules, with the findings each holds: the toolbar counts them, the dialog lists them.
-  const [rules, refreshRules] = usePoll<SuppressionList>(() => run<SuppressionList>(SUPPRESS_LIST_ARGS), 10000, active);
+  // Suppression rules, with the findings each holds, for the toolbar's count and a finding's
+  // rule. Each read counts every rule's findings, so they are read seldom, and again whenever
+  // the findings list shows what they hold has changed (below). The dialog reads its own.
+  const [rules, refreshRules] = usePoll<SuppressionList>(() => run<SuppressionList>(SUPPRESS_LIST_ARGS), 60000, active);
   const [suppressing, setSuppressing] = useState<Finding | null>(null);
   const [showRules, setShowRules] = useState(false);
-  // Read again on opening, so the dialog doesn't wait for the next poll.
-  const openRules = () => {
-    refreshRules();
-    setShowRules(true);
-  };
+  const openRules = () => setShowRules(true);
 
   const view = useMemo<ListView>(() => ({ hideClosed: hideFp, filter, compare: comparing ? { seen, want: compare } : null }), [hideFp, filter, comparing, seen, compare]);
   const groups = useMemo(() => {
@@ -169,6 +167,13 @@ export function FindingsView({ active }: { active: boolean }) {
 
   const hosts = useMemo(() => hostsOf(data?.items ?? []), [data]);
   const names = useMemo(() => alertNames(data?.items ?? []), [data]);
+  const held = useMemo(() => suppressedKey(data?.items), [data]);
+  const firstHeld = useRef(true);
+  useEffect(() => {
+    // The poll's own first read covers the first list.
+    if (firstHeld.current) firstHeld.current = false;
+    else refreshRules();
+  }, [held, refreshRules]);
   const byId = useMemo(() => new Map((data?.items ?? []).map((f) => [f.id, f])), [data]);
   const shown = useMemo(() => groups.flatMap((g) => g.items.map((f) => f.id)), [groups]);
   const picked = useMemo(() => shown.filter((id) => checked.has(id)), [shown, checked]);
@@ -564,6 +569,7 @@ export function FindingsView({ active }: { active: boolean }) {
   const noFinding: string | false = finding ? false : "No finding is open";
   const noSuppress: string | false = noFinding || (finding && !canSuppress(finding) ? "A rule leaves findings added by hand alone" : false);
   const noList: string | false = shown.length ? false : "No findings are shown";
+  const byRule = finding?.suppressed_by != null ? suppressedBy(finding.suppressed_by, rules?.suppressions) : null;
   useActions([
     { ...NEXT_FINDING, hidden: !active, disabled: noList, run: () => select(stepFinding(shown, selected, 1)) },
     { ...PREVIOUS_FINDING, hidden: !active, disabled: noList, run: () => select(stepFinding(shown, selected, -1)) },
@@ -894,9 +900,13 @@ export function FindingsView({ active }: { active: boolean }) {
                   <>
                     <dt>Suppressed</dt>
                     <dd>
-                      <button className="link" onClick={openRules} title="Show the suppression rules">
-                        by rule {finding.suppressed_by}
-                      </button>
+                      {byRule?.live ? (
+                        <button className="link" onClick={openRules} title="Show the suppression rules">
+                          {byRule.text}
+                        </button>
+                      ) : (
+                        byRule?.text
+                      )}
                     </dd>
                   </>
                 )}
@@ -1052,7 +1062,7 @@ export function FindingsView({ active }: { active: boolean }) {
           }}
         />
       )}
-      {showRules && <SuppressionRules rules={rules?.suppressions ?? null} names={names} close={() => setShowRules(false)} changed={suppressionChanged} />}
+      {showRules && <SuppressionRules names={names} close={() => setShowRules(false)} changed={suppressionChanged} />}
     </div>
   );
 }

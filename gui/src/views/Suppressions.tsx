@@ -2,10 +2,10 @@
 // parameter) is a false positive wherever scans find it. The arguments and wording are in
 // suppression.ts; the CLI does the matching and marking.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { run, type Finding } from "../api";
 import { useDialogFocus } from "../ui/dialogFocus";
-import { addedNote, draftFor, draftProblem, removedNote, ruleWhere, rulesSummary, suppressAddArgs, suppressRemoveArgs, type SuppressDraft, type SuppressionRule } from "./suppression.ts";
+import { addedNote, draftFor, draftProblem, removedNote, ruleWhere, rulesSummary, SUPPRESS_LIST_ARGS, suppressAddArgs, suppressRemoveArgs, type SuppressDraft, type SuppressionList, type SuppressionRule } from "./suppression.ts";
 
 /** A new rule, started from `finding`. `added` gets what to say once it is added. */
 export function SuppressDialog({ finding, close, added }: { finding: Finding; close: () => void; added: (note: string) => void }) {
@@ -36,7 +36,9 @@ export function SuppressDialog({ finding, close, added }: { finding: Finding; cl
   };
 
   return (
-    <div className="confirm-backdrop" onKeyDown={(e) => e.key === "Escape" && close()}>
+    // Not closed while the rule is being added: it would be added unseen, and its answer would
+    // land on whatever dialog was opened next.
+    <div className="confirm-backdrop" onKeyDown={(e) => e.key === "Escape" && !busy && close()}>
       <form
         ref={box}
         className="confirm-dialog suppress-dialog"
@@ -86,7 +88,7 @@ export function SuppressDialog({ finding, close, added }: { finding: Finding; cl
         )}
         <div className="row gap">
           <span className="grow" />
-          <button type="button" className="btn" onClick={close}>
+          <button type="button" className="btn" disabled={busy} onClick={close}>
             Cancel
           </button>
           <button type="submit" className="btn primary" disabled={busy || !!problem} title={problem ?? undefined}>
@@ -99,18 +101,34 @@ export function SuppressDialog({ finding, close, added }: { finding: Finding; cl
 }
 
 /**
- * The rules, each with what it holds and Remove (which can open its findings again). `names`:
- * alert refs to their names, as the findings list has them. `changed` gets what to say after a
- * removal, so the list and rules are read again.
+ * The rules, each with what it holds and Remove (which can open its findings again), read when
+ * it opens and after each removal, so it never shows a rule already gone or hides a failed read.
+ * `names`: alert refs to their names, as the findings list has them. `changed` gets what to say
+ * after a removal, so the findings and the toolbar's count are read again.
  */
-export function SuppressionRules(p: { rules: SuppressionRule[] | null; names: ReadonlyMap<string, string>; close: () => void; changed: (note: string) => void }) {
+export function SuppressionRules(p: { names: ReadonlyMap<string, string>; close: () => void; changed: (note: string) => void }) {
   // The rule asked about, and whether its findings open again.
   const [removing, setRemoving] = useState<{ id: number; reopen: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // null until the first read lands (or fails).
+  const [list, setList] = useState<SuppressionRule[] | null>(null);
   const box = useRef<HTMLDivElement>(null);
   useDialogFocus(box);
-  const rules = p.rules ?? [];
+  const rules = list ?? [];
+  const live = useRef(true);
+  const load = () =>
+    run<SuppressionList>(SUPPRESS_LIST_ARGS).then(
+      (l) => live.current && setList(l.suppressions),
+      (e: any) => live.current && setError(`Couldn't read the rules: ${e.message}`),
+    );
+  useEffect(() => {
+    live.current = true;
+    load();
+    return () => {
+      live.current = false;
+    };
+  }, []);
   // The buttons of a removal go when it ends; focus stays in the dialog, so Esc and Tab still work.
   const stopRemoving = () => {
     setRemoving(null);
@@ -123,9 +141,13 @@ export function SuppressionRules(p: { rules: SuppressionRule[] | null; names: Re
     setBusy(true);
     setError("");
     try {
+      const held = rules.find((x) => x.id === id)?.findings ?? 0;
       const r = await run<{ id: number; reopened: number }>(suppressRemoveArgs(id, reopen));
+      // The rule leaves the list before Remove can be pressed for it again.
+      setList((l) => l?.filter((x) => x.id !== id) ?? l);
       stopRemoving();
-      p.changed(removedNote(id, r.reopened, reopen));
+      p.changed(removedNote(id, r.reopened, reopen, held));
+      load();
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -145,7 +167,7 @@ export function SuppressionRules(p: { rules: SuppressionRule[] | null; names: Re
     >
       <div ref={box} className="confirm-dialog suppress-rules" role="dialog" aria-modal="true" aria-labelledby="suppress-rules-title" aria-describedby="suppress-rules-help">
         <h2 id="suppress-rules-title">Suppression rules</h2>
-        <p id="suppress-rules-help">{p.rules == null ? "Reading the rules…" : rulesSummary(rules)}</p>
+        <p id="suppress-rules-help">{list == null ? (error ? "" : "Reading the rules…") : rulesSummary(rules)}</p>
         {rules.length > 0 && (
           <ul className="suppress-list" aria-label="Suppression rules">
             {rules.map((r) => (

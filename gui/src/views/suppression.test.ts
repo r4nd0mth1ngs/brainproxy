@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { addedNote, alertNames, canSuppress, draftFor, draftProblem, removedNote, ruleWhere, rulesLabel, rulesSummary, suppressAddArgs, suppressedCount, suppressRemoveArgs } from "./suppression.ts";
+import { addedNote, alertNames, canSuppress, draftFor, draftProblem, matchPath, removedNote, ruleWhere, rulesLabel, rulesSummary, suppressAddArgs, suppressedBy, suppressedCount, suppressedKey, suppressRemoveArgs } from "./suppression.ts";
 
 const finding = { alert_ref: "10038", host: "app.test", url: "https://app.test/static/app.js?v=3", param: "" };
 
 test("a rule starts from the finding: its alert, host, path and parameter", () => {
-  assert.deepEqual(draftFor(finding), { alert: "10038", host: "app.test", pathPrefix: "/static/app.js", param: "", reason: "" });
+  assert.deepEqual(draftFor(finding), { alert: "10038", host: "app.test:443", pathPrefix: "/static/app.js", param: "", reason: "" });
   assert.deepEqual(draftFor({ ...finding, url: "http://127.0.0.1:3000/search?q=1", host: "127.0.0.1", param: "q" }), {
     alert: "10038",
     host: "127.0.0.1:3000",
@@ -15,11 +15,38 @@ test("a rule starts from the finding: its alert, host, path and parameter", () =
   });
 });
 
-test("the host keeps a port only when the URL names one that isn't the default", () => {
-  assert.equal(draftFor({ ...finding, url: "https://app.test:443/" }).host, "app.test");
-  assert.equal(draftFor({ ...finding, url: "http://app.test:80/a" }).host, "app.test");
+test("the host always keeps its port, so a rule made on one service doesn't hide another's findings", () => {
+  // The scheme's default port too, written or not: app.test:443 is not app.test:8443.
+  assert.equal(draftFor({ ...finding, url: "https://app.test:443/" }).host, "app.test:443");
+  assert.equal(draftFor({ ...finding, url: "https://app.test/" }).host, "app.test:443");
+  assert.equal(draftFor({ ...finding, url: "http://app.test:80/a" }).host, "app.test:80");
+  assert.equal(draftFor({ ...finding, url: "http://APP.test/a" }).host, "app.test:80");
   assert.equal(draftFor({ ...finding, url: "https://app.test:8443/a" }).host, "app.test:8443");
   assert.equal(draftFor({ ...finding, host: "::1", url: "http://[::1]:3000/a" }).host, "[::1]:3000");
+  assert.equal(draftFor({ ...finding, host: "::1", url: "http://[::1]/a" }).host, "[::1]:80");
+  assert.equal(draftFor({ ...finding, url: "wss://app.test/socket" }).host, "app.test:443");
+  // A scheme with no known default port: the name alone, as the finding has it.
+  assert.equal(draftFor({ ...finding, url: "ftp://app.test/a" }).host, "app.test");
+});
+
+test("the path is the one the CLI matches: no ;name=value parameters, percent-encoded", () => {
+  assert.equal(draftFor({ ...finding, url: "http://127.0.0.1:38471/app;jsessionid=abc/page" }).pathPrefix, "/app/page");
+  assert.equal(draftFor({ ...finding, url: "http://app.test/login;jsessionid=x?next=/" }).pathPrefix, "/login");
+  // A ; piece with no = isn't a parameter and stays.
+  assert.equal(draftFor({ ...finding, url: "http://app.test/a;b/c" }).pathPrefix, "/a;b/c");
+  assert.equal(draftFor({ ...finding, url: "http://app.test/a;b;v=1/c" }).pathPrefix, "/a;b/c");
+  assert.equal(draftFor({ ...finding, url: "http://app.test/caf%C3%A9/x" }).pathPrefix, "/caf%C3%A9/x");
+  assert.equal(draftFor({ ...finding, url: "http://app.test/;v=1" }).pathPrefix, "");
+});
+
+test("matchPath encodes a typed path and leaves out path parameters", () => {
+  assert.equal(matchPath("/static/"), "/static/");
+  assert.equal(matchPath("/café/"), "/caf%C3%A9/");
+  assert.equal(matchPath("/a b/"), "/a%20b/");
+  assert.equal(matchPath("/caf%C3%A9/"), "/caf%C3%A9/");
+  assert.equal(matchPath("/app;jsessionid=1/"), "/app/");
+  // A leading // stays a path, not a host.
+  assert.equal(matchPath("//static/"), "//static/");
 });
 
 test("the site's root is every path, and a finding with no URL starts from its host", () => {
@@ -35,6 +62,8 @@ test("the dialog says what the CLI would refuse before it runs", () => {
   for (const host of ["app.test/x", "a b", "user@app.test", "app.test?x", "app.test#x"]) assert.match(draftProblem({ ...ok, host })!, /host is a name/, host);
   assert.equal(draftProblem({ ...ok, host: "[::1]:3000" }), null);
   assert.match(draftProblem({ ...ok, pathPrefix: "static/" })!, /starts with \//);
+  assert.match(draftProblem({ ...ok, pathPrefix: "/search?q=1" })!, /no \? or #/);
+  assert.match(draftProblem({ ...ok, pathPrefix: "/#/admin" })!, /no \? or #/);
   assert.equal(draftProblem({ ...ok, pathPrefix: " " }), null);
   assert.match(draftProblem({ ...ok, reason: "  " })!, /reason/);
 });
@@ -54,6 +83,9 @@ test("add sends each value as --flag=value, leaving out an empty path and parame
     "--reason=--reopen is wrong here",
   ]);
   assert.ok(!suppressAddArgs({ ...d, param: "   " }).some((a) => a.startsWith("--param")));
+  // A typed path goes as the CLI matches it; a stray space round a parameter is dropped.
+  assert.ok(suppressAddArgs({ ...d, pathPrefix: "/café/", param: " id " }).includes("--path-prefix=/caf%C3%A9/"));
+  assert.ok(suppressAddArgs({ ...d, pathPrefix: "/café/", param: " id " }).includes("--param=id"));
 });
 
 test("remove opens the findings again only when asked", () => {
@@ -93,9 +125,31 @@ test("after adding, it says when the finding it came from was left alone", () =>
 });
 
 test("after removing, it says what happened to the findings", () => {
-  assert.equal(removedNote(3, 0, false), "Suppression rule 3 removed. The findings it marked stay false positives.");
-  assert.equal(removedNote(3, 1, true), "Suppression rule 3 removed: 1 finding open again.");
-  assert.equal(removedNote(3, 4, true), "Suppression rule 3 removed: 4 findings open again.");
+  assert.equal(removedNote(3, 0, false, 5), "Suppression rule 3 removed. The 5 findings it marked stay false positives.");
+  assert.equal(removedNote(3, 0, false, 1), "Suppression rule 3 removed. The finding it marked stays a false positive.");
+  assert.equal(removedNote(3, 0, false, 0), "Suppression rule 3 removed.");
+  assert.equal(removedNote(3, 1, true, 1), "Suppression rule 3 removed: 1 finding open again.");
+  assert.equal(removedNote(3, 4, true, 4), "Suppression rule 3 removed: 4 findings open again.");
+});
+
+test("a finding names its rule, and says when the rule was removed since", () => {
+  assert.deepEqual(suppressedBy(7, null), { text: "by rule 7", live: true });
+  assert.deepEqual(suppressedBy(7, [{ id: 2 }, { id: 7 }]), { text: "by rule 7", live: true });
+  assert.deepEqual(suppressedBy(7, [{ id: 2 }]), { text: "by rule 7, since removed", live: false });
+  assert.deepEqual(suppressedBy(7, []), { text: "by rule 7, since removed", live: false });
+});
+
+test("the rules are read again when what they hold changes", () => {
+  const items = [
+    { id: 1, state: "false_positive", suppressed_by: 2 },
+    { id: 2, state: "open", suppressed_by: null },
+    { id: 3, state: "false_positive", suppressed_by: null },
+    // Not the rule's any more once its state changed, whatever the column says.
+    { id: 4, state: "open", suppressed_by: 2 },
+  ];
+  assert.equal(suppressedKey(items), "1:2");
+  assert.equal(suppressedKey(null), "");
+  assert.notEqual(suppressedKey([{ ...items[0], state: "open" }]), suppressedKey(items));
 });
 
 test("only scanners' findings start a rule", () => {
