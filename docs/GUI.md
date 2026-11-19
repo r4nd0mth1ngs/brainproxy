@@ -755,6 +755,10 @@ arrays whole), so change both when the window changes. The icons are in
   or adds Traffic steps but doesn't edit a step's text. A macro isn't renamed in place (session
   rules name it). *New macro profile* starts a profile with no login from its first macro,
   since `auth add` refuses a profile with nothing to do.
+- Findings › *Split…* reads the issue again just before it splits, but a finding moved to
+  another issue between that read and the split is still split out of its new issue:
+  `findings issue split` takes the findings, not the issue they come from. A split moves at most
+  2,000 findings and a merge runs in batches of 500 issues (Windows' command-line limit).
 - Traffic's Query mode runs `history list --filter` through the same paging as the contents
   search. A query the CLI refuses as invalid input isn't tried again until the text changes
   (`failPage(..., invalid)`); the toolbar shows the parser's message. Saved filters are loaded
