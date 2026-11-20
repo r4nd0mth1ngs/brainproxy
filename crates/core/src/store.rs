@@ -553,8 +553,11 @@ pub struct HistoryFilter {
     /// gui, cli, mcp, or unknown (entries from before origins were kept).
     pub origin: Option<String>,
     /// Substring searched in the raw request and response, and in their decoded bodies
-    /// (so a gzip or chunked body matches too). Case-sensitive.
+    /// (so a gzip or chunked body matches too). Case-sensitive unless `ignore_case`.
     pub contains: Option<String>,
+    /// `contains` matches ASCII letters in any case, as the filter language's `:` does. Other
+    /// bytes, UTF-8 letters outside ASCII included, must match as stored.
+    pub ignore_case: bool,
     /// A query in the history filter language ([`crate::filter`]).
     pub filter: Option<String>,
     pub after_id: Option<i64>,
@@ -1412,12 +1415,20 @@ impl Store {
             push("id > ?", Box::new(id));
         }
         if let Some(c) = &f.contains {
-            args.push(Box::new(c.clone().into_bytes()));
-            let n = args.len();
-            sql.push_str(&format!(
-                " AND (instr(request, ?{n}) > 0 OR instr(response, ?{n}) > 0 \
-                 OR instr(req_body, ?{n}) > 0 OR instr(resp_body, ?{n}) > 0)"
-            ));
+            let cols = ["request", "response", "req_body", "resp_body"];
+            let cond: Vec<String> = if f.ignore_case {
+                // The filter language's SQL, so `--contains X --ignore-case` and `req:X OR resp:X`
+                // agree. SQLite folds each row's value on its own, never every body at once.
+                args.push(Box::new(c.clone()));
+                let p = format!("?{}", args.len());
+                cols.iter().map(|col| crate::filter::contains(col, &p)).collect()
+            } else {
+                // Bound as a blob, so instr compares bytes.
+                args.push(Box::new(c.clone().into_bytes()));
+                let n = args.len();
+                cols.iter().map(|col| format!("instr({col}, ?{n}) > 0")).collect()
+            };
+            sql.push_str(&format!(" AND ({})", cond.join(" OR ")));
         }
         // An empty query filters nothing, as the app leaves it out.
         if let Some(q) = f.filter.as_deref().filter(|q| !q.trim().is_empty()) {
@@ -2741,6 +2752,63 @@ mod tests {
             .unwrap();
         assert_eq!(ids(has("deflated-word")), [deflated]);
         assert_eq!(ids(has("not-gzip-text")), [corrupt]);
+    }
+
+    #[test]
+    fn contains_can_ignore_ascii_case() {
+        let s = Store::open_in_memory().unwrap();
+        let target = Target::from_url("http://a.test").unwrap();
+        let rec = |headers: &str, body: &[u8], gzip: bool| {
+            let body = if gzip {
+                let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                std::io::Write::write_all(&mut z, body).unwrap();
+                z.finish().unwrap()
+            } else {
+                body.to_vec()
+            };
+            let enc = if gzip { "Content-Encoding: gzip\r\n" } else { "" };
+            let mut response =
+                format!("HTTP/1.1 200 OK\r\n{headers}{enc}Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+            response.extend_from_slice(&body);
+            let request = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec();
+            s.record_exchange(
+                "proxy",
+                &Exchange { target: target.clone(), request, response, duration_ms: 1, sni: None, stream: None },
+            )
+            .unwrap()
+        };
+        let header = rec("X-Api-Token: abc\r\n", b"-", false);
+        let body = rec("", b"{\"Error\":\"Stack TRACE\"}", false);
+        // NUL and bytes that aren't UTF-8 around the word, which must be searched past.
+        let binary = rec("", b"\x00\xff\xfe\x80STACK\x00trace\x00\xc3StAcK TrAcE\xff", false);
+        let gz = rec("", b"compressed STACK trace", true);
+        let cafe = rec("", "CAF\u{c9}".as_bytes(), false);
+        let ids = |c: &str, ignore_case: bool| {
+            let f = HistoryFilter { contains: Some(c.into()), ignore_case, ..Default::default() };
+            s.list(&f).unwrap().iter().map(|h| h.id).collect::<Vec<_>>()
+        };
+        assert!(ids("stack trace", false).is_empty());
+        assert_eq!(ids("stack trace", true), [body, binary, gz]);
+        assert_eq!(ids("x-api-token: ABC", true), [header]);
+        // ASCII folds, letters outside ASCII match only as stored.
+        assert_eq!(ids("caf\u{c9}", true), [cafe]);
+        assert!(ids("caf\u{e9}", true).is_empty());
+        // The same rows as the filter language's req and resp fields, which fold the same way.
+        let q = |q: &str| {
+            let f = HistoryFilter { filter: Some(q.into()), ..Default::default() };
+            s.list(&f).unwrap().iter().map(|h| h.id).collect::<Vec<_>>()
+        };
+        let fields = r#"req:"stack trace" OR resp:"stack trace" OR req.body:"stack trace" OR resp.body:"stack trace""#;
+        assert_eq!(q(fields), ids("stack trace", true));
+        // Wildcards stay plain text, and the other filters still apply.
+        assert!(ids("st_ck", true).is_empty());
+        let f = HistoryFilter {
+            contains: Some("STACK".into()),
+            ignore_case: true,
+            after_id: Some(binary),
+            ..Default::default()
+        };
+        assert_eq!(s.list(&f).unwrap().iter().map(|h| h.id).collect::<Vec<_>>(), [gz]);
     }
 
     #[test]

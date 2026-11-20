@@ -35,6 +35,13 @@ test("a contents search goes to --contains; the rest to --filter", () => {
   assert.deepEqual(args.slice(3, 5), ["--contains=token", "--filter=status<400"]);
 });
 
+test("a contents search that ignores case exports with --ignore-case, as Traffic searches", () => {
+  const args = exportArgs({ ...NONE, text: "Token", contents: true, ignoreCase: true }, DEFAULT_EXPORT, "/t.har", true);
+  assert.deepEqual(args.slice(3, 6), ["--contains=Token", "--ignore-case", `--limit=${EXPORT_LIMIT}`]);
+  // A query search folds ASCII case itself; the setting adds nothing to it.
+  assert.ok(!exportArgs({ ...NONE, text: "resp:x", query: true, ignoreCase: true }, DEFAULT_EXPORT, "/t.har", true).includes("--ignore-case"));
+});
+
 test("a contents search of only spaces searches nothing, as in Traffic", () => {
   assert.deepEqual(exportArgs({ ...NONE, text: "  ", contents: true }, DEFAULT_EXPORT, "/t.har", true).slice(3, 4), [`--limit=${EXPORT_LIMIT}`]);
 });

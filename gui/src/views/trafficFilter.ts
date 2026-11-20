@@ -10,6 +10,11 @@ export interface TrafficFilter {
   /** Search `text` inside requests and responses (the CLI) instead of URL, title and method. */
   contents: boolean;
   /**
+   * The contents search matches ASCII letters in any case (`--ignore-case`). Off: the text must
+   * match as stored. Only the contents search reads it.
+   */
+  ignoreCase: boolean;
+  /**
    * `text` is a query in the filter language (`history list --filter`), run by the CLI. Wins
    * over `contents`: at most one of them is on.
    */
@@ -22,7 +27,7 @@ export interface TrafficFilter {
 }
 
 // Refused requests (outside the engagement scope) are mostly browser background noise.
-export const DEFAULT_FILTER: TrafficFilter = { text: "", contents: false, query: false, sources: [], hideErrors: false, hideAssets: false, hideRefused: true };
+export const DEFAULT_FILTER: TrafficFilter = { text: "", contents: false, ignoreCase: false, query: false, sources: [], hideErrors: false, hideAssets: false, hideRefused: true };
 
 /** Which search the text box does: the URL, title and method here, or a CLI search. */
 export type SearchMode = "text" | "contents" | "query";
@@ -57,14 +62,21 @@ export interface SavedFilter {
 
 export const savedKey = (project: string) => `traffic-filters:${project}`;
 
-/** A filter from stored JSON: unknown fields are dropped and missing ones take the defaults. */
+/**
+ * A filter from stored JSON: unknown fields are dropped and missing ones take the defaults.
+ * `ignoreCase` is kept only on a contents search, the one that reads it, so a URL or query
+ * filter saved with it left over equals the same filter without it. (The toolbar's own state
+ * keeps it across a mode change: withMode doesn't come through here.)
+ */
 export function parseFilter(v: unknown): TrafficFilter {
   const o = v && typeof v === "object" ? (v as Record<string, unknown>) : {};
   const bool = (k: keyof TrafficFilter) => (typeof o[k] === "boolean" ? (o[k] as boolean) : (DEFAULT_FILTER[k] as boolean));
   const query = bool("query");
+  const contents = query ? false : bool("contents");
   return {
     text: typeof o.text === "string" ? o.text : "",
-    contents: query ? false : bool("contents"),
+    contents,
+    ignoreCase: contents && bool("ignoreCase"),
     query,
     sources: Array.isArray(o.sources) ? [...new Set(o.sources.filter((s): s is string => typeof s === "string"))] : [],
     hideErrors: bool("hideErrors"),
@@ -126,8 +138,18 @@ export function clearLocalSaved(project: string): void {
 export const FILTERS_LIST_ARGS = ["history", "filters", "list"];
 export const filtersSaveArgs = (rev: number) => ["history", "filters", "save", "--if-revision", String(rev)];
 
-/** A save's stdin: the whole list, each filter in its stored form. */
-export const savedBody = (list: SavedFilter[]) => JSON.stringify({ filters: list.map((s) => ({ name: s.name, filter: parseFilter(s.filter) })) });
+/**
+ * A save's stdin: the whole list, each filter in its stored form. ignoreCase is left out when
+ * off, as the CLI stores it: a large set stays within what a save takes, and a build from
+ * before it existed still reads the filters.
+ */
+export function savedBody(list: SavedFilter[]): string {
+  const stored = (f: TrafficFilter) => {
+    const { ignoreCase, ...rest } = parseFilter(f);
+    return ignoreCase ? { ...rest, ignoreCase } : rest;
+  };
+  return JSON.stringify({ filters: list.map((s) => ({ name: s.name, filter: stored(s.filter) })) });
+}
 
 /**
  * `list` (saved in the project) with the filters an older build kept in localStorage added.
@@ -292,6 +314,8 @@ export interface SearchQuery {
   kind: "contains" | "filter";
   text: string;
   source: string | null;
+  /** --ignore-case, for kind "contains" only (the filter language folds ASCII case itself). */
+  ignoreCase: boolean;
 }
 
 export interface ContentSearch {
@@ -321,12 +345,14 @@ export interface ContentSearch {
 
 /**
  * The search a filter asks for, or null when the contents search is off or its text is only
- * whitespace (it would match almost every row). Only the text and a single source are sent to
- * the CLI, so only they make a new search; the checkboxes are applied here (see refilter).
+ * whitespace (it would match almost every row). Only the text, a single source and (for a
+ * contents search) the case setting are sent to the CLI, so only they make a new search; the
+ * checkboxes are applied here (see refilter).
  */
 export function searchFor(f: TrafficFilter): SearchQuery | null {
   if (!(f.contents || f.query) || !f.text.trim()) return null;
-  return { kind: f.query ? "filter" : "contains", text: f.text, source: f.sources.length === 1 ? f.sources[0] : null };
+  const kind = f.query ? "filter" : "contains";
+  return { kind, text: f.text, source: f.sources.length === 1 ? f.sources[0] : null, ignoreCase: kind === "contains" && f.ignoreCase };
 }
 
 export const newSearch = (query: SearchQuery): ContentSearch => ({
@@ -358,14 +384,15 @@ export function searchFrom(s: ContentSearch, id: number): ContentSearch {
 /** Whether `s` is the search the filter asks for (else its matches belong to an older query). */
 export const isCurrent = (s: ContentSearch | null, f: TrafficFilter): s is ContentSearch => {
   const want = searchFor(f);
-  return !!s && !!want && s.query.kind === want.kind && s.query.text === want.text && s.query.source === want.source;
+  const q = s?.query;
+  return !!q && !!want && q.kind === want.kind && q.text === want.text && q.source === want.source && q.ignoreCase === want.ignoreCase;
 };
 
 /** `history list` arguments for the next page of a search. */
 export function searchArgs(s: ContentSearch): string[] {
-  const { kind, text, source } = s.query;
-  const what = kind === "filter" ? `--filter=${text}` : `--contains=${text}`;
-  return ["history", "list", what, ...(source ? [`--source=${source}`] : []), `--after=${s.cursor}`, `--limit=${SEARCH_PAGE}`];
+  const { kind, text, source, ignoreCase } = s.query;
+  const what = kind === "filter" ? [`--filter=${text}`] : [`--contains=${text}`, ...(ignoreCase ? ["--ignore-case"] : [])];
+  return ["history", "list", ...what, ...(source ? [`--source=${source}`] : []), `--after=${s.cursor}`, `--limit=${SEARCH_PAGE}`];
 }
 
 /**

@@ -373,11 +373,17 @@ enum HistoryCmd {
         #[arg(long, value_parser = ["gui", "cli", "mcp", "unknown"])]
         origin: Option<String>,
         /// Text to search for in raw requests and responses, and in their decoded bodies (gzip,
-        /// deflate, br, chunked). Case-sensitive and literal: the bytes must match as stored,
-        /// so URL-encoded (a%40b.com) or JSON-escaped text and HTTP/2's lower-case header names
-        /// are searched as they appear.
+        /// deflate, br, chunked). Literal and case-sensitive (see --ignore-case): the bytes must
+        /// match as stored, so URL-encoded (a%40b.com) or JSON-escaped text and HTTP/2's
+        /// lower-case header names are searched as they appear.
         #[arg(long)]
         contains: Option<String>,
+        /// Make --contains match ASCII letters (A-Z, a-z) in any case, as the filter language's
+        /// FIELD:VALUE does. Every other byte must still match as stored: letters outside ASCII (é
+        /// and É) aren't folded, and bodies, binary ones too, are searched as bytes, not read as
+        /// text in any charset.
+        #[arg(long, requires = "contains")]
+        ignore_case: bool,
         /// A query in the filter language, e.g. 'status:5xx AND resp.body:"stack trace"' or
         /// 'host:api.test method=POST NOT path:/health'. FIELD:VALUE contains (ASCII letters in any case),
         /// = equals, != differs, ~ and !~ match a regex, < <= > >= compare numbers and times,
@@ -1467,7 +1473,7 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
     match cmd {
         HistoryCmd::Export(_) => unreachable!("handled above"),
-        HistoryCmd::List { host, method, status, source, tag, origin, contains, filter, after, limit } => {
+        HistoryCmd::List { host, method, status, source, tag, origin, contains, ignore_case, filter, after, limit } => {
             let items = store.list(&HistoryFilter {
                 host,
                 method,
@@ -1476,6 +1482,7 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                 tag,
                 origin,
                 contains,
+                ignore_case,
                 filter,
                 after_id: after,
                 limit: Some(limit),

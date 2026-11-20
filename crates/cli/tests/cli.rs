@@ -1472,9 +1472,144 @@ fn history_contains_takes_the_gui_arguments_and_finds_no_secrets() {
     assert_eq!(code, 0, "{v}");
     let arg = v["data"]["args"].as_array().unwrap().iter().find(|a| a["flag"] == "--contains").unwrap();
     let help = arg["help"].as_str().unwrap();
-    for words in ["decoded bodies", "Case-sensitive and literal", "URL-encoded", "JSON-escaped"] {
+    for words in ["decoded bodies", "Literal and case-sensitive (see --ignore-case)", "URL-encoded", "JSON-escaped"] {
         assert!(help.contains(words), "{help}");
     }
+}
+
+/// Answers each request with the response body its path names, as raw bytes (gzip-encoded for
+/// /gzip), and a mixed-case header.
+fn serve_bodies() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = vec![0u8; 65536];
+            let mut len = 0;
+            loop {
+                match s.read(&mut buf[len..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => len += n,
+                }
+                let Some(i) = buf[..len].windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                let head = String::from_utf8_lossy(&buf[..i]).to_ascii_lowercase();
+                let cl = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                    .unwrap_or(0);
+                if len >= i + 4 + cl {
+                    break;
+                }
+            }
+            let line = String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string();
+            let (body, enc): (Vec<u8>, &str) = match line.split(' ').nth(1).unwrap_or("/") {
+                "/json" => (b"{\"Error\":\"Stack TRACE at line 3\"}".to_vec(), ""),
+                "/binary" => (b"\x00\xff\xfe\x80sTaCk\x00tRaCe\x00\xc3\x28STACK TRACE\xff\x00".to_vec(), ""),
+                "/utf8" => ("Na\u{ef}ve CAF\u{c9}".as_bytes().to_vec(), ""),
+                "/gzip" => {
+                    let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    z.write_all(b"zipped stack Trace").unwrap();
+                    (z.finish().unwrap(), "Content-Encoding: gzip\r\n")
+                }
+                _ => (b"nothing to see".to_vec(), ""),
+            };
+            let mut resp = format!(
+                "HTTP/1.1 200 OK\r\nX-Request-Token: AbC-77\r\n{enc}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            resp.extend_from_slice(&body);
+            let _ = s.write_all(&resp);
+        }
+    });
+    port
+}
+
+#[test]
+fn history_contains_can_ignore_ascii_case() {
+    let port = serve_bodies();
+    let project = tmp_project("ignore-case");
+    let base = format!("http://127.0.0.1:{port}");
+    let mut id = std::collections::HashMap::new();
+    for path in ["json", "binary", "utf8", "gzip", "plain"] {
+        let (code, v) = run(&["send", "--url", &format!("{base}/{path}")], &project, None);
+        assert_eq!(code, 0, "{v}");
+        id.insert(path, v["data"]["id"].as_i64().unwrap());
+    }
+    // A request whose binary body holds the words, and a mixed-case request header.
+    let mut req =
+        format!("POST /up HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Trace-ID: Zq9\r\nContent-Length: 12\r\n\r\n")
+            .into_bytes();
+    req.extend_from_slice(b"\x01\x00STACK\xfftrace");
+    let (code, v) = run(&["send", "--scheme", "http"], &project, Some(&req));
+    assert_eq!(code, 0, "{v}");
+    let up = v["data"]["id"].as_i64().unwrap();
+
+    let ids = |args: &[&str]| {
+        let (code, v) = run(&[&["history", "list"], args].concat(), &project, None);
+        assert_eq!(code, 0, "{v}");
+        let mut got: Vec<i64> =
+            v["data"]["items"].as_array().unwrap().iter().map(|i| i["id"].as_i64().unwrap()).collect();
+        got.sort_unstable();
+        got
+    };
+    let sorted = |mut v: Vec<i64>| {
+        v.sort_unstable();
+        v
+    };
+
+    // Case-sensitive by default: only the exact bytes match.
+    assert!(ids(&["--contains=stack trace"]).is_empty());
+    assert_eq!(ids(&["--contains=STACK TRACE"]), [id["binary"]]);
+    // Bodies (decoded gzip, past NULs and bytes that aren't UTF-8) and headers, any ASCII case.
+    assert_eq!(ids(&["--contains=stack trace", "--ignore-case"]), sorted(vec![id["json"], id["binary"], id["gzip"]]));
+    assert_eq!(
+        ids(&["--contains=stack\u{ff}TRACE", "--ignore-case"]),
+        Vec::<i64>::new(),
+        "a typed ÿ is UTF-8, not 0xff"
+    );
+    assert_eq!(ids(&["--contains=x-trace-id: zQ9", "--ignore-case"]), [up]);
+    assert_eq!(ids(&["--contains=x-request-token: abc-77", "--ignore-case"]).len(), 6);
+    assert!(ids(&["--contains=x-request-token: abc-77"]).is_empty());
+    // Letters outside ASCII aren't folded: they match only as stored.
+    assert_eq!(ids(&["--contains=na\u{ef}ve caf\u{c9}", "--ignore-case"]), [id["utf8"]]);
+    assert!(ids(&["--contains=caf\u{e9}", "--ignore-case"]).is_empty());
+    // The GUI's form: --contains=TEXT with --source, --after and --limit pages.
+    assert_eq!(ids(&["--contains=STACK", "--ignore-case", "--source=send", &format!("--after={}", id["gzip"])]), [up]);
+    assert_eq!(ids(&["--contains=STACK", "--ignore-case", "--after=0", "--limit=1"]), [id["json"]]);
+    // The same rows as the filter language's req and resp fields, which fold ASCII the same way.
+    let q = r#"--filter=req:"stack trace" OR resp:"stack trace" OR req.body:"stack trace" OR resp.body:"stack trace""#;
+    assert_eq!(ids(&[q]), ids(&["--contains=stack trace", "--ignore-case"]));
+
+    // Without --contains there is nothing to fold: a usage error, not a silent no-op.
+    let (code, v) = run(&["history", "list", "--ignore-case"], &project, None);
+    assert_ne!(code, 0, "{v}");
+    assert_eq!(v["error"]["kind"], "usage", "{v}");
+
+    let (code, v) = run(&["history", "export", "--ignore-case"], &project, None);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("usage")), "{v}");
+
+    // A HAR export takes it too.
+    let (code, v) =
+        run(&["history", "export", "--contains=STACK trace", "--ignore-case", "--no-redact"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["entries"], 3, "{v}");
+
+    // The flag's help (the history_list tool's description too) says what it does with letters outside ASCII.
+    let (code, v) = run(&["capabilities", "history", "list"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let arg = v["data"]["args"].as_array().unwrap().iter().find(|a| a["flag"] == "--ignore-case").unwrap();
+    let help = arg["help"].as_str().unwrap();
+    assert!(help.contains("outside ASCII") && help.contains("aren't folded") && help.contains("any charset"), "{help}");
+
+    // A saved Traffic filter keeps the setting.
+    let set = br#"{"filters": [{"name": "traces", "filter": {"text": "stack trace", "contents": true, "ignoreCase": true}}]}"#;
+    let (code, v) = run(&["history", "filters", "save"], &project, Some(set));
+    assert_eq!(code, 0, "{v}");
+    let (_, v) = run(&["history", "filters", "list"], &project, None);
+    assert_eq!(v["data"]["filters"][0]["filter"]["ignoreCase"], true, "{v}");
+    assert_eq!(v["data"]["v"], 2, "{v}");
 }
 
 #[test]
