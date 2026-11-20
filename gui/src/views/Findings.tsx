@@ -1312,6 +1312,10 @@ export function FindingsView({ active }: { active: boolean }) {
           from={issueDialog.from}
           targets={issueDialog.targets}
           onClose={() => setIssueDialog(null)}
+          onPartial={() => {
+            refresh();
+            refreshIssues();
+          }}
           onMerged={(into, moved) => {
             app.toast(`Moved ${moved} finding${moved === 1 ? "" : "s"} into issue #${into}.`);
             setChecked(new Set());

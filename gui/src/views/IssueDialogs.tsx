@@ -150,17 +150,43 @@ function MetricRow({ name, metric, values, value, onPick }: { name: string; metr
  * Moves every finding of the `from` issues into one picked from `targets`. From an issue's menu
  * `from` is that issue and `targets` the others; from ticked findings both are their issues.
  */
-export function MergeDialog({ from, targets, onClose, onMerged }: { from: IssueInfo[]; targets: IssueInfo[]; onClose: () => void; onMerged: (into: number, moved: number) => void }) {
+export function MergeDialog({
+  from,
+  targets,
+  onClose,
+  onMerged,
+  onPartial,
+}: {
+  from: IssueInfo[];
+  targets: IssueInfo[];
+  onClose: () => void;
+  onMerged: (into: number, moved: number) => void;
+  /** A later batch failed after earlier ones went through: the list should show what moved. */
+  onPartial?: () => void;
+}) {
   const [into, setInto] = useState<number | null>(from.length > 1 ? from[0].id : null);
   const [filter, setFilter] = useState("");
   const { busy, error, go } = useCommand();
   const keep = targets.find((i) => i.id === into);
   const cmds = into == null ? [] : mergeCommands(into, from.map((i) => i.id));
-  // Batch after batch; one that fails stops there, and what moved before it stays moved.
+  const total = cmds.reduce((n, c) => n + c.length - 4, 0);
+  // Batch after batch; one that fails stops there, and what moved before it stays moved, so the
+  // error says how many issues were merged and the list is read again to show them.
   const merge = () =>
     go(async () => {
       let moved = 0;
-      for (const cmd of cmds) moved += (await run<{ moved: number }>(cmd)).moved;
+      let merged = 0;
+      for (const cmd of cmds) {
+        try {
+          moved += (await run<{ moved: number }>(cmd)).moved;
+        } catch (e: any) {
+          if (!merged) throw e;
+          onPartial?.();
+          throw new Error(`${merged} of ${total} issues were merged into #${into} before this; the rest weren't: ${e.message}`);
+        }
+        // The command is `findings issue merge INTO FROM...`.
+        merged += cmd.length - 4;
+      }
       return moved;
     }, (moved) => into != null && onMerged(into, moved));
   const warning = mergeWarning(keep, from);
