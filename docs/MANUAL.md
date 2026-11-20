@@ -1117,8 +1117,11 @@ byte, side by side or unified.
     header is left alone. NTLM works over HTTP/1.1 only: the proxy sends those hosts'
     requests upstream over HTTP/1.1 even when the browser speaks HTTP/2 to it.
   - **Macros:** requests that run in order with the profile's session.
-    *New macro from Traffic* lists recent requests; click them in the order they should run
-    (move them up or down), then say what to take from each response into a variable: an
+    *New macro* lists recent requests from Traffic; click them in the order they should run
+    (move them up or down), or *Add a raw request* to paste one with the origin it goes to.
+    *Edit request* opens a step's request in the message editor, where a button puts
+    `{{name}}` at the caret for each value an earlier step extracts. Then say what to take
+    from each response into a variable: an
     HTML input by name (or a `<meta name=… content=…>`), a JSON path such as `data.token`, a
     regex (group 1), a response header, or a cookie the response sets. Later steps use a
     value as `{{name}}` (also `{{username}}`, `{{password}}` and, with a TOTP secret in the
@@ -1127,8 +1130,9 @@ byte, side by side or unified.
     *Run* shows each step's request, status and history entry, and the values found, masked
     (first four characters and the length). The values become the session's latest.
     *Edit…* changes a macro in place: move steps up or down, take them out, add more from
-    Traffic, and change what is extracted (an extractor moves with its step). The macro keeps
-    its name and its place, and the session rules that run it go on running it.
+    Traffic or paste them, edit a step's request, change what is extracted (an extractor moves
+    with its step), and rename it. The macro keeps its place, and the session rules that run
+    it go on running it, under a new name too.
   - **Session rules:** what to do before a request goes out with this profile, for the
     tools you tick (proxy, send, fuzz, crawl including API import requests, scan, checks;
     none ticked means all) and a URL: a host pattern like `*.app.test` or a URL prefix like
@@ -2538,15 +2542,22 @@ Session handling (`auth macro`, `auth rule`; see Settings › Auth profiles abov
   can then set its options; `auth add` alone refuses a profile with no login, header, macro or
   rule). KIND is `regex`, `json`, `header`, `cookie` or `input`. A FILE
   step is sent to its `Host` over `--scheme` (default https) unless the request line has a
-  full URL or ORIGIN is given. `auth macro list/show/run/remove`; a macro a rule runs
-  can't be removed until the rule is.
-- `auth macro edit PROFILE NAME [--step SPEC ...] [--extract STEP:VAR=KIND:EXPR ... | --no-extract]`
-  changes a macro in place: it keeps its name and its place among the profile's macros, and the
-  session rules that run it go on running it. `--step` replaces the steps, in order; besides what
+  full URL or ORIGIN is given. FILE `-` is the request on stdin (one step only, so
+  `--step https://app.test=-` takes a request typed or piped in). A FILE step is stored with its
+  head's line endings made CRLF, as a macro run sends it. `auth macro list/show/run/remove`; a
+  macro a rule runs can't be removed until the rule is.
+- `auth macro edit PROFILE NAME [--step SPEC ...] [--extract STEP:VAR=KIND:EXPR ... | --no-extract] [--rename NEW]`
+  changes a macro in place: it keeps its place among the profile's macros, and the session rules
+  that run it go on running it. `--step` replaces the steps, in order; besides what
   `auth macro add` takes, `step:N` is the macro's own step N as it is, with its extractors
-  (`--step step:2 --step step:1` swaps two steps, `--step step:1 --step 42` adds one).
+  (`--step step:2 --step step:1` swaps two steps, `--step step:1 --step 42` adds one). To change a
+  step's request, give its new text in its place, from stdin or a file:
+  `--step step:1 --step https://app.test=-` with step 2's request (with `{{csrf}}` put in, say) on
+  stdin. A step given as text has no extractors unless `--extract` gives them.
   `--extract` replaces every extractor (STEP is a step of the edited macro) and `--no-extract`
-  removes them all. The macro is checked as `auth macro add` checks one, and a changed macro
+  removes them all. `--rename NEW` gives the macro a new name (refused when another macro has it);
+  the session rules that run it run it under the new name, and record whoever renamed it as their
+  origin. The macro is checked as `auth macro add` checks one, and a changed macro
   records whoever edited it as its origin. `auth macro show` gives its `revision`, and
   `--if-revision REV` fails with a conflict, changing nothing, when the macro has changed since.
 - Every `auth macro`, `auth rule` and `auth sign` command that changes a profile's macros, rules

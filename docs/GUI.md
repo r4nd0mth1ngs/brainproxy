@@ -203,7 +203,7 @@ defaults, in local storage (`shortcuts`), like the theme and Recent.
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps, including gzip, zlib, and raw deflate (Brotli decodes only). **Smart decode** finds the layers (URL, Base64, hex, HTML, JWT, gzip, zlib) and puts them in as steps to check or change, stopping at JSON; its note says if the 8-layer limit or a decompression bomb stopped it | `encode`, `decode`, `hash`; Smart decode: `decode auto -` (its `steps` and `stopped`) |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
-| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; a TOTP secret for one-time codes; with macros built from Traffic, edited in place (*Edit…*: steps reordered, taken out or added from Traffic, extractors), and session rules; *Record a login* also records the page's steps for a login only a browser can repeat, asks for the TOTP secret when a code was typed, and with *The login uses a passkey* puts a virtual authenticator in the recording browser, see `views/recordLogin.ts`; a recorded profile shows its browser steps and passkeys, never a key), match & replace (`views/MatchReplace.tsx`, `views/matchReplace.ts`: structured locations, what a rule applies to, a host condition, a Content-Type condition on a response rule, a replacement that is text or a script file (chosen with the file dialog, added after a confirmation that names it, listed as `script NAME` with why it is not applied when its file changed), a *Whole request (script)* location whose script may change, block or answer a request (the tester shows what it did and its answer; Traffic marks an answered row `200*` with a *script answer* tag and a note over the response, and a blocked one *blocked*; Findings tags a finding raised from a script's answer *script answer* and says so over it), a tester that sends nothing and says when a script failed, *Edit…* (or a double-click) to change a rule in place, copy as JSON and import, which names the scripts the rules would run; a *Response preset* picker (`views/rulePresets.ts`) adds a preset's ready-made rules, says beside each whether it is added already (one added from the CLI with `--host` has rules of its own and counts as not added), and its rules show in the table as any other), intercept options, proxy (status, start, the port, who can connect, invisible mode and a redirect the app uses, and restarting with them, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA (create, copy and regenerate the CA; *Install in system trust store…* asks first in a dialog that says what it changes on this OS, checks with `ca export` that the CA is still the one shown, then runs `ca install-system` on Windows (the user's Trusted Root store, after Windows' own warning) and Linux (needs root; the dialog also shows the `sudo` commands to run instead), gives the command to run on macOS, where the CLI can't, and shows how to take this CA out again by its thumbprint, since the CLI has no remove; see `views/systemTrust.ts`), rule data, project, keyboard (shortcuts, above), open source licenses (credits and NOTICE) | `auth *` (incl. `auth record start [--passkey \| --passkeys-from]`, `auth record finish [--save]` with `BRAINPROXY_SECRET_TOTP`, `auth add --keep-password --keep-totp --keep-recorded` (an edit that leaves the password empty keeps the stored one), `auth macro add/run/remove`, `auth macro show` and `auth macro edit --step step:N --extract --if-revision REV` (Edit…), `auth rule add/remove`, `query` for the Traffic picker), `rules *` (incl. `rules test`, `rules import -`, `rules edit ID --if-revision REV`, `rules presets list/add`), `intercept *`, `proxy status/start/stop/restart` (incl. `--invisible`, `--redirect`), `proxy setup show/set`, `engagement check` (the redirect), `connection *`, `ca init/export/install-system`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
+| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; a TOTP secret for one-time codes; with macros built from Traffic or pasted raw requests, a step's request edited in the message editor with `{{name}}` put in for an earlier step's value, edited in place (*Edit…*: steps reordered, taken out, added from Traffic or pasted, their requests edited, extractors, the name), and session rules; *Record a login* also records the page's steps for a login only a browser can repeat, asks for the TOTP secret when a code was typed, and with *The login uses a passkey* puts a virtual authenticator in the recording browser, see `views/recordLogin.ts`; a recorded profile shows its browser steps and passkeys, never a key), match & replace (`views/MatchReplace.tsx`, `views/matchReplace.ts`: structured locations, what a rule applies to, a host condition, a Content-Type condition on a response rule, a replacement that is text or a script file (chosen with the file dialog, added after a confirmation that names it, listed as `script NAME` with why it is not applied when its file changed), a *Whole request (script)* location whose script may change, block or answer a request (the tester shows what it did and its answer; Traffic marks an answered row `200*` with a *script answer* tag and a note over the response, and a blocked one *blocked*; Findings tags a finding raised from a script's answer *script answer* and says so over it), a tester that sends nothing and says when a script failed, *Edit…* (or a double-click) to change a rule in place, copy as JSON and import, which names the scripts the rules would run; a *Response preset* picker (`views/rulePresets.ts`) adds a preset's ready-made rules, says beside each whether it is added already (one added from the CLI with `--host` has rules of its own and counts as not added), and its rules show in the table as any other), intercept options, proxy (status, start, the port, who can connect, invisible mode and a redirect the app uses, and restarting with them, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA (create, copy and regenerate the CA; *Install in system trust store…* asks first in a dialog that says what it changes on this OS, checks with `ca export` that the CA is still the one shown, then runs `ca install-system` on Windows (the user's Trusted Root store, after Windows' own warning) and Linux (needs root; the dialog also shows the `sudo` commands to run instead), gives the command to run on macOS, where the CLI can't, and shows how to take this CA out again by its thumbprint, since the CLI has no remove; see `views/systemTrust.ts`), rule data, project, keyboard (shortcuts, above), open source licenses (credits and NOTICE) | `auth *` (incl. `auth record start [--passkey \| --passkeys-from]`, `auth record finish [--save]` with `BRAINPROXY_SECRET_TOTP`, `auth add --keep-password --keep-totp --keep-recorded` (an edit that leaves the password empty keeps the stored one), `auth macro add/run/remove` (a step given as text as `--step ORIGIN=FILE`, its file staged privately for the call), `auth macro show` and `auth macro edit --step step:N --extract --rename --if-revision REV` (Edit…), `auth rule add/remove`, `query` for the Traffic picker), `rules *` (incl. `rules test`, `rules import -`, `rules edit ID --if-revision REV`, `rules presets list/add`), `intercept *`, `proxy status/start/stop/restart` (incl. `--invisible`, `--redirect`), `proxy setup show/set`, `engagement check` (the redirect), `connection *`, `ca init/export/install-system`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
 
 ### Guided scan
 
@@ -572,7 +572,7 @@ A finding added by hand, a match-and-replace rule and a macro each have *Edit…
 dialog (`aria-modal`) that opens with the record as it is and saves only what changed, with
 the revision it was opened at (`--if-revision`), so a change made meanwhile elsewhere (an
 agent, the command line, another window) is never overwritten: the edit fails and says so.
-The record keeps its id (a rule its number, a macro its name) and its place in the list.
+The record keeps its id (a rule its number, a macro its name unless renamed) and its place in the list.
 
 - **Finding** (Findings › *Edit…*, `views/NewFinding.tsx` with `edit`, logic in
   `formFromFinding` and `findingEditArgs` of `views/manualFinding.ts`): the New finding form,
@@ -592,12 +592,23 @@ The record keeps its id (a rule its number, a macro its name) and its place in t
   one (`--host-header-test` goes with the edit). A conflict reads the rules again and closes the
   dialog, with a toast. Whether a rule is on stays with its checkbox.
 - **Macro** (Settings › Auth profiles › a macro's *Edit…*, `MacroEditor` in
-  `views/SessionHandling.tsx`, logic in `macroEditor`, `macroEditArgs` and `macroEditProblem` of
-  `views/sessionRules.ts`): reads `auth macro show`, then lists the steps (move up or down, take
-  out, add from Traffic with the picker *New macro from Traffic* uses) and the extractors, each
-  on a step that it follows as the step moves. It runs `auth macro edit` with every step
-  (`--step step:N` for one of its own, a history id for a new one) and every extractor (or
-  `--no-extract`).
+  `views/SessionHandling.tsx`, logic in `macroEditor`, `macroEditArgs`, `macroEditProblem`,
+  `editedStep`, `varsBefore` and `insertVar` of `views/sessionRules.ts`): reads `auth macro
+  show`, then shows its name and lists the steps (move up or down, take out, add from Traffic
+  with the picker *New macro* uses, or *Add a raw request*) and the extractors, each on a step
+  that it follows as the step moves. A step's *Edit request* opens its request in the message
+  editor Replay uses (`ui/HttpView.tsx`), with the origin it goes to (a pasted request's follows
+  its Host header until one is typed) and a button per value it can use (`{{csrf}}` for an
+  earlier step's extractor, `{{username}}`, `{{password}}`), put in at the caret (at the end
+  before the request is clicked), changing no other byte. A step saved unchanged (line endings
+  aside) stays what it was; an edited one is marked *edited*, a pasted one *pasted*. A save the
+  CLI warns about (a step's Host the scope doesn't list) says so in a toast. It runs `auth macro edit` with
+  every step (`--step step:N` for one of its own, a history id for a new one, `ORIGIN=FILE` for
+  one given as text, its bytes staged as a private file for the call, as Replay's race group
+  members are), every extractor (or `--no-extract`), and `--rename` when the name changed. *New
+  macro* (`MacroBuilder`) takes Traffic rows and pasted requests the same way, each with *Edit
+  request*, and runs `auth macro add`. The dev bridge stages request files as the Tauri shell
+  does (`src/requestFiles.ts`, `src-tauri/src/race_files.rs`).
 
 ## Look
 
@@ -753,12 +764,10 @@ arrays whole), so change both when the window changes. The icons are in
   typed again; `--login-request` only takes a file.
 - A literal auth password goes to `auth add` in `BRAINPROXY_SECRET_PASSWORD`, not argv. The
   login body is a template (`{{password}}` is filled at login), so it stays an argument.
-- Macros are built from Traffic entries only (the 500 most recent); a step from a raw
-  request file, or a step whose request should be edited (to add `{{name}}`), needs
-  `auth macro add` on the command line; the macro editor likewise keeps, reorders, removes
-  or adds Traffic steps but doesn't edit a step's text. A macro isn't renamed in place (session
-  rules name it). *New macro profile* starts a profile with no login from its first macro,
-  since `auth add` refuses a profile with nothing to do.
+- A macro's Traffic picker lists the 500 most recent entries; an older one is pasted as a raw
+  request. A step's request is edited as text: a Traffic row with a binary body can be a step
+  as it is, but *Edit request* refuses it. *New macro profile* starts a profile with no login
+  from its first macro, since `auth add` refuses a profile with nothing to do.
 - Traffic's Query mode runs `history list --filter` through the same paging as the contents
   search. A query the CLI refuses as invalid input isn't tried again until the text changes
   (`failPage(..., invalid)`); the toolbar shows the parser's message. Saved filters are loaded

@@ -48,7 +48,7 @@ export const getProject = () => project;
  */
 export interface CliInput {
   stdin?: string | Uint8Array;
-  /** Private staged files referenced by --also=@request:I; removed when the CLI exits. */
+  /** Private staged files referenced by --also=@request:I or --step=[ORIGIN=]@request:I; removed when the CLI exits. */
   requestFiles?: Uint8Array[];
   env?: Record<string, string>;
   /** Run against this project instead of the open one. */

@@ -1,11 +1,13 @@
 // Settings › Auth profiles › a profile's macros, session rules and request signers. A macro
-// is built by picking requests from Traffic in order and saying what to extract from each
-// response, and edited in place the same way (`auth macro edit`); a rule says, for some tools
+// is built by picking requests from Traffic in order (or pasting raw ones), editing a step's
+// request where it needs a value (`{{name}}`), and saying what to extract from each response;
+// it is edited in place the same way (`auth macro edit`); a rule says, for some tools
 // and URLs, what to do before each request goes out; a signer says how to compute a rule's
 // signature or JWT, and where its key is.
 
 import { useEffect, useRef, useState } from "react";
-import { run } from "../api";
+import { historyRequest, run } from "../api";
+import { HttpView } from "../ui/HttpView";
 import { useApp } from "../store";
 import { confirm } from "../ui/Confirm";
 import { useDialogFocus } from "../ui/dialogFocus";
@@ -19,10 +21,17 @@ import {
   KEY_ENCODINGS,
   TOOLS,
   actionLabel,
+  cleanOrigin,
+  historyOrigin,
+  inferOrigin,
+  insertVar,
+  latestOnly,
   macroAddArgs,
   macroEditArgs,
   macroEditProblem,
   macroEditor,
+  macroSavedWarning,
+  moved,
   parseParams,
   ruleAddArgs,
   ruleProblems,
@@ -30,6 +39,10 @@ import {
   signerForm,
   signerLabel,
   signerProblems,
+  stepNote,
+  stepTextProblem,
+  varsBefore,
+  withStepText,
   type Action,
   type EditorExtract,
   type EditorStep,
@@ -41,6 +54,7 @@ import {
   type SessionRule,
   type Signer,
   type SignerForm,
+  type StepText,
   type Tool,
 } from "./sessionRules";
 
@@ -126,7 +140,7 @@ export function SessionHandling(p: Props) {
               <button className="btn small" disabled={!!busy} onClick={() => runMacro(m.name)}>
                 {busy === m.name ? "Running…" : "Run"}
               </button>
-              <button className="btn small" title="Change its steps or what it extracts, in place" onClick={() => setEditingMacro(m)}>
+              <button className="btn small" title="Change its steps, their requests, what it extracts or its name, in place" onClick={() => setEditingMacro(m)}>
                 Edit…
               </button>
               <button className="btn small" onClick={() => removeMacro(m.name)}>
@@ -173,7 +187,7 @@ export function SessionHandling(p: Props) {
       ) : (
         <div className="row gap set-actions">
           <button className="btn" onClick={() => setBuilding(true)}>
-            New macro from Traffic
+            New macro
           </button>
         </div>
       )}
@@ -369,27 +383,198 @@ function TrafficPicker(p: { place: (id: number) => number; onPick: (h: Picked) =
   );
 }
 
-export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved: () => void }) {
-  const exec = useExec();
-  const [name, setName] = useState("");
-  const [steps, setSteps] = useState<Picked[]>([]);
-  const [extract, setExtract] = useState<ExtractRow[]>([]);
+/**
+ * A step's request being edited: which step (null for a new one), its text when the dialog
+ * opened, its original text, and which opening this is (each gets a fresh dialog).
+ */
+interface Editing {
+  key: string | null;
+  start: StepText;
+  was: StepText | null;
+  n: number;
+}
 
-  const toggle = (h: Picked) =>
-    setSteps((s) => (s.some((x) => x.id === h.id) ? s.filter((x) => x.id !== h.id) : [...s, h]));
-  const move = (i: number, by: number) =>
-    setSteps((s) => {
-      const out = [...s];
-      const j = i + by;
-      if (j < 0 || j >= out.length) return s;
-      [out[i], out[j]] = [out[j], out[i]];
-      return out;
+/**
+ * The text of a step to edit: the macro's own from `detail`, a Traffic row's from history, or
+ * the text it was given. Throws, with what to say, for a Traffic row whose body is binary: a
+ * step's text is UTF-8, so such a row can be a step only as it is.
+ */
+async function stepText(s: EditorStep, detail: MacroDetail | null): Promise<StepText> {
+  if (s.kind === "text") return { target: s.target, request: s.request };
+  if (s.kind === "kept") {
+    const d = detail?.steps[s.n - 1];
+    if (!d) throw new Error("The macro is still being read.");
+    return { target: d.target, request: d.request };
+  }
+  const h = await historyRequest(s.id);
+  if (h.binary) throw new Error(`Request #${s.id} has a binary body: it can be a step as it is, but a step's request is edited as text.`);
+  return { target: historyOrigin(h.entry.url), request: h.raw };
+}
+
+/** Opens a step's request in the editor dialog (`editing`), or reports why it can't. */
+function useStepEditor(detail: MacroDetail | null) {
+  const app = useApp();
+  const [editing, setEditing] = useState<Editing | null>(null);
+  // A Traffic row is read first: one that answers after another step was opened, or a paste
+  // started, is dropped rather than retarget the dialog open now.
+  const [lookups] = useState(latestOnly);
+  const open = async (s: EditorStep) => {
+    const n = lookups.next();
+    try {
+      const t = await stepText(s, detail);
+      // The original text, so saving it unchanged keeps the step what it was.
+      if (lookups.isLatest(n)) setEditing({ key: s.key, start: t, was: s.kind === "text" ? null : t, n });
+    } catch (e: any) {
+      if (lookups.isLatest(n)) app.toast(e.message, "error");
+    }
+  };
+  const paste = () => setEditing({ key: null, start: { target: "", request: "" }, was: null, n: lookups.next() });
+  const close = () => {
+    lookups.next();
+    setEditing(null);
+  };
+  return { editing, open, paste, close };
+}
+
+/**
+ * One step's request as text: the origin it goes to and the raw request, in the editor Replay
+ * uses, with buttons that put {{name}} at the caret for the values earlier steps extract.
+ */
+function StepTextDialog(p: { title: string; start: StepText; vars: string[]; onCancel: () => void; onSave: (t: StepText) => void }) {
+  const [request, setRequest] = useState(p.start.request);
+  // A pasted request's origin follows its Host header until one is typed.
+  const [target, setTarget] = useState<string | null>(p.start.target || null);
+  const origin = target ?? inferOrigin(request);
+  const t = { target: cleanOrigin(origin), request };
+  const problem = stepTextProblem(t);
+  const editor = useRef<HTMLTextAreaElement>(null);
+  const dialog = useRef<HTMLDivElement>(null);
+  useDialogFocus(dialog);
+  // A value put in before the request is clicked goes at its end, not before its method.
+  useEffect(() => {
+    const el = editor.current;
+    el?.setSelectionRange(el.value.length, el.value.length);
+  }, []);
+  const put = (name: string) => {
+    const el = editor.current;
+    const r = insertVar(request, el?.selectionStart ?? request.length, el?.selectionEnd ?? request.length, name);
+    setRequest(r.value);
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(r.caret, r.caret);
     });
+  };
+  return (
+    <div
+      className="confirm-backdrop"
+      onKeyDown={(e) => {
+        // Its own Esc: the macro dialog under it stays open.
+        if (e.key !== "Escape") return;
+        e.stopPropagation();
+        p.onCancel();
+      }}
+    >
+      <div ref={dialog} className="confirm-dialog finding-dialog sh-text-dialog" role="dialog" aria-modal="true" aria-labelledby="step-text-title">
+        <h2 id="step-text-title">{p.title}</h2>
+        <div className="form">
+          <label className="wide">
+            <span className="label">Origin it goes to</span>
+            <input className="input mono" value={origin} placeholder="https://app.test" onChange={(e) => setTarget(e.target.value)} />
+          </label>
+        </div>
+        <div className="sh-request">
+          <HttpView title="Request" value={request} onChange={setRequest} editorRef={editor} placeholder={"POST /login HTTP/1.1\nHost: app.test\n\nuser={{username}}&csrf={{csrf}}"} />
+        </div>
+        <div className="row gap sh-vars small">
+          <span className="muted">Put in a value:</span>
+          {p.vars.map((v) => (
+            <button key={v} className="btn small mono" onMouseDown={(e) => e.preventDefault()} onClick={() => put(v)} title={`Insert {{${v}}} at the caret`}>
+              {`{{${v}}}`}
+            </button>
+          ))}
+        </div>
+        <p className="muted small">
+          Values extracted by earlier steps, and the profile's username and password, go in as <span className="mono">{"{{name}}"}</span>.
+          Content-Length is set when the step runs.
+        </p>
+        {problem && request && <div className="muted small">{problem}</div>}
+        <div className="row gap finding-dialog-actions">
+          <div className="toolbar-end">
+            <button className="btn" onClick={p.onCancel}>
+              Cancel
+            </button>
+            <button className="btn primary" disabled={!!problem} title={problem ?? undefined} onClick={() => p.onSave(t)}>
+              Done
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The steps of a macro being built or edited: each can move, have its request edited, or be taken out. */
+function StepList(p: {
+  steps: EditorStep[];
+  note: (s: EditorStep) => string;
+  move: (i: number, by: number) => void;
+  edit: (s: EditorStep) => void;
+  takeOut: (s: EditorStep) => void;
+}) {
+  return (
+    <ol className="sh-steps small">
+      {p.steps.map((s, i) => (
+        <li key={s.key}>
+          <span className="mono">{s.line}</span>
+          {p.note(s) && <span className="muted"> · {p.note(s)}</span>}{" "}
+          <button className="btn small" aria-label={`Edit step ${i + 1}'s request`} title="Edit its request" onClick={() => p.edit(s)}>
+            Edit request
+          </button>
+          <button className="btn small" aria-label={`Move step ${i + 1} up`} onClick={() => p.move(i, -1)} disabled={i === 0}>
+            ↑
+          </button>
+          <button className="btn small" aria-label={`Move step ${i + 1} down`} onClick={() => p.move(i, 1)} disabled={i === p.steps.length - 1}>
+            ↓
+          </button>
+          <button className="btn small" aria-label={`Take out step ${i + 1}`} onClick={() => p.takeOut(s)}>
+            ✕
+          </button>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved: () => void }) {
+  const app = useApp();
+  const [name, setName] = useState("");
+  const [steps, setSteps] = useState<EditorStep[]>([]);
+  const [extract, setExtract] = useState<ExtractRow[]>([]);
+  const pasted = useRef(0);
+  const ed = useStepEditor(null);
+
+  const toggle = (h: Picked) => {
+    const key = `history${h.id}`;
+    setSteps((s) => (s.some((x) => x.key === key) ? s.filter((x) => x.key !== key) : [...s, { key, kind: "history", id: h.id, line: `${h.method} ${h.url}` }]));
+  };
   const setRow = (i: number, patch: Partial<ExtractRow>) => setExtract((rows) => rows.map((r, k) => (k === i ? { ...r, ...patch } : r)));
+  const saveText = (t: StepText) => {
+    const e = ed.editing;
+    if (!e) return;
+    const newKey = e.key === null ? `text${++pasted.current}` : "";
+    setSteps((s) => withStepText(s, e.key, t, e.was, newKey));
+    ed.close();
+  };
 
   const save = async () => {
-    const d = await exec(macroAddArgs(p.profile, name, steps.map((s) => s.id), extract));
-    if (d) p.onSaved();
+    const call = macroAddArgs(p.profile, name, steps, extract);
+    try {
+      const warning = macroSavedWarning(await run<{ host_warning?: string }>(call.args, { requestFiles: call.requestFiles }));
+      if (warning) app.toast(warning, "error");
+      p.onSaved();
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
   };
 
   return (
@@ -400,32 +585,24 @@ export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved
           <input className="input" value={name} placeholder="csrf" onChange={(e) => setName(e.target.value)} />
         </label>
       </div>
-      <TrafficPicker place={(id) => steps.findIndex((s) => s.id === id)} onPick={toggle} />
+      <TrafficPicker place={(id) => steps.findIndex((s) => s.key === `history${id}`)} onPick={toggle} />
+      <button className="btn small" onClick={ed.paste}>
+        Add a raw request
+      </button>
       {steps.length > 0 && (
         <>
           <h4>Steps</h4>
-          <ol className="sh-steps small">
-            {steps.map((s, i) => (
-              <li key={s.id}>
-                <span className="mono">
-                  {s.method} {s.url}
-                </span>{" "}
-                <button className="btn small" onClick={() => move(i, -1)} disabled={i === 0}>
-                  ↑
-                </button>
-                <button className="btn small" onClick={() => move(i, 1)} disabled={i === steps.length - 1}>
-                  ↓
-                </button>
-                <button className="btn small" onClick={() => toggle(s)}>
-                  ✕
-                </button>
-              </li>
-            ))}
-          </ol>
+          <StepList
+            steps={steps}
+            note={stepNote}
+            move={(i, by) => setSteps((s) => moved(s, i, by))}
+            edit={ed.open}
+            takeOut={(s) => setSteps((all) => all.filter((x) => x.key !== s.key))}
+          />
           <h4>Extract values</h4>
           <p className="muted small">
-            Later steps use a value as <span className="mono">{"{{name}}"}</span>; their parameters with the same name get it
-            too.
+            Later steps use a value as <span className="mono">{"{{name}}"}</span> (Edit request puts it in); their parameters with
+            the same name get it too.
           </p>
           {extract.map((x, i) => (
             <div key={i} className="row gap sh-extract">
@@ -468,17 +645,39 @@ export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved
           Cancel
         </button>
       </div>
+      {ed.editing && (
+        <StepTextDialog
+          key={ed.editing.n}
+          title={ed.editing.key === null ? "Add a raw request" : `Edit step ${steps.findIndex((s) => s.key === ed.editing!.key) + 1}'s request`}
+          start={ed.editing.start}
+          vars={varsBefore(
+            steps,
+            extract.map((x) => ({ key: steps[x.step - 1]?.key ?? "", var: x.var })),
+            ed.editing.key,
+          )}
+          onCancel={ed.close}
+          onSave={saveText}
+        />
+      )}
     </div>
   );
 }
 
-/** Edits a macro in place: its steps (reordered, taken out, added from Traffic) and its extractors. */
+/**
+ * Edits a macro in place: its steps (reordered, taken out, added from Traffic or pasted, their
+ * requests edited), its extractors and its name.
+ */
 function MacroEditor(p: { profile: string; name: string; onClose: () => void; onSaved: () => void }) {
+  const app = useApp();
   const [start, setStart] = useState<{ steps: EditorStep[]; extract: EditorExtract[] } | null>(null);
+  const [detail, setDetail] = useState<MacroDetail | null>(null);
   const [revision, setRevision] = useState<string | undefined>();
+  const [name, setName] = useState(p.name);
   const [steps, setSteps] = useState<EditorStep[]>([]);
   const [extract, setExtract] = useState<EditorExtract[]>([]);
   const [adding, setAdding] = useState(false);
+  const pasted = useRef(0);
+  const ed = useStepEditor(detail);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialog = useRef<HTMLDivElement>(null);
@@ -488,6 +687,7 @@ function MacroEditor(p: { profile: string; name: string; onClose: () => void; on
     run<{ macro: MacroDetail; revision: string }>(["auth", "macro", "show", "--", p.profile, p.name]).then(
       (d) => {
         const e = macroEditor(d.macro);
+        setDetail(d.macro);
         setStart(e);
         setSteps(e.steps);
         setExtract(e.extract);
@@ -497,14 +697,6 @@ function MacroEditor(p: { profile: string; name: string; onClose: () => void; on
     );
   }, []);
 
-  const move = (i: number, by: number) =>
-    setSteps((s) => {
-      const out = [...s];
-      const j = i + by;
-      if (j < 0 || j >= out.length) return s;
-      [out[i], out[j]] = [out[j], out[i]];
-      return out;
-    });
   // A step taken out takes its extractors with it.
   const takeOut = (key: string) => {
     setSteps((s) => s.filter((x) => x.key !== key));
@@ -516,16 +708,24 @@ function MacroEditor(p: { profile: string; name: string; onClose: () => void; on
     setSteps((s) => [...s, { key, kind: "history", id: h.id, line: `${h.method} ${h.url}` }]);
   };
   const setRow = (i: number, patch: Partial<EditorExtract>) => setExtract((rows) => rows.map((r, k) => (k === i ? { ...r, ...patch } : r)));
-  const problem = start ? macroEditProblem(steps, extract) : "Reading the macro…";
+  const saveText = (t: StepText) => {
+    const e = ed.editing;
+    if (!e) return;
+    const newKey = e.key === null ? `text${++pasted.current}` : "";
+    setSteps((s) => withStepText(s, e.key, t, e.was, newKey));
+    ed.close();
+  };
+  const problem = start ? macroEditProblem(steps, extract, name) : "Reading the macro…";
 
   const save = async () => {
     if (!start) return;
-    const args = macroEditArgs(p.profile, p.name, start, steps, extract, revision);
-    if (!args) return p.onClose();
+    const call = macroEditArgs(p.profile, p.name, start, steps, extract, revision, name);
+    if (!call) return p.onClose();
     setBusy(true);
     setError(null);
     try {
-      await run(args);
+      const warning = macroSavedWarning(await run<{ host_warning?: string }>(call.args, { requestFiles: call.requestFiles }));
+      if (warning) app.toast(warning, "error");
       p.onSaved();
     } catch (e: any) {
       setError(e.message);
@@ -538,33 +738,33 @@ function MacroEditor(p: { profile: string; name: string; onClose: () => void; on
       <div ref={dialog} className="confirm-dialog finding-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-macro-title">
         <h2 id="edit-macro-title">Edit macro {p.name}</h2>
         <p>
-          It keeps its name and its place, and session rules that run it go on running it. Saving a change records you as the one who set it. An extractor moves with its step.
+          It keeps its place, and session rules that run it go on running it, under a new name too. Saving a change records you as the one who set it (after a rename, of those rules too). An extractor moves with its step.
         </p>
+        <div className="form">
+          <label>
+            <span className="label">Name</span>
+            <input className="input" value={name} onChange={(e) => setName(e.target.value)} />
+          </label>
+        </div>
         <h4>Steps</h4>
-        <ol className="sh-steps small">
-          {steps.map((s, i) => (
-            <li key={s.key}>
-              <span className="mono">{s.line}</span>
-              {s.kind === "history" && <span className="muted"> · new, from #{s.id}</span>}{" "}
-              <button className="btn small" aria-label={`Move step ${i + 1} up`} onClick={() => move(i, -1)} disabled={i === 0}>
-                ↑
-              </button>
-              <button className="btn small" aria-label={`Move step ${i + 1} down`} onClick={() => move(i, 1)} disabled={i === steps.length - 1}>
-                ↓
-              </button>
-              <button className="btn small" aria-label={`Take out step ${i + 1}`} onClick={() => takeOut(s.key)}>
-                ✕
-              </button>
-            </li>
-          ))}
-        </ol>
-        {adding ? (
-          <TrafficPicker place={(id) => steps.findIndex((s) => s.key === `history${id}`)} onPick={pick} />
-        ) : (
-          <button className="btn small" disabled={!start} onClick={() => setAdding(true)}>
-            Add steps from Traffic
+        <StepList
+          steps={steps}
+          note={stepNote}
+          move={(i, by) => setSteps((s) => moved(s, i, by))}
+          edit={ed.open}
+          takeOut={(s) => takeOut(s.key)}
+        />
+        <div className="row gap">
+          {!adding && (
+            <button className="btn small" disabled={!start} onClick={() => setAdding(true)}>
+              Add steps from Traffic
+            </button>
+          )}
+          <button className="btn small" disabled={!start} onClick={ed.paste}>
+            Add a raw request
           </button>
-        )}
+        </div>
+        {adding && <TrafficPicker place={(id) => steps.findIndex((s) => s.key === `history${id}`)} onPick={pick} />}
         <h4>Extract values</h4>
         {extract.map((x, i) => (
           <div key={i} className="row gap sh-extract">
@@ -613,6 +813,16 @@ function MacroEditor(p: { profile: string; name: string; onClose: () => void; on
             </button>
           </div>
         </div>
+        {ed.editing && (
+          <StepTextDialog
+            key={ed.editing.n}
+            title={ed.editing.key === null ? "Add a raw request" : `Edit step ${steps.findIndex((s) => s.key === ed.editing!.key) + 1}'s request`}
+            start={ed.editing.start}
+            vars={varsBefore(steps, extract, ed.editing.key)}
+            onCancel={ed.close}
+            onSave={saveText}
+          />
+        )}
       </div>
     </div>
   );

@@ -461,6 +461,125 @@ fn a_macro_is_edited_in_place_and_keeps_its_place_and_its_rules() {
 }
 
 #[test]
+fn a_macro_steps_text_is_edited_from_stdin_and_runs_with_earlier_values() {
+    let env = Env::new("macro-text");
+    let port = serve();
+    let origin = format!("http://127.0.0.1:{port}");
+    let a = env.file("a.txt", &format!("GET /a?t=abc HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"));
+    let b = env.file("b.txt", &format!("GET /b HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"));
+    let add = ["auth", "macro", "add", "app", "login", "--scheme", "http", "--step", &a, "--step", &b];
+    env.ok_as(&GUI, &[&add[..], &["--extract", "1:tok=regex:t=(\\w+)"]].concat());
+    let rev = env.ok(&["auth", "macro", "show", "app", "login"])["revision"].as_str().unwrap().to_string();
+
+    // Step 2's text is replaced from stdin (the app's textarea gives \n line endings), sent to
+    // the origin given with it; step 1 is kept with its extractor.
+    let text = format!("GET /b?csrf={{{{tok}}}} HTTP/1.1\nHost: 127.0.0.1:{port}\n\n");
+    let spec = format!("{origin}=-");
+    let edit = ["auth", "macro", "edit", "app", "login", "--step", "step:1", "--step", &spec, "--if-revision", &rev];
+    let (code, v) = env.run_as(&[], &edit, Some(text.as_bytes()));
+    assert_eq!(code, 0, "{v}");
+    let d = &v["data"];
+    assert_eq!(d["changed"], true);
+    assert_eq!(d["macro"]["requests"][1], format!("GET {origin}/b?csrf={{{{tok}}}}"), "{d}");
+    let shown = env.ok(&["auth", "macro", "show", "app", "login"]);
+    let steps = &shown["macro"]["steps"];
+    // Stored with its head's line endings mended, as it is sent.
+    let mended = text.replace('\n', "\r\n");
+    assert_eq!((steps[1]["request"].as_str(), steps[1]["target"].as_str()), (Some(mended.as_str()), Some(&origin[..])));
+    assert!(steps[1]["history_id"].is_null(), "{shown}");
+    assert_eq!(steps[0]["extract"][0]["var"], "tok", "{shown}");
+    // The revision read before the edit is stale now: the same edit again changes nothing.
+    let (kind, _) = env.fails(&[], &edit, Some(b"GET /other HTTP/1.1\nHost: 127.0.0.1\n\n"));
+    assert_eq!(kind, "conflict");
+    assert_eq!(env.ok(&["auth", "macro", "show", "app", "login"])["macro"], shown["macro"]);
+
+    // Run, the edited step goes out with its line endings mended and step 1's value in place.
+    let r = env.ok(&["auth", "macro", "run", "app", "login"]);
+    let id = r["run"]["steps"][1]["history_id"].as_i64().unwrap_or_else(|| panic!("{r}")).to_string();
+    let sent = env.ok(&["history", "show", &id]);
+    let echoed = sent["response"]["body"]["content"].as_str().unwrap_or_default();
+    assert!(echoed.starts_with("GET /b?csrf=abc HTTP/1.1\r\n"), "{sent}");
+
+    // Only one step can come from stdin, and it is text.
+    let two = ["auth", "macro", "edit", "app", "login", "--step", &spec, "--step", "-"];
+    let (kind, msg) = env.fails(&[], &two, Some(text.as_bytes()));
+    assert!(kind == "invalid_input" && msg.contains("only one step"), "{kind}: {msg}");
+    let one = ["auth", "macro", "edit", "app", "login", "--step", &spec];
+    let (kind, msg) = env.fails(&[], &one, Some(b"POST / HTTP/1.1\nHost: 127.0.0.1\n\n\xff\xfe"));
+    assert!(kind == "invalid_input" && msg.contains("not UTF-8"), "{kind}: {msg}");
+    // A FILE step is stored with its head's line endings mended too.
+    let lf = env.file("lf.txt", &format!("GET /lf HTTP/1.1\nHost: 127.0.0.1:{port}\n\nbody\nline"));
+    let d = env.ok(&["auth", "macro", "add", "app", "filed", "--scheme", "http", "--step", &lf]);
+    assert_eq!(d["macro"]["requests"][0], format!("GET {origin}/lf"), "{d}");
+    let shown = env.ok(&["auth", "macro", "show", "app", "filed"]);
+    let want = format!("GET /lf HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\nbody\nline");
+    assert_eq!(shown["macro"]["steps"][0]["request"], want, "the body is left as it is");
+    // `auth macro add` takes a step from stdin too; its target comes from the Host and --scheme.
+    let (code, v) = env.run_as(
+        &[],
+        &["auth", "macro", "add", "app", "piped", "--scheme", "http", "--step", "-"],
+        Some(text.as_bytes()),
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["macro"]["requests"][0], format!("GET {origin}/b?csrf={{{{tok}}}}"), "{v}");
+
+    // Through MCP a step's text comes on stdin as well, and the agent then answers for the macro;
+    // a Host the scope doesn't list is still refused without --host-header-test.
+    let edit = ["auth", "macro", "edit", "app", "login", "--step", "step:1", "--step", &spec];
+    let (code, v) = env.run_as(&AGENT, &edit, Some(text.replace("/b?", "/c?").as_bytes()));
+    assert_eq!(code, 0, "{v}");
+    assert_eq!((v["data"]["changed"].as_bool(), v["data"]["macro"]["origin"].as_str()), (Some(true), Some("mcp")));
+    let foreign = b"GET /x HTTP/1.1\nHost: e.test\n\n";
+    let (_, msg) = env.fails(&AGENT, &edit, Some(foreign));
+    assert!(msg.contains("macro login step 2 sets Host e.test") && msg.contains("--host-header-test"), "{msg}");
+}
+
+#[test]
+fn a_renamed_macro_takes_its_rules_with_it() {
+    let env = Env::new("macro-rename");
+    let step = |name: &str, path: &str| env.file(name, &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n"));
+    let (a, b) = (step("a.txt", "/a"), step("b.txt", "/b"));
+    env.ok_as(&GUI, &["auth", "macro", "add", "app", "login", "--scheme", "http", "--step", &a]);
+    env.ok_as(&GUI, &["auth", "macro", "add", "app", "csrf", "--scheme", "http", "--step", &b]);
+    env.ok_as(&GUI, &["auth", "rule", "add", "app", "--action", "macro:login:each", "--action", "update"]);
+    env.ok_as(&GUI, &["auth", "rule", "add", "app", "--action", "macro:csrf"]);
+    let rev = env.ok(&["auth", "macro", "show", "app", "login"])["revision"].as_str().unwrap().to_string();
+
+    // A name another macro has is refused, and so is a stale revision: nothing changes.
+    let (kind, msg) = env.fails(&[], &["auth", "macro", "edit", "app", "login", "--rename", "csrf"], None);
+    assert!(kind == "invalid_input" && msg.contains("csrf"), "{kind}: {msg}");
+    let (kind, _) =
+        env.fails(&[], &["auth", "macro", "edit", "app", "login", "--rename", "x", "--if-revision", "0"], None);
+    assert_eq!(kind, "conflict");
+    // Its own name is no change.
+    let d = env.ok(&["auth", "macro", "edit", "app", "login", "--rename", "login"]);
+    assert_eq!(d["changed"], false);
+
+    let d = env.ok_as(&AGENT, &["auth", "macro", "edit", "app", "login", "--rename", "signin", "--if-revision", &rev]);
+    assert_eq!((d["changed"].as_bool(), d["macro"]["name"].as_str()), (Some(true), Some("signin")), "{d}");
+    let shown = env.ok(&["auth", "macro", "show", "app", "signin"]);
+    assert_eq!(shown["revision"], d["revision"]);
+    let (kind, _) = env.fails(&[], &["auth", "macro", "show", "app", "login"], None);
+    assert_eq!(kind, "not_found");
+    // It keeps its place; the rule that ran it runs it by its new name, and the agent answers
+    // for that rule now; the other rule is untouched.
+    let names: Vec<String> = env.ok(&["auth", "macro", "list", "app"])["macros"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["signin", "csrf"]);
+    let shown = env.ok(&["auth", "show", "app"]);
+    let rules = shown["rules"].as_array().unwrap_or_else(|| panic!("{shown}"));
+    assert_eq!(rules[0]["actions"][0], json!({"action": "run_macro", "macro": "signin", "every": 1}), "{shown}");
+    assert_eq!((rules[0]["origin"].as_str(), rules[1]["origin"].as_str()), (Some("mcp"), Some("gui")), "{shown}");
+    assert_eq!(rules[1]["actions"][0]["macro"], "csrf");
+    // The old name is free again.
+    env.ok(&["auth", "macro", "add", "app", "login", "--scheme", "http", "--step", &a]);
+}
+
+#[test]
 fn an_edited_finding_keeps_its_issue_and_write_up_where_they_belong() {
     let env = Env::new("issues");
     let add = |title: &str, url: &str| {
