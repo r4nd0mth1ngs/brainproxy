@@ -231,6 +231,8 @@ export interface FindingItem {
   issue_id?: number | null;
   /** A person's rating (`findings rate`), with the scanner's beside it; null while the scanner's stands. */
   rated?: Rated | null;
+  /** The suppression rule that marked it a false positive; null when none did, or its state changed since. */
+  suppressed_by?: number | null;
 }
 
 /** A person's rating of a scanner finding, as `findings list --all` gives it. */
