@@ -116,7 +116,8 @@ pub enum CaCmd {
         force: bool,
     },
     /// Add the CA to the system trust store. Debian/Kali: update-ca-certificates, needs root. Windows: the
-    /// current user's Trusted Root store (certutil -user), no admin needed. Not through MCP.
+    /// current user's Trusted Root store (certutil -user), no admin needed. macOS: not done here; the
+    /// error gives the `security add-trusted-cert` command to run. Not through MCP.
     InstallSystem,
 }
 
@@ -845,7 +846,18 @@ pub fn ca(home: &Path, cmd: CaCmd, out: &Out) -> Result<(), Error> {
                 "installed in the current user's Trusted Root store".into()
             });
         }
-        #[cfg(not(windows))]
+        // The Debian path below would land in /usr/local, which Homebrew makes writable without root,
+        // leaving a stray file before update-ca-certificates is found missing.
+        #[cfg(target_os = "macos")]
+        CaCmd::InstallSystem => {
+            let (_, info) = load_ca(home)?;
+            let path = info.cert_path.display().to_string().replace('\'', "'\\''");
+            return Err(Error::InvalidInput(format!(
+                "ca install-system doesn't change the macOS trust store; run this in Terminal: sudo security \
+                 add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain '{path}'"
+            )));
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
         CaCmd::InstallSystem => {
             let (ca, _) = load_ca(home)?;
             let dest = PathBuf::from("/usr/local/share/ca-certificates/brainproxy.crt");

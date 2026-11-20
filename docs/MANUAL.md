@@ -1311,7 +1311,8 @@ values, TOTP secrets, passkeys, and session tokens; `auth show` redacts them. `r
 `ca export --out` refuse to overwrite an existing file unless given `--force`, and through MCP
 `--force` is refused for them and for `ca init`, so an agent writes new files only and keeps
 the CA. `ca install-system` (adding the CA to the system trust store) isn't offered through
-MCP at all, and refuses a tool call. On Unix the files these and other `--out`/`-o` options
+MCP at all, and refuses a tool call. On macOS it changes nothing and answers with the
+`sudo security add-trusted-cert` command that adds the CA to the System keychain. On Unix the files these and other `--out`/`-o` options
 write are readable by their owner only (0600), also one `--force` overwrites.
 
 ```sh

@@ -823,6 +823,24 @@ fn ca_install_system_refuses_a_tool_call_before_it_touches_anything() {
     assert!(out.contains("refused through MCP"), "{out}");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn ca_install_system_on_macos_gives_the_keychain_command_instead_of_writing_anything() {
+    let p = tmp_project("ca-install-macos");
+    let home = p.parent().unwrap().join("home");
+    let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .env("BRAINPROXY_HOME", &home)
+        .args(["--format", "json", "--project"])
+        .arg(&p)
+        .args(["ca", "install-system"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("sudo security add-trusted-cert"), "{out}");
+    assert!(out.contains("ca.pem"), "{out}");
+}
+
 #[test]
 fn an_agent_sends_a_foreign_host_only_as_a_stated_host_header_test() {
     let port = serve(2);

@@ -1,7 +1,7 @@
 // Settings › TLS / CA › Install in system trust store: what `ca install-system` changes on this
-// OS, and what its result means. The CLI writes the Debian store on every system but Windows,
-// so on macOS the app doesn't run it (it would fail, or leave a stray file under a
-// Homebrew-owned /usr/local) and gives the command to run instead.
+// OS, and what its result means. The CLI installs only on Windows and Debian-family Linux; on
+// macOS it refuses with the keychain command, so the app doesn't run it there and shows that
+// command instead.
 
 export type TrustOs = "windows" | "mac" | "linux";
 
@@ -107,7 +107,7 @@ export function trustPlan(os: TrustOs, certPath: string, sha1?: string): TrustPl
       store: "the macOS System keychain",
       args: null,
       changes: [
-        `On macOS the app can't do this itself: brainproxy's ca install-system only knows Windows and Debian-family Linux. Run the command below in Terminal to add ${certPath} to the System keychain as a trusted root.`,
+        `On macOS the app can't do this itself: brainproxy's ca install-system only installs on Windows and Debian-family Linux. Run the command below in Terminal to add ${certPath} to the System keychain as a trusted root.`,
         TRUST_ALL,
         KEY,
       ],
