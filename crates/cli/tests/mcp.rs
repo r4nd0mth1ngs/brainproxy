@@ -758,6 +758,27 @@ fn an_agent_cannot_replace_a_persons_layouts_or_files() {
 }
 
 #[test]
+fn ca_install_system_refuses_a_tool_call_before_it_touches_anything() {
+    // The home is under a regular file, so no CA can be loaded or made there: were the refusal
+    // gone, the command would fail before reaching any trust store, and this test with it.
+    let p = tmp_project("ca-install-system");
+    let blocker = p.parent().unwrap().join("not-a-dir");
+    std::fs::write(&blocker, "").unwrap();
+    let home = blocker.join("home");
+    let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .env("BRAINPROXY_MCP_CALL", "1")
+        .env("BRAINPROXY_HOME", &home)
+        .args(["--format", "json", "--project"])
+        .arg(&p)
+        .args(["ca", "install-system"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("refused through MCP"), "{out}");
+}
+
+#[test]
 fn an_agent_sends_a_foreign_host_only_as_a_stated_host_header_test() {
     let port = serve(2);
     let mut m = Mcp::start(&tmp_project("host"), &[]);
@@ -1422,6 +1443,7 @@ fn a_modern_request_is_refused_what_a_handshake_one_is() {
         "connection_review",
         "findings_issue_review",
         "report_summary_review",
+        "ca_install_system",
     ] {
         assert!(!names.contains(&name), "{name} is listed to a modern client");
         let modern = m.modern("tools/call", json!({"name": name, "arguments": {}}));

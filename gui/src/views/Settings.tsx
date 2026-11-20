@@ -54,6 +54,7 @@ import NOTICE from "../../../NOTICE?raw";
 import { Keyboard } from "./Keyboard";
 import { passwordArgs } from "./authPassword.ts";
 import { useActions } from "../ui/useActions.ts";
+import { SystemTrustDialog } from "./SystemTrust.tsx";
 
 type Sub = "auth" | "rules" | "intercept" | "proxy" | "connections" | "ca" | "updates" | "project" | "keyboard" | "licenses";
 
@@ -1111,6 +1112,7 @@ function Ca() {
   const app = useApp();
   const exec = useRunner();
   const [ca, setCa] = useState<{ cert_path: string; pem: string; sha256: string } | null>(null);
+  const [trusting, setTrusting] = useState(false);
 
   // `ca export` creates the CA on first use, like the proxy does.
   const load = async () => setCa((await exec<{ cert_path: string; pem: string; sha256: string }>(["ca", "export"])) ?? null);
@@ -1155,8 +1157,12 @@ function Ca() {
               question="Replace the CA? Every client that trusts the old one must trust the new one."
               onConfirm={() => init(true)}
             />
+            <button className="btn" onClick={() => setTrusting(true)}>
+              Install in system trust store…
+            </button>
           </div>
           <pre className="code set-pem">{ca.pem}</pre>
+          {trusting && <SystemTrustDialog certPath={ca.cert_path} pem={ca.pem} sha256={ca.sha256} close={() => setTrusting(false)} />}
         </>
       )}
       <h3>Trust it</h3>
