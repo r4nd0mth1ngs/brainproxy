@@ -854,6 +854,8 @@ fn replay_tabs_are_saved_in_the_project() {
     let project = tmp_project("replay-tabs");
     let (code, v) = run(&["replay", "tabs", "list"], &project, None);
     assert_eq!((code, v["data"]["count"].as_u64()), (0, Some(0)), "{v}");
+    // None saved yet is format 1, which 0.9.0 saves over.
+    assert_eq!(v["data"]["v"], 1, "{v}");
 
     let req = "GET /?k=«auth:app:query:k» HTTP/1.1\nHost: 127.0.0.1\n\n";
     let set = serde_json::json!({"tabs": [
@@ -940,8 +942,16 @@ fn replay_tabs_are_saved_in_the_project() {
     let (_, v) = run(&["replay", "tabs", "list"], &project, None);
     assert_eq!((&v["data"]["count"], &v["data"]["rev"]), (&0.into(), &3.into()), "{v}");
 
+    // Binary WebSocket messages are kept as typed, in format 2; 0.9.0 (format 1) won't save over them.
+    let set = br#"{"tabs": [{"kind": "ws", "request": "GET / HTTP/1.1\n\n", "messages": ["hi", {"hex": "00 ff"}, {"base64": "AP8="}]}]}"#;
+    let (code, v) = run(&["replay", "tabs", "save"], &project, Some(set));
+    assert_eq!(code, 0, "{v}");
+    let (_, v) = run(&["replay", "tabs", "list"], &project, None);
+    assert_eq!(v["data"]["v"], 2, "{v}");
+    assert_eq!(v["data"]["tabs"][0]["messages"], serde_json::json!(["hi", {"hex": "00 ff"}, {"base64": "AP8="}]));
+
     // A set saved by a newer version isn't saved over (its new fields would be lost), but lists.
-    let newer = r#"{"v":2,"rev":7,"tabs":[{"kind":"grpc","request":""}]}"#;
+    let newer = r#"{"v":3,"rev":7,"tabs":[{"kind":"grpc","request":""}]}"#;
     brainproxy_core::store::Store::open(&project).unwrap().meta_set("replay.tabs", Some(newer)).unwrap();
     let (code, v) = run(&["replay", "tabs", "save"], &project, Some(br#"{"tabs": []}"#));
     assert_eq!(v["error"]["kind"], "conflict", "{v}");
@@ -950,9 +960,9 @@ fn replay_tabs_are_saved_in_the_project() {
     let (_, v) = run(&["replay", "tabs", "list"], &project, None);
     assert_eq!(
         (&v["data"]["tabs"][0]["kind"], &v["data"]["v"], &v["data"]["rev"]),
-        (&"grpc".into(), &2.into(), &7.into())
+        (&"grpc".into(), &3.into(), &7.into())
     );
-    assert_eq!(run(&["replay", "tabs", "list", "--summary"], &project, None).1["data"]["v"], 2);
+    assert_eq!(run(&["replay", "tabs", "list", "--summary"], &project, None).1["data"]["v"], 3);
 }
 
 #[test]

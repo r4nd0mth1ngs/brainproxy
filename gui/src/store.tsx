@@ -8,6 +8,7 @@ import type { Mark } from "./views/payloadMarks";
 import { proxyControl, type ProxyControl } from "./views/proxyPort";
 import { clearReplayTabs } from "./views/replayCalls";
 import type { ReplayOptions } from "./views/replayOptions";
+import type { WsOut } from "./views/ws";
 import { LIST_ARGS, NEWER, closingSaves, fromSaved, newerFormat, revisions, saver, toSaved } from "./views/replayTabs";
 import type { HistoryPick } from "./views/trafficActions";
 
@@ -33,7 +34,7 @@ export interface Handoff {
   /** `raw` holds a binary body, one char per byte (see `bodyText`); send it with `textBytes(raw, true)`. */
   binary?: boolean;
   /** A WebSocket handshake: Replay opens it in WebSocket mode with these messages to send. */
-  ws?: string[];
+  ws?: WsOut[];
   /** Parts of `raw` Replay highlights: a finding's payload (see payloadMarks.ts). */
   marks?: Mark[];
   /** The finding the request is the attack of: Replay can compare it with its baseline. */

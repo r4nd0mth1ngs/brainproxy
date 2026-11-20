@@ -643,8 +643,16 @@ Edit a raw request and send it as often as you like, in separate tabs.
   same as `brainproxy send req.http --also cart.http --sequence single` (or `separate`), with
   the active tab's options as flags.
 - **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
-  handshake and the messages to send (text, separated by a line with `---`), then
-  **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the
+  handshake and the messages to send, separated by a line with `---`, then
+  **Connect and send**. A line with `--- hex` or `--- base64` instead starts a binary
+  message written that way (hex ignores spaces, line breaks and colons; base64 may be
+  URL-safe or unpadded), and `--- text` a text one. A blank message after a plain `---`
+  is skipped; after a named separator it is sent empty. A message line that would read as
+  a separator is written with a backslash before it (`\---`), which isn't sent. The box's
+  toolbar counts the messages, and a binary one that doesn't decode is named there and
+  stops the send before anything goes out. Send to Replay takes text and binary messages,
+  binary ones with their bytes exactly (as hex, or base64 over 16 KB); binary messages are
+  listed as hex and their printable ASCII, and open in the Hex view. brainproxy opens a new connection (with a fresh key), sends the
   messages, and lists what comes back for **Listen** seconds after the last one, or until a
   reply matches **Until**. Each run is recorded like proxied traffic, as it happens; with
   **Don't record** on, only the handshake gets a row, without its content. Their Options are
@@ -660,7 +668,7 @@ Edit a raw request and send it as often as you like, in separate tabs.
 - **Kept with the project:** open tabs are saved in the project file a moment after you
   change them and when you close it, and come back when you open it again (copies made with
   `project save` or *Save as…* have them too). A tab keeps its title, target, request (or
-  handshake and messages), Listen and Until, a finding's highlighted payload and the finding
+  handshake and messages, binary ones as typed), Listen and Until, a finding's highlighted payload and the finding
   it came from, and its Options except **Don't record**, which
   is chosen again each time (so a reopened tab, or one an agent prepared, never sends
   unrecorded); responses and the ‹ › send history are not kept. Requests are kept exactly as typed, auth placeholders included. If saving fails
@@ -674,7 +682,9 @@ Edit a raw request and send it as often as you like, in separate tabs.
   `replay tabs list` returns them in full, so anyone with a copy of the project file can
   read them: replace them with `«auth:…»` placeholders before you keep or share the
   project. A project whose tabs were saved by a newer brainproxy shows them but doesn't
-  save over them.
+  save over them. Tabs holding a binary WebSocket message are saved in a newer format
+  (2), so brainproxy 0.9.0 and older show them but don't save over them; other tabs stay
+  in the format those read and save.
 
 ### Fuzzer
 Mark payload positions with `§value§` (*Add §*, *Auto §* for every parameter), choose an
@@ -1326,6 +1336,7 @@ brainproxy ws list                                        # WebSocket connection
 brainproxy ws messages 3 --contains token                 # their messages, both ways
 brainproxy ws send --from 3 -m '{"op":"whoami"}' --until whoami   # replay with a new connection
 echo '{"messages":["token=..."]}' | brainproxy ws send --from 3 --input-json   # messages off the command line
+echo '{"messages":[{"hex":"08 96 01"},{"base64":"AJ+Slg=="}]}' | brainproxy ws send --from 3 --input-json   # binary
 
 brainproxy sse list                                       # event streams (text/event-stream) seen by the proxy
 brainproxy sse events 2 --contains token                  # a stream's events; sse event 41 shows one

@@ -5,13 +5,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+use base64::Engine as _;
 use brainproxy_core::http::{RawRequest, WireReader};
 use brainproxy_core::ws::{
     accept_key, close_payload, encode_frame, parse_frame, random_mask, Assembler, Deflate, Direction, MAX_MESSAGE,
     OP_BINARY, OP_CLOSE, OP_PING, OP_PONG, OP_TEXT,
 };
 use flate2::{Compress, Compression, FlushCompress};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -47,6 +48,13 @@ impl Env {
 
     /// Runs a command with `stdin`, expecting success.
     fn ok_with_stdin(&self, args: &[&str], stdin: &[u8]) -> Value {
+        let (code, v) = self.run_with_stdin(args, stdin);
+        assert_eq!(code, 0, "{args:?} -> {v}");
+        v["data"].clone()
+    }
+
+    /// Runs a command with `stdin`: its exit code and JSON envelope.
+    fn run_with_stdin(&self, args: &[&str], stdin: &[u8]) -> (i32, Value) {
         use std::io::Write;
         let mut child = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
             .args(["--format", "json", "--project"])
@@ -62,8 +70,7 @@ impl Env {
         let _ = child.stdin.take().unwrap().write_all(stdin);
         let out = child.wait_with_output().unwrap();
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(out.status.code(), Some(0), "{args:?} -> {v}");
-        v["data"].clone()
+        (out.status.code().unwrap(), v)
     }
 
     fn ok(&self, args: &[&str]) -> Value {
@@ -586,6 +593,57 @@ fn ws_send_reads_messages_from_stdin() {
     let _ = child.stdin.take().unwrap().write_all(br#"{"mesages": []}"#);
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+#[test]
+fn ws_send_reads_binary_messages_from_stdin() {
+    let env = Env::new("stdin-binary");
+    let port = spawn_ws_echo();
+    let url = format!("ws://127.0.0.1:{port}/bin");
+    // Text, then binary as hex and as base64, in order; the echo answers each with its own opcode.
+    let input = br#"{"messages": ["hi", {"hex": "00 ff 0a"}, {"base64": "AJ+Slg=="}]}"#;
+    let r = env.ok_with_stdin(&["ws", "send", "--url", &url, "--input-json", "--max-messages", "3"], input);
+    assert_eq!(r["stopped"], "max-messages", "{r}");
+    let sent: Vec<(Value, Value)> = r["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["direction"] == "to-server" && m["opcode"] != "close")
+        .map(|m| (m["opcode"].clone(), m["payload"]["content"].clone()))
+        .collect();
+    assert_eq!(
+        sent,
+        [(json!("text"), json!("hi")), (json!("binary"), json!("AP8K")), (json!("binary"), json!("AJ+Slg=="))],
+        "{r}"
+    );
+    // The last reply before the close: the echo of the base64 message, binary too.
+    let echo =
+        r["messages"].as_array().unwrap().iter().rfind(|m| m["direction"] == "to-client" && m["opcode"] != "close");
+    let echo = echo.unwrap();
+    assert_eq!((echo["opcode"].as_str(), echo["payload"]["encoding"].as_str()), (Some("binary"), Some("base64")));
+    let mut want = b"echo: ".to_vec();
+    want.extend_from_slice(&[0, 159, 146, 150]);
+    assert_eq!(echo["payload"]["content"], base64::engine::general_purpose::STANDARD.encode(&want));
+    // Recorded with the bytes as sent.
+    let conn = env.closed_connection();
+    let recorded =
+        env.ok(&["ws", "messages", &conn["id"].to_string(), "--opcode", "binary", "--direction", "to-server"]);
+    assert_eq!(recorded["items"][0]["payload"]["content"], "AP8K");
+
+    // A message that doesn't decode is refused before anything is sent, naming it.
+    let before = env.ok(&["ws", "list"])["items"].as_array().unwrap().len();
+    for (bad, what) in [(r#"{"hex": "0g"}"#, "messages[1]: hex"), (r#"{"base64": "A"}"#, "messages[1]: base64")] {
+        let input = format!(r#"{{"messages": ["first", {bad}]}}"#);
+        let (code, v) = env.run_with_stdin(&["ws", "send", "--url", &url, "--input-json"], input.as_bytes());
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+        assert!(msg.contains(what), "{msg}");
+    }
+    let (code, v) =
+        env.run_with_stdin(&["ws", "send", "--url", &url, "--input-json"], br#"{"messages": [{"bytes": [0]}]}"#);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains(r#"{"hex": "..."}"#), "{v}");
+    assert_eq!(env.ok(&["ws", "list"])["items"].as_array().unwrap().len(), before);
 }
 
 #[test]

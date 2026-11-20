@@ -7,6 +7,7 @@
 import type { RepeaterTab } from "../store";
 import { marksFromSaved, type Mark } from "./payloadMarks.ts";
 import { optionsFromSaved, savedOptions, type SavedOptions } from "./replayOptions.ts";
+import { isWsOut, type WsOut } from "./ws.ts";
 
 /** One tab as `replay tabs save` takes it. */
 export interface SavedTab {
@@ -16,7 +17,8 @@ export interface SavedTab {
   /** The raw request, or a WebSocket tab's handshake. */
   request: string;
   binary?: boolean;
-  messages?: string[];
+  /** A WebSocket tab's messages: text, or binary as `{hex}` / `{base64}` as typed. */
+  messages?: WsOut[];
   wait?: number;
   until?: string;
   /** How the tab sends; never Don't record (see savedOptions). */
@@ -42,8 +44,11 @@ export const SUMMARY_ARGS = ["replay", "tabs", "list", "--summary"];
 /** A save over the set at `rev`; one saved elsewhere since fails with a conflict. */
 export const saveArgs = (rev: number) => [...SAVE_ARGS, "--if-revision", String(rev)];
 
-/** The format this build reads and writes. A newer set has fields this one would drop. */
-const FORMAT = 1;
+/**
+ * The newest format this build reads and writes; a newer set has fields this one would drop.
+ * 2 added binary WebSocket messages (the CLI writes 2 only for a set holding one).
+ */
+const FORMAT = 2;
 /** Longest WebSocket Listen, in seconds (`ws send --wait` refuses more). */
 export const MAX_WAIT = 86400;
 
@@ -103,7 +108,7 @@ export function fromSaved(data: unknown, nextKey: () => number, firstNumber = 1)
     const key = nextKey();
     const tab: RepeaterTab = { key, title: str(t.title) || String(tabs.length + firstNumber), target: str(t.target), raw: str(t.request) };
     if (t.kind === "ws") {
-      tab.ws = Array.isArray(t.messages) ? t.messages.filter((m): m is string => typeof m === "string") : [];
+      tab.ws = Array.isArray(t.messages) ? t.messages.filter(isWsOut) : [];
       if (typeof t.wait === "number" && t.wait >= 0 && t.wait <= MAX_WAIT) tab.wsWait = t.wait;
       if (t.until) tab.wsUntil = str(t.until);
     } else {

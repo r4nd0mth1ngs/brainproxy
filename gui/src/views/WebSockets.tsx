@@ -1,8 +1,8 @@
 // Proxy → WebSockets: connections the proxy relayed (or Replay opened) and their messages;
 // and Replay's WebSocket mode (`ws send`).
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { bodyText, cancelCli, historyRequest, hostOf, isBinary, pathOf, requireWhole, run, type Body } from "../api";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { bodyText, cancelCli, historyRequest, hostOf, isBinary, pathOf, requireWhole, run } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
@@ -12,7 +12,23 @@ import { usePoll } from "../ui/usePoll";
 import { beginCall, endCall, failureText, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
 import { optionsProblem } from "./replayOptions";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
-import { arrow, joinMessages, splitMessages, wsOrigin, wsSendArgs, wsSendInput, type WsConnection, type WsMessage, type WsSendResult } from "./ws";
+import {
+  arrow,
+  connectionMessages,
+  HANDOFF_MAX,
+  joinMessages,
+  messagesSummary,
+  payloadPreview,
+  replayMessage,
+  splitMessages,
+  wsOrigin,
+  wsSendArgs,
+  wsSendInput,
+  type WsConnection,
+  type WsMessage,
+  type WsOut,
+  type WsSendResult,
+} from "./ws";
 import { MAX_WAIT } from "./replayTabs";
 
 const PREVIEW = 300;
@@ -26,10 +42,7 @@ async function wholeMessage(connection: number, id: number): Promise<WsMessage> 
   return m;
 }
 
-const preview = (b: Body) => {
-  const t = isBinary(b) ? `(binary, ${b.length ?? "?"} bytes)` : bodyText(b);
-  return t.length > PREVIEW ? t.slice(0, PREVIEW) + "…" : t;
-};
+const preview = (m: WsMessage) => payloadPreview(m, PREVIEW);
 
 const CONN_COLUMNS: Column<WsConnection>[] = [
   { key: "id", label: "#", width: 50, value: (r) => r.id, align: "right" },
@@ -48,13 +61,13 @@ const MSG_COLUMNS: Column<WsMessage>[] = [
   { key: "dir", label: "", width: 28, value: (r) => r.direction, render: (r) => <span title={r.direction}>{arrow(r.direction)}</span> },
   { key: "opcode", label: "Type", width: 60, value: (r) => r.opcode },
   { key: "length", label: "Length", width: 70, value: (r) => r.length ?? null, align: "right" },
-  { key: "payload", label: "Payload", width: 460, value: (r) => preview(r.payload) },
+  { key: "payload", label: "Payload", width: 460, value: preview },
   { key: "intercept", label: "Intercept", width: 80, value: (r) => r.intercept ?? null },
   { key: "time", label: "Time", width: 170, value: (r) => r.time ?? null },
 ];
 
 /** A Replay handoff for a connection: its handshake and the given messages. */
-async function replayHandoff(c: WsConnection, messages: string[]): Promise<Omit<RepeaterTab, "key">> {
+async function replayHandoff(c: WsConnection, messages: WsOut[]): Promise<Omit<RepeaterTab, "key">> {
   if (c.history_id == null) throw new Error(`Connection #${c.id} has no recorded handshake`);
   const h = await historyRequest(c.history_id);
   return { raw: h.raw, target: wsOrigin(c.url), ws: messages, title: `WS ${pathOf(c.url.replace(/^ws/, "http")).slice(0, 20)}` };
@@ -108,19 +121,21 @@ export function WebSockets({ active }: { active: boolean }) {
     };
   }, [current, selected, app.toast]);
 
-  const toReplay = (c: WsConnection, msgs: string[]) =>
+  const toReplay = (c: WsConnection, msgs: WsOut[]) =>
     replayHandoff(c, msgs).then(app.sendToRepeater, (e) => app.toast(e.message, "error"));
 
   const connMenu = (c: WsConnection, ev: React.MouseEvent) =>
     open(ev, [
       {
         label: "Send to Replay",
+        // `--opcode` takes one type: each type's first ones, merged in order.
         action: () =>
-          run<{ items: WsMessage[] }>(["ws", "messages", String(c.id), "--direction", "to-server", "--opcode", "text", "--limit", "20", "--max-body", "2000000"])
-            .then((d) => {
-              d.items.forEach((m) => requireWhole(m.payload, `Message #${m.id}`));
-              return toReplay(c, d.items.map((m) => bodyText(m.payload)));
-            })
+          Promise.all(
+            ["text", "binary"].map((op) =>
+              run<{ items: WsMessage[] }>(["ws", "messages", String(c.id), "--direction", "to-server", "--opcode", op, "--limit", String(HANDOFF_MAX), "--max-body", "2000000"]),
+            ),
+          )
+            .then(([text, binary]) => toReplay(c, connectionMessages(text.items, binary.items)))
             .catch((e) => app.toast(e.message, "error")),
       },
       { label: "Copy URL", action: () => navigator.clipboard.writeText(c.url) },
@@ -128,15 +143,15 @@ export function WebSockets({ active }: { active: boolean }) {
 
   const msgMenu = (m: WsMessage, ev: React.MouseEvent) =>
     open(ev, [
-      // Replay sends text messages; binary ones go with `ws send --resend ID`.
-      ...(m.opcode === "text"
+      // Replay sends text and binary messages; control frames aren't messages to send.
+      ...(m.opcode === "text" || m.opcode === "binary"
         ? [
             {
               label: "Send to Replay",
               action: () =>
                 conn &&
                 wholeMessage(conn.id, m.id!)
-                  .then((x) => toReplay(conn, [bodyText(x.payload)]))
+                  .then((x) => toReplay(conn, [replayMessage(x)]))
                   .catch((e) => app.toast(e.message, "error")),
             },
           ]
@@ -188,6 +203,7 @@ export function WebSockets({ active }: { active: boolean }) {
             title={full ? `${arrow(full.direction)} ${full.opcode} #${full.id}${full.compressed ? " (compressed)" : ""}` : "Message"}
             value={full ? bodyText(full.payload) : ""}
             binary={isBinary(full?.payload)}
+            opensIn={full?.opcode === "binary" ? "hex" : "raw"}
             placeholder="Select a message"
           />
         </Split>
@@ -248,18 +264,28 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
     };
   }, [addReplayEditor, commit]);
 
+  const messages = useMemo(() => splitMessages(text), [text]);
+  const summary = useMemo(() => messagesSummary(messages), [messages]);
+
   const send = async () => {
     const host = /^host:\s*(\S+)/im.exec(raw)?.[1];
     const to = target || (host ? `${/:443$/.test(host) ? "https" : "http"}://${host.replace(/:443$/, "")}` : "");
     if (!to) return app.toast("Set a target (ws://, wss://, http:// or https://host[:port]) or a Host header", "error");
     const problem = optionsProblem(options);
     if (problem) return app.toast(problem, "error");
+    // A binary message that doesn't decode stops the send before anything goes out.
+    let stdin: string;
+    try {
+      stdin = wsSendInput(raw, messages);
+    } catch (e: any) {
+      return app.toast(e.message, "error");
+    }
     setTarget(to);
     const key = tab.key;
     const id = beginCall(key, "replay-ws-send");
     let r: WsSendResult | string;
     try {
-      r = await run<WsSendResult>(wsSendArgs({ target: to, wait, until: until || undefined, options }), { stdin: wsSendInput(raw, splitMessages(text)), call: id });
+      r = await run<WsSendResult>(wsSendArgs({ target: to, wait, until: until || undefined, options }), { stdin, call: id });
     } catch (e: any) {
       r = failureText(e, "ws");
     }
@@ -310,7 +336,11 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
           <HttpView title="Handshake" value={raw} onChange={setRaw} />
           <div className="col fill">
             <div className="toolbar">
-              <span className="label">Messages to send (text), separated by a line with ---</span>
+              <span className="label" title="A line with --- starts the next text message; --- hex or --- base64 starts a binary one written that way">
+                Messages to send, separated by a line with --- (--- hex or --- base64 before a binary one)
+              </span>
+              <span className="grow" />
+              <span className={summary.problem ? "s4" : "muted"}>{summary.text}</span>
             </div>
             <textarea className="input mono fill" spellCheck={false} value={text} onChange={(e) => setText(e.target.value)} placeholder={'{"type":"subscribe"}\n---\n{"type":"ping"}'} />
           </div>
@@ -323,7 +353,7 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
               { key: "dir", label: "", width: 28, value: (r) => r.direction, render: (r) => <span title={r.direction}>{arrow(r.direction)}</span> },
               { key: "opcode", label: "Type", width: 60, value: (r) => r.opcode },
               { key: "ms", label: "At", width: 70, value: (r) => r.elapsed_ms ?? null, render: (r) => `${r.elapsed_ms ?? 0} ms`, align: "right" },
-              { key: "payload", label: "Payload", width: 380, value: (r) => preview(r.payload) },
+              { key: "payload", label: "Payload", width: 380, value: preview },
             ]}
             rowKey={(r) => r.idx}
             selected={current}
@@ -335,6 +365,7 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
             title={shown ? `${arrow(shown.direction)} ${shown.opcode}` : typeof result === "object" && result && !result.upgraded ? "Response" : "Message"}
             value={shown ? bodyText(shown.payload) : typeof result === "object" && result && !result.upgraded && result.response ? bodyText(result.response.body) : ""}
             binary={isBinary(shown?.payload)}
+            opensIn={shown?.opcode === "binary" ? "hex" : "raw"}
             placeholder="Select a message"
           />
         </Split>
