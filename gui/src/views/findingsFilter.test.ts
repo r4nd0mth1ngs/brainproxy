@@ -166,6 +166,16 @@ test("the risk chips count what the list would show: closed, filtered and compar
   assert.equal(inView(items[2], { ...view, compare: { seen, want: "new" } }), false);
 });
 
+test("the search finds a renamed issue's findings by the issue's title, and counts them", () => {
+  const items = [item({ id: 1, risk: "high", issue_id: 7 }), item({ id: 2, risk: "low", issue_id: 8 }), item({ id: 3, risk: "low", issue_id: null })];
+  const view = { hideClosed: true, filter: { ...NO_FILTER, text: "comments xss" }, issueTitles: new Map([[7, "Stored XSS in comments"]]) };
+  assert.deepEqual(items.map((f) => inView(f, view)), [true, false, false]);
+  assert.deepEqual(riskCounts(items, view), { high: 1 });
+  // Without the titles, the finding's own fields only.
+  assert.equal(inView(items[0], { ...view, issueTitles: undefined }), false);
+  assert.ok(matchesFinding(items[0], { ...NO_FILTER, text: "comments" }, "Stored XSS in comments"));
+});
+
 test("a repro pack replaces a file only when the save dialog asked about it", () => {
   assert.deepEqual(reproCommand(9, "/w/finding-9.json", true), ["findings", "repro", "9", "--output", "/w/finding-9.json", "--force"]);
   assert.deepEqual(reproCommand(9, "/w/finding-9.json", false), ["findings", "repro", "9", "--output", "/w/finding-9.json"]);

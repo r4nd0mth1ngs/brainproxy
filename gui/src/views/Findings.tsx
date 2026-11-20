@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { bodyText, historyRequest, isBinary, MAX_BODY, rawResponse, run, inTauri, type Finding, type FindingEvent, type FindingItem, type HistoryEntry, type Risk } from "../api";
 import { originOf, useApp } from "../store";
 import { ask, confirm } from "../ui/Confirm";
-import { Menu, useMenu } from "../ui/Menu";
+import { Menu, type MenuItem, useMenu } from "../ui/Menu";
 import { chooseSave } from "../ui/chooseSave.ts";
 import { saveFailure } from "../ui/savePath.ts";
 import { HttpView } from "../ui/HttpView";
@@ -57,6 +57,8 @@ import {
   withDraft,
 } from "./findingsTriage.ts";
 import { heldNote, loadAll, type ListPage, type Loaded } from "./findingsPages.ts";
+import { CvssDialog, MergeDialog, SplitDialog } from "./IssueDialogs";
+import { cvssLabel, issueActionProblems, type IssueInfo, issueMap, issuesArgs, pickedActions, titleCommand } from "./issueTools.ts";
 import { addedBy } from "./manualFinding";
 import { isScriptAnswer, SCRIPT_ANSWER_NOTE } from "./matchReplace.ts";
 import { openVerifyDiff, verifyFinding, VerifyStrip } from "./PayloadCompare.tsx";
@@ -75,6 +77,8 @@ const RANK: Record<Risk, number> = { critical: 0, high: 1, medium: 2, low: 3, in
 const LIVE_STATES = STATES.map((s) => s.id).join(",");
 
 type Compare = "all" | Seen;
+/** The issue dialog open now, if any. */
+type IssueDialogState = { kind: "cvss"; issue: IssueInfo } | { kind: "merge"; from: IssueInfo[]; targets: IssueInfo[] } | { kind: "split"; issue: IssueInfo } | null;
 const COMPARE: { id: Compare; label: string; title: string }[] = [
   { id: "all", label: "All findings", title: "Every finding in the project" },
   { id: "new", label: "New in", title: "First found by this scan" },
@@ -94,7 +98,11 @@ export function RiskBadge({ risk }: { risk: Risk }) {
 interface Group {
   key: string;
   alert: string;
+  /** The alert's name, as its first finding has it. */
   name: string;
+  /** The issue's own title where it has one, else `name`. */
+  title: string;
+  issue: IssueInfo | undefined;
   host: string;
   risk: Risk;
   items: FindingItem[];
@@ -104,7 +112,15 @@ export function FindingsView({ active }: { active: boolean }) {
   const app = useApp();
   // Every triage state but removed: removed findings added by hand stay in the project for
   // comparisons, not in the list. Read in pages, so a big project isn't cut short unseen.
-  const [data, refresh] = usePoll<Loaded>(() => loadAll((args) => run<ListPage>(args), LIVE_STATES), 5000, active);
+  // With the issues' titles and CVSS ratings, which the findings list doesn't carry; read
+  // together, so a merge or split shows in both at once.
+  const [data, refresh] = usePoll<Loaded & { issues: IssueInfo[] }>(async () => {
+    const [list, i] = await Promise.all([loadAll((args) => run<ListPage>(args), LIVE_STATES), run<{ issues: IssueInfo[] }>(issuesArgs(LIVE_STATES))]);
+    return { ...list, issues: i.issues };
+  }, 5000, active);
+  const issues = useMemo(() => issueMap(data?.issues), [data]);
+  const issueTitles = useMemo(() => new Map([...issues.values()].filter((i) => i.titled).map((i) => [i.id, i.title])), [issues]);
+  const [issueDialog, setIssueDialog] = useState<IssueDialogState>(null);
   const [risks, setRisks] = useState(new Set<Risk>(RISKS));
   const [hideFp, setHideFp] = useState(true);
   const [filter, setFilter] = useState<FindingFilter>(NO_FILTER);
@@ -129,6 +145,10 @@ export function FindingsView({ active }: { active: boolean }) {
   // The findings the rating dialog is open for, the ticked ones it left out, the issue it may
   // rate, and whether they are the ticked ones (then the ticks go once rated).
   const [rating, setRating] = useState<{ findings: FindingItem[]; skipped: number; issue: number | null; ticked: boolean } | null>(null);
+  // The issue `narrative` is the write-up of. A finding moved to another issue (a merge or a
+  // split) shows no write-up until that issue's arrives, so the old one is never saved onto it.
+  const [narrativeIssue, setNarrativeIssue] = useState<number | null>(null);
+  const narrativeFor = useRef<number | null>(null);
   const [trail, setTrail] = useState<Trail | null>(null);
   const [retesting, setRetesting] = useState(false);
   // The finding added by hand being edited, as it was when the dialog opened.
@@ -158,19 +178,20 @@ export function FindingsView({ active }: { active: boolean }) {
   const [showRules, setShowRules] = useState(false);
   const openRules = () => setShowRules(true);
 
-  const view = useMemo<ListView>(() => ({ hideClosed: hideFp, filter, compare: comparing ? { seen, want: compare } : null }), [hideFp, filter, comparing, seen, compare]);
+  const view = useMemo<ListView>(() => ({ hideClosed: hideFp, filter, compare: comparing ? { seen, want: compare } : null, issueTitles }), [hideFp, filter, comparing, seen, compare, issueTitles]);
   const groups = useMemo(() => {
     const by = new Map<string, Group>();
     for (const f of data?.items ?? []) {
       if (!risks.has(f.risk) || !inView(f, view)) continue;
       const key = groupKey(f);
-      const g = by.get(key) ?? { key, alert: f.alert_ref, name: f.name, host: f.host, risk: f.risk, items: [] };
+      const issue = f.issue_id != null ? issues.get(f.issue_id) : undefined;
+      const g = by.get(key) ?? { key, alert: f.alert_ref, name: f.name, title: issue?.title ?? f.name, issue, host: f.host, risk: f.risk, items: [] };
       if (RANK[f.risk] < RANK[g.risk]) g.risk = f.risk;
       g.items.push(f);
       by.set(key, g);
     }
-    return [...by.values()].sort((a, b) => RANK[a.risk] - RANK[b.risk] || a.name.localeCompare(b.name));
-  }, [data, risks, view]);
+    return [...by.values()].sort((a, b) => RANK[a.risk] - RANK[b.risk] || a.title.localeCompare(b.title));
+  }, [data, risks, view, issues]);
 
   const hosts = useMemo(() => hostsOf(data?.items ?? []), [data]);
   const names = useMemo(() => alertNames(data?.items ?? []), [data]);
@@ -197,6 +218,8 @@ export function FindingsView({ active }: { active: boolean }) {
     setEvents([]);
     setNarrative(null);
     setIssueRating(null);
+    setNarrativeIssue(null);
+    narrativeFor.current = null;
     setTrail(null);
     run<{ events: FindingEvent[] }>(["findings", "timeline", String(selected)]).then((t) => live && setEvents(t.events), () => {});
     run<Trail>(["findings", "trail", String(selected)]).then((t) => live && setTrail(t), () => {});
@@ -288,13 +311,19 @@ export function FindingsView({ active }: { active: boolean }) {
     }
   };
 
-  // An issue's write-up, unless another finding was opened meanwhile.
-  const loadNarrative = (issue: number, live: () => boolean = () => true) =>
-    run<{ narrative: Narrative | null; rating?: IssueRating | null }>(["findings", "issue", "show", String(issue)]).then((i) => {
-      if (!live()) return;
-      setNarrative((cur) => (same(cur, i.narrative) ? cur : i.narrative));
-      setIssueRating((cur) => (same(cur, i.rating ?? null) ? cur : (i.rating ?? null)));
-    }, () => {});
+  // An issue's write-up and rating, unless another finding (or another issue of this one) was opened meanwhile.
+  const loadNarrative = (issue: number, live: () => boolean = () => true) => {
+    narrativeFor.current = issue;
+    return run<{ narrative: Narrative | null; rating?: IssueRating | null }>(["findings", "issue", "show", String(issue)]).then(
+      (i) => {
+        if (!live() || narrativeFor.current !== issue) return;
+        setNarrative((cur) => (same(cur, i.narrative) ? cur : i.narrative));
+        setIssueRating((cur) => (same(cur, i.rating ?? null) ? cur : (i.rating ?? null)));
+        setNarrativeIssue(issue);
+      },
+      () => {},
+    );
+  };
 
   // The recorded request and response, read again only when the finding points at another one.
   const shownEntry = useRef<number | null>(null);
@@ -319,11 +348,13 @@ export function FindingsView({ active }: { active: boolean }) {
     run<Finding>(["findings", "show", String(id)]).then((f) => {
       if (!live()) return;
       setFinding((cur) => (same(cur, f) ? cur : f));
-      if (f.issue_id != null) loadNarrative(f.issue_id, live);
-      else {
+      if (narrativeFor.current !== f.issue_id) {
         setNarrative(null);
         setIssueRating(null);
+        setNarrativeIssue(null);
+        narrativeFor.current = null;
       }
+      if (f.issue_id != null) loadNarrative(f.issue_id, live);
       loadEntry(f.history_id, live);
     }, () => {});
     run<{ events: FindingEvent[] }>(["findings", "timeline", String(id)]).then((t) => {
@@ -369,7 +400,7 @@ export function FindingsView({ active }: { active: boolean }) {
   const saveWriteup = async (review: boolean) => {
     const issue = finding?.issue_id;
     const id = finding?.id;
-    if (issue == null || id == null) return;
+    if (issue == null || id == null || narrativeIssue !== issue) return;
     const sent = writeup;
     try {
       if (!review) {
@@ -614,6 +645,44 @@ export function FindingsView({ active }: { active: boolean }) {
     }
   };
 
+  // Issues rearranged (renamed, rated, merged, split): the list, the issues and the open
+  // finding are read again, and `show` (an issue the findings moved to) opens in the list.
+  const issueChanged = (show?: number) => {
+    setIssueDialog(null);
+    if (show != null) setOpen((o) => new Set(o).add(`issue:${show}`));
+    refresh();
+    if (openId.current != null) reloadDetail(openId.current);
+  };
+  const retitle = async (issue: IssueInfo, title: string) => {
+    try {
+      await run(titleCommand(issue.id, title));
+      issueChanged();
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
+  const renameIssue = async (issue: IssueInfo) => {
+    const title = await ask(`Rename issue #${issue.id}`, "Its title in Findings and in reports, in place of the alert's name. Reset title goes back to the alert's name.", "Rename", "Cancel", issue.title);
+    if (title != null && title.trim() !== issue.title) retitle(issue, title);
+  };
+  // From an issue's menu: into any other issue the list has.
+  const mergeIssue = (issue: IssueInfo) => setIssueDialog({ kind: "merge", from: [issue], targets: [...issues.values()].filter((i) => i.id !== issue.id) });
+  // From ticked findings (those shown): merge their issues, or split them off theirs.
+  const pickedFor = useMemo(() => pickedActions(picked, byId, issues), [picked, byId, issues]);
+  const issueMenuItems = (issue: IssueInfo): (MenuItem | "-")[] => {
+    const no = issueActionProblems(issue, issues.size);
+    return [
+      { label: "Rename issue…", action: () => renameIssue(issue), hint: issue.titled ? `Now “${issue.title}”` : undefined },
+      ...(issue.titled ? [{ label: "Reset title", action: () => retitle(issue, ""), hint: "Back to the alert's name" }] : []),
+      { label: "CVSS rating…", action: () => setIssueDialog({ kind: "cvss", issue }), hint: cvssLabel(issue) || "Not rated" },
+      "-",
+      { label: "Merge into…", action: () => mergeIssue(issue), disabled: !!no.merge, hint: no.merge || "Move its findings into another issue" },
+      { label: "Split…", action: () => setIssueDialog({ kind: "split", issue }), disabled: !!no.split, hint: no.split || "Move some of its findings to a new issue" },
+    ];
+  };
+  const issueMenu = useMenu();
+  const openIssue = finding?.issue_id != null ? issues.get(finding.issue_id) : undefined;
+
   // The report builder: audience, sections, branding, format, with a preview.
   const [reporting, setReporting] = useState(false);
   const reportName = app.temp ? "engagement" : app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
@@ -621,6 +690,7 @@ export function FindingsView({ active }: { active: boolean }) {
   const noSuppress: string | false = noFinding || (finding && !canSuppress(finding) ? "A rule leaves findings added by hand alone" : false);
   const noList: string | false = shown.length ? false : "No findings are shown";
   const byRule = finding?.suppressed_by != null ? suppressedBy(finding.suppressed_by, rules?.suppressions) : null;
+  const noIssue: string | false = noFinding || (openIssue ? false : "The open finding has no issue");
   useActions([
     { ...NEXT_FINDING, hidden: !active, disabled: noList, run: () => select(stepFinding(shown, selected, 1)) },
     { ...PREVIOUS_FINDING, hidden: !active, disabled: noList, run: () => select(stepFinding(shown, selected, -1)) },
@@ -637,6 +707,26 @@ export function FindingsView({ active }: { active: boolean }) {
         app.setTab("findings");
         openRules();
       },
+    },
+    { id: "findings.issue.rename", title: "Rename issue…", group: "Findings", keywords: "title retitle", hidden: !active, disabled: noIssue, run: () => openIssue && renameIssue(openIssue) },
+    { id: "findings.issue.cvss", title: "Issue CVSS rating…", group: "Findings", keywords: "cvss 4.0 vector score severity rate", hidden: !active, disabled: noIssue, run: () => openIssue && setIssueDialog({ kind: "cvss", issue: openIssue }) },
+    {
+      id: "findings.issue.merge",
+      title: "Merge issue into…",
+      group: "Findings",
+      keywords: "combine join",
+      hidden: !active,
+      disabled: noIssue || (openIssue && issueActionProblems(openIssue, issues.size).merge) || false,
+      run: () => openIssue && mergeIssue(openIssue),
+    },
+    {
+      id: "findings.issue.split",
+      title: "Split issue…",
+      group: "Findings",
+      keywords: "separate new issue",
+      hidden: !active,
+      disabled: noIssue || (openIssue && issueActionProblems(openIssue, issues.size).split) || false,
+      run: () => openIssue && setIssueDialog({ kind: "split", issue: openIssue }),
     },
     {
       id: "findings.report",
@@ -751,6 +841,21 @@ export function FindingsView({ active }: { active: boolean }) {
           <button className="btn small" disabled={busy} onClick={ratePicked} title="Rate the ticked scanner findings' risk and/or confidence yourself, or give them the scanner's rating back">
             Rate…
           </button>
+          {pickedFor.merge.length > 0 && (
+            <button
+              className="btn small"
+              disabled={busy}
+              onClick={() => setIssueDialog({ kind: "merge", from: pickedFor.merge, targets: pickedFor.merge })}
+              title="Keep one of the ticked findings' issues and move every finding of the others into it"
+            >
+              Merge their issues…
+            </button>
+          )}
+          {pickedFor.split && (
+            <button className="btn small" disabled={busy} onClick={() => pickedFor.split && setIssueDialog({ kind: "split", issue: pickedFor.split })} title="Move the ticked findings out of their issue into a new one">
+              Split off…
+            </button>
+          )}
           {picked.length < shown.length && (
             <button className="btn small" disabled={busy} onClick={() => setChecked(new Set(shown))}>
               Select all {shown.length} shown
@@ -794,11 +899,20 @@ export function FindingsView({ active }: { active: boolean }) {
                       setChecked(next);
                     }}
                   />
-                  <button className="tree-group" aria-expanded={open.has(g.key) || filter.text !== ""} onClick={() => setOpen(toggle(open, g.key))}>
+                  <button
+                    className="tree-group"
+                    aria-expanded={open.has(g.key) || filter.text !== ""}
+                    onClick={() => setOpen(toggle(open, g.key))}
+                    onContextMenu={(e) => {
+                      if (!g.issue) return;
+                      e.preventDefault();
+                      issueMenu.open(e, issueMenuItems(g.issue));
+                    }}
+                  >
                     <span className="caret">{open.has(g.key) ? "▾" : "▸"}</span>
                     <span className={`dot-risk risk-${g.risk}`} />
-                    <span className="grow ellipsis">
-                      {g.name}
+                    <span className="grow ellipsis" title={g.issue?.titled ? `Renamed; the alert is ${g.name}` : undefined}>
+                      {g.title}
                       {hosts.length > 1 && <span className="muted"> · {hostsOf(g.items).join(", ")}</span>}
                     </span>
                     {isScriptAnswer(g.alert) && (
@@ -812,6 +926,11 @@ export function FindingsView({ active }: { active: boolean }) {
                           {t}
                         </span>
                       ))}
+                    {g.issue?.cvss && (
+                      <span className="tag" title={g.issue.cvss.vector}>
+                        {cvssLabel(g.issue)}
+                      </span>
+                    )}
                     <span className="muted">{g.items.length}</span>
                   </button>
                 </div>
@@ -906,6 +1025,16 @@ export function FindingsView({ active }: { active: boolean }) {
                     {verifying ? "Comparing…" : "Compare with/without payload"}
                   </button>
                 )}
+                {openIssue && (
+                  <button
+                    className="btn small"
+                    aria-haspopup="menu"
+                    onClick={(e) => issueMenu.open(e, issueMenuItems(openIssue))}
+                    title="Rename this finding's issue, rate it with CVSS 4.0, merge it into another or split findings off it"
+                  >
+                    Issue ▾
+                  </button>
+                )}
                 <button
                   className="btn small"
                   aria-haspopup="menu"
@@ -942,6 +1071,21 @@ export function FindingsView({ active }: { active: boolean }) {
                 )}
               </div>
               <dl className="facts">
+                {openIssue && (
+                  <>
+                    <dt>Issue</dt>
+                    <dd>
+                      #{openIssue.id} {openIssue.title}
+                      {openIssue.instances > 1 && <span className="muted"> · {openIssue.instances} findings</span>}
+                      {openIssue.cvss && (
+                        <>
+                          {" · "}
+                          {cvssLabel(openIssue)} <span className="mono muted">{openIssue.cvss.vector}</span>
+                        </>
+                      )}
+                    </dd>
+                  </>
+                )}
                 <dt>URL</dt>
                 <dd className="mono">
                   {finding.method} {finding.url}
@@ -1047,10 +1191,11 @@ export function FindingsView({ active }: { active: boolean }) {
                     rows={4}
                     placeholder="What this issue means for this site, for the report. An agent can draft it; it's printed once a person reviews it."
                     value={writeup}
+                    disabled={narrativeIssue !== finding.issue_id}
                     onChange={(e) => setWriteup(e.target.value)}
                   />
                   <div className="toolbar flat">
-                    <button className="btn small" disabled={writeup.trim() === (narrative?.text ?? "")} onClick={() => saveWriteup(false)}>
+                    <button className="btn small" disabled={narrativeIssue !== finding.issue_id || writeup.trim() === (narrative?.text ?? "")} onClick={() => saveWriteup(false)}>
                       {writeup.trim() === "" && narrative ? "Clear write-up" : "Save write-up"}
                     </button>
                     {narrative && !narrative.reviewed_at && writeup.trim() === narrative.text && (
@@ -1136,6 +1281,41 @@ export function FindingsView({ active }: { active: boolean }) {
         )}
       </Split>
       <Menu menu={ticketMenu.menu} close={ticketMenu.close} />
+      <Menu menu={issueMenu.menu} close={issueMenu.close} />
+      {issueDialog?.kind === "cvss" && (
+        <CvssDialog
+          issue={issueDialog.issue}
+          onClose={() => setIssueDialog(null)}
+          onSaved={(c) => {
+            app.toast(c ? `Issue #${issueDialog.issue.id} rated CVSS 4.0 ${c.score.toFixed(1)} (${c.severity}).` : `Issue #${issueDialog.issue.id} has no CVSS rating now.`);
+            issueChanged();
+          }}
+        />
+      )}
+      {issueDialog?.kind === "merge" && (
+        <MergeDialog
+          from={issueDialog.from}
+          targets={issueDialog.targets}
+          onClose={() => setIssueDialog(null)}
+          onMerged={(into, moved) => {
+            app.toast(`Moved ${moved} finding${moved === 1 ? "" : "s"} into issue #${into}.`);
+            setChecked(new Set());
+            issueChanged(into);
+          }}
+        />
+      )}
+      {issueDialog?.kind === "split" && (
+        <SplitDialog
+          issue={issueDialog.issue}
+          checked={new Set(picked)}
+          onClose={() => setIssueDialog(null)}
+          onSplit={(issue, moved) => {
+            app.toast(`Moved ${moved.length} finding${moved.length === 1 ? "" : "s"} to new issue #${issue}.`);
+            setChecked(new Set());
+            issueChanged(issue);
+          }}
+        />
+      )}
       {reporting && <ReportBuilder name={reportName} onClose={() => setReporting(false)} />}
       {app.findingDraft && <NewFinding draft={app.findingDraft} onClose={() => app.newFinding(null)} onAdded={added} />}
       {editing && <NewFinding draft={null} edit={editing} onClose={() => setEditing(null)} onEdited={edited} />}
