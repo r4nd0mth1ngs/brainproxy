@@ -46,6 +46,16 @@ export function issueMap(issues: readonly IssueInfo[] | undefined): Map<number, 
   return new Map((issues ?? []).map((i) => [i.id, i]));
 }
 
+/**
+ * The issues the findings belong to that `issues` doesn't have, as a key ("" when none): a scan
+ * that adds an issue between two reads of the issues. The key lets the view ask once per set.
+ */
+export function missingIssues(items: readonly FindingItem[] | undefined, issues: ReadonlyMap<number, IssueInfo>): string {
+  const missing = new Set<number>();
+  for (const f of items ?? []) if (f.issue_id != null && !issues.has(f.issue_id)) missing.add(f.issue_id);
+  return [...missing].sort((a, b) => a - b).join(",");
+}
+
 /** An issue in a list of them: its number, title and hosts. */
 export function issueLabel(i: IssueInfo): string {
   return `#${i.id} ${i.title}${i.host ? ` · ${i.host}` : ""}`;

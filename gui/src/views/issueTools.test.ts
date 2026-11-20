@@ -14,6 +14,7 @@ import {
   MERGE_BATCH,
   mergeCommands,
   mergeWarning,
+  missingIssues,
   pickedActions,
   SPLIT_MAX,
   splitCommand,
@@ -64,6 +65,14 @@ test("issues are found by id and labelled by number, title and hosts", () => {
   assert.equal(issueMap(undefined).size, 0);
   assert.equal(issueLabel(issue(1)), "#1 Missing anti-clickjacking header · a.test");
   assert.equal(issueLabel(issue(2, { title: "Two", host: "" })), "#2 Two");
+});
+
+test("the issues the findings name but the issue list lacks make one key, the same for the same set", () => {
+  const m = issueMap([issue(1)]);
+  assert.equal(missingIssues([finding(1, 1), finding(2, null)], m), "");
+  assert.equal(missingIssues(undefined, m), "");
+  assert.equal(missingIssues([finding(1, 7), finding(2, 3), finding(3, 7), finding(4, 1)], m), "3,7");
+  assert.equal(missingIssues([finding(5, 3), finding(6, 7)], m), "3,7");
 });
 
 test("a CVSS rating reads in short, with one decimal", () => {

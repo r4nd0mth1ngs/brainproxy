@@ -58,7 +58,7 @@ import {
 } from "./findingsTriage.ts";
 import { heldNote, loadAll, type ListPage, type Loaded } from "./findingsPages.ts";
 import { CvssDialog, MergeDialog, SplitDialog } from "./IssueDialogs";
-import { cvssLabel, issueActionProblems, type IssueInfo, issueMap, issuesArgs, pickedActions, titleCommand } from "./issueTools.ts";
+import { cvssLabel, issueActionProblems, type IssueInfo, issueMap, issuesArgs, missingIssues, pickedActions, titleCommand } from "./issueTools.ts";
 import { addedBy } from "./manualFinding";
 import { isScriptAnswer, SCRIPT_ANSWER_NOTE } from "./matchReplace.ts";
 import { openVerifyDiff, verifyFinding, VerifyStrip } from "./PayloadCompare.tsx";
@@ -112,13 +112,21 @@ export function FindingsView({ active }: { active: boolean }) {
   const app = useApp();
   // Every triage state but removed: removed findings added by hand stay in the project for
   // comparisons, not in the list. Read in pages, so a big project isn't cut short unseen.
-  // With the issues' titles and CVSS ratings, which the findings list doesn't carry; read
-  // together, so a merge or split shows in both at once.
-  const [data, refresh] = usePoll<Loaded & { issues: IssueInfo[] }>(async () => {
-    const [list, i] = await Promise.all([loadAll((args) => run<ListPage>(args), LIVE_STATES), run<{ issues: IssueInfo[] }>(issuesArgs(LIVE_STATES))]);
-    return { ...list, issues: i.issues };
-  }, 5000, active);
-  const issues = useMemo(() => issueMap(data?.issues), [data]);
+  const [data, refresh] = usePoll<Loaded>(() => loadAll((args) => run<ListPage>(args), LIVE_STATES), 5000, active);
+  // The issues' titles, CVSS ratings and whole-issue decisions, which the findings list doesn't
+  // carry. Read on their own, slower poll (the query is heavier than a page of findings), so a
+  // failed read keeps the last issues and never holds up the list; read again at once after an
+  // issue is changed here, and when the list names an issue they don't have yet (a new scan's).
+  const [issueList, refreshIssues] = usePoll<{ issues: IssueInfo[] }>(() => run<{ issues: IssueInfo[] }>(issuesArgs(LIVE_STATES)), 30000, active);
+  const issues = useMemo(() => issueMap(issueList?.issues), [issueList]);
+  const askedFor = useRef("");
+  useEffect(() => {
+    if (!issueList) return;
+    const missing = missingIssues(data?.items, issues);
+    // Once per set of missing issues: one the query leaves out isn't asked for on every poll.
+    if (missing && missing !== askedFor.current) refreshIssues();
+    askedFor.current = missing;
+  }, [data, issues]);
   const issueTitles = useMemo(() => new Map([...issues.values()].filter((i) => i.titled).map((i) => [i.id, i.title])), [issues]);
   const [issueDialog, setIssueDialog] = useState<IssueDialogState>(null);
   const [risks, setRisks] = useState(new Set<Risk>(RISKS));
@@ -599,6 +607,7 @@ export function FindingsView({ active }: { active: boolean }) {
     // The open finding takes its new rating, timeline and issue rating; the list its risk counts.
     if (openId.current != null) reloadDetail(openId.current);
     refresh();
+    if (rating?.issue != null) refreshIssues();
   };
   // Ends the rating of the open finding's whole issue: its findings get the scanner's rating back.
   const endIssueRating = async () => {
@@ -614,6 +623,7 @@ export function FindingsView({ active }: { active: boolean }) {
     try {
       await run(clearCommands([], issue)[0]);
       app.toast(`Issue #${issue} has the scanner's rating again.`);
+      refreshIssues();
     } catch (e: any) {
       app.toast(e.message, "error");
     }
@@ -651,6 +661,7 @@ export function FindingsView({ active }: { active: boolean }) {
     setIssueDialog(null);
     if (show != null) setOpen((o) => new Set(o).add(`issue:${show}`));
     refresh();
+    refreshIssues();
     if (openId.current != null) reloadDetail(openId.current);
   };
   const retitle = async (issue: IssueInfo, title: string) => {
