@@ -42,7 +42,7 @@ function Field({ label, children, wide, group }: { label: string; children: Reac
 }
 
 /** One of a few choices: a named group of buttons, the picked one pressed, so a screen reader says both. */
-function Choice<T extends string>({ label, value, options, onPick, render }: { label: string; value: T; options: T[]; onPick: (v: T) => void; render?: (v: T) => ReactNode }) {
+export function Choice<T extends string>({ label, value, options, onPick, render }: { label: string; value: T; options: T[]; onPick: (v: T) => void; render?: (v: T) => ReactNode }) {
   const id = useId();
   return (
     <div>
