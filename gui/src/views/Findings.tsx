@@ -699,6 +699,10 @@ export function FindingsView({ active }: { active: boolean }) {
   const reportName = app.temp ? "engagement" : app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
   const noFinding: string | false = finding ? false : "No finding is open";
   const noSuppress: string | false = noFinding || (finding && !canSuppress(finding) ? "A rule leaves findings added by hand alone" : false);
+  // Not a finding still shown while the one just picked (J, K) loads, as rateOpen.
+  const suppressOpen = () => {
+    if (finding && finding.id === selected && canSuppress(finding)) setSuppressing(finding);
+  };
   const noList: string | false = shown.length ? false : "No findings are shown";
   const byRule = finding?.suppressed_by != null ? suppressedBy(finding.suppressed_by, rules?.suppressions) : null;
   const noIssue: string | false = noFinding || (openIssue ? false : "The open finding has no issue");
@@ -708,7 +712,7 @@ export function FindingsView({ active }: { active: boolean }) {
     ...TRIAGE_KEYS.map((k) => ({ ...k, hidden: !active, disabled: noFinding, run: () => mark(k.state, true) })),
     { ...RATE_FINDING, hidden: !active, disabled: noFinding || (finding && !ratable(finding) ? "A finding added by hand has its own risk: Edit… it" : false), run: rateOpen },
     { id: "findings.new", title: "New finding…", group: "Findings", keywords: "write up manual issue", run: () => app.newFinding({}) },
-    { id: "findings.suppress", title: "Suppress the open finding…", group: "Findings", keywords: "false positive rule ignore hide", hidden: !active, disabled: noSuppress, run: () => setSuppressing(finding) },
+    { id: "findings.suppress", title: "Suppress the open finding…", group: "Findings", keywords: "false positive rule ignore hide", hidden: !active, disabled: noSuppress, run: suppressOpen },
     {
       id: "findings.suppressions",
       title: "Suppression rules…",
