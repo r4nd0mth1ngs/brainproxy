@@ -386,6 +386,34 @@ pub(crate) mod tests {
         alt_svc: Option<String>,
         uni: Option<u32>,
     ) -> (u16, Arc<AtomicU64>) {
+        try_h3_server(port, alpn, alt_svc, uni).await.unwrap()
+    }
+
+    /// An HTTP/1.1 server and a QUIC server on the same port number: returns the port, the
+    /// HTTP/1.1 requests and the QUIC connections accepted. A free TCP port says nothing about
+    /// the UDP one, which another process on a busy runner may hold, so a clash picks a new port.
+    async fn h1_with_h3(
+        alt_svc: Option<String>,
+        alpn: &[&[u8]],
+        uni: Option<u32>,
+    ) -> (u16, Arc<AtomicU64>, Arc<AtomicU64>) {
+        for _ in 0..20 {
+            let (port, requests) = h1_server(0, alt_svc.clone()).await;
+            match try_h3_server(port, alpn, None, uni).await {
+                Ok((_, accepted)) => return (port, requests, accepted),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        panic!("no port was free for both TCP and UDP");
+    }
+
+    async fn try_h3_server(
+        port: u16,
+        alpn: &[&[u8]],
+        alt_svc: Option<String>,
+        uni: Option<u32>,
+    ) -> std::io::Result<(u16, Arc<AtomicU64>)> {
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls(alpn)).unwrap();
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         if let Some(n) = uni {
@@ -393,7 +421,7 @@ pub(crate) mod tests {
             transport.max_concurrent_uni_streams(n.into());
             config.transport_config(Arc::new(transport));
         }
-        let endpoint = quinn::Endpoint::server(config, SocketAddr::from(([127, 0, 0, 1], port))).unwrap();
+        let endpoint = quinn::Endpoint::server(config, SocketAddr::from(([127, 0, 0, 1], port)))?;
         let port = endpoint.local_addr().unwrap().port();
         let accepted = Arc::new(AtomicU64::new(0));
         let count = accepted.clone();
@@ -445,7 +473,7 @@ pub(crate) mod tests {
                 });
             }
         });
-        (port, accepted)
+        Ok((port, accepted))
     }
 
     /// An HTTP/1.1 server over TLS on 127.0.0.1 (`port`, or any) answering `h1 <request line>`
@@ -548,8 +576,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn falls_back_to_tcp_when_http3_is_not_offered() {
         // TCP and UDP on the same port: HTTP/1.1 over TLS, and a QUIC server without h3.
-        let (port, requests) = h1_server(0, None).await;
-        let (_, accepted) = h3_server(port, &[b"not-h3"], None).await;
+        let (port, requests, accepted) = h1_with_h3(None, &[b"not-h3"], None).await;
         let c = client(&["127.0.0.1".into()], true);
         let ex = c.send(&get("/a", port, "HTTP/1.1"), &target(port)).await.unwrap();
         assert!(ex.response.starts_with(b"HTTP/1.1 200"), "{}", text(&ex.response));
@@ -638,9 +665,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn follows_alt_svc_to_an_endpoint_in_scope() {
         let (h3_port, accepted) = h3_server(0, &[ALPN], None).await;
-        let (port, requests) = h1_server(0, Some(format!(r#"h3=":{h3_port}"; ma=60"#))).await;
         // A QUIC server without h3 on the TCP port, so the first try fails fast.
-        h3_server(port, &[b"not-h3"], None).await;
+        let (port, requests, _) = h1_with_h3(Some(format!(r#"h3=":{h3_port}"; ma=60"#)), &[b"not-h3"], None).await;
         let c = client(&["127.0.0.1".into()], true);
         let ex = c.send(&get("/a", port, "HTTP/1.1"), &target(port)).await.unwrap();
         assert!(ex.response.starts_with(b"HTTP/1.1 200"), "{}", text(&ex.response));
@@ -656,8 +682,7 @@ pub(crate) mod tests {
         // The scope lists the TCP origin's port only. Its Alt-Svc points at another port, where
         // a UDP socket counts what arrives.
         let (sink, got) = udp_sink().await;
-        let (port, requests) = h1_server(0, Some(format!(r#"h3=":{sink}""#))).await;
-        h3_server(port, &[b"not-h3"], None).await;
+        let (port, requests, _) = h1_with_h3(Some(format!(r#"h3=":{sink}""#)), &[b"not-h3"], None).await;
         let c = client(&[format!("127.0.0.1:{port}")], true);
         c.send(&get("/a", port, "HTTP/1.1"), &target(port)).await.unwrap();
         let ex = c.send(&get("/b", port, "HTTP/1.1"), &target(port)).await.unwrap();
@@ -694,9 +719,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_server_that_never_lets_http3_start_leaves_time_for_tcp() {
-        let (port, requests) = h1_server(0, None).await;
         // QUIC completes, but HTTP/3 can't open its control stream: no stream credit.
-        let (_, accepted) = h3_server_with(port, &[ALPN], None, Some(0)).await;
+        let (port, requests, accepted) = h1_with_h3(None, &[ALPN], Some(0)).await;
         let scope = ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] };
         let opts = SendOptions {
             guard: Some(Guard::from_specs(vec![scope]).unwrap()),
@@ -716,8 +740,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_withdrawn_alt_svc_endpoint_is_not_used_again() {
         let (alt, alt_accepted) = h3_server(0, &[ALPN], None).await;
-        let (port, _) = h1_server(0, Some(format!(r#"h3=":{alt}""#))).await;
-        h3_server(port, &[b"not-h3"], None).await;
+        let (port, _, _) = h1_with_h3(Some(format!(r#"h3=":{alt}""#)), &[b"not-h3"], None).await;
         let c = client(&["127.0.0.1".into()], true);
         c.send(&get("/a", port, "HTTP/1.1"), &target(port)).await.unwrap();
         let ex = c.send(&get("/b", port, "HTTP/1.1"), &target(port)).await.unwrap();
@@ -738,8 +761,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_recorded_http3_request_learns_alt_svc_without_the_option() {
         let (alt, accepted) = h3_server(0, &[ALPN], None).await;
-        let (port, _) = h1_server(0, Some(format!(r#"h3=":{alt}""#))).await;
-        h3_server(port, &[b"not-h3"], None).await;
+        let (port, _, _) = h1_with_h3(Some(format!(r#"h3=":{alt}""#)), &[b"not-h3"], None).await;
         let c = client(&["127.0.0.1".into()], false);
         let ex = c.send(&get("/a", port, "HTTP/3"), &target(port)).await.unwrap();
         assert!(ex.response.starts_with(b"HTTP/1.1 200"), "{}", text(&ex.response));
@@ -750,8 +772,17 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn an_http2_fallback_is_recorded_as_http2() {
-        let (port, _) = crate::http::h2::tests::h2_server(Some(vec![b"h2".to_vec()])).await;
-        h3_server(port, &[b"not-h3"], None).await;
+        // As in `h1_with_h3`: the UDP port can be taken although the TCP one was free.
+        let mut port = 0;
+        for _ in 0..20 {
+            (port, _) = crate::http::h2::tests::h2_server(Some(vec![b"h2".to_vec()])).await;
+            match try_h3_server(port, &[b"not-h3"], None, None).await {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => port = 0,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_ne!(port, 0, "no port was free for both TCP and UDP");
         let scope = ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] };
         let opts = SendOptions {
             guard: Some(Guard::from_specs(vec![scope]).unwrap()),
@@ -768,8 +799,7 @@ pub(crate) mod tests {
     async fn advertised_endpoints_the_scope_or_a_proxy_rule_keeps_out_are_not_contacted() {
         use crate::connection::{ConnectionSettings, UpstreamRule};
         // A host the scope doesn't list (with an address scope, its addresses decide).
-        let (port, _) = h1_server(0, Some(r#"h3="evil.test:443""#.into())).await;
-        h3_server(port, &[b"not-h3"], None).await;
+        let (port, _, _) = h1_with_h3(Some(r#"h3="evil.test:443""#.into()), &[b"not-h3"], None).await;
         let c = client(&["127.0.0.1".into()], true);
         c.send(&get("/a", port, "HTTP/1.1"), &target(port)).await.unwrap();
         let ex = c.send(&get("/b", port, "HTTP/1.1"), &target(port)).await.unwrap();
@@ -778,8 +808,7 @@ pub(crate) mod tests {
         assert!(notes.contains("Alt-Svc endpoint evil.test:443") && notes.contains("out of scope"), "{notes}");
         // A host in scope that the connection settings send through a proxy.
         let (sink, got) = udp_sink().await;
-        let (port, _) = h1_server(0, Some(format!(r#"h3="localhost:{sink}""#))).await;
-        h3_server(port, &[b"not-h3"], None).await;
+        let (port, _, _) = h1_with_h3(Some(format!(r#"h3="localhost:{sink}""#)), &[b"not-h3"], None).await;
         let c = client(&["127.0.0.1".into(), "localhost".into()], true);
         let rule = UpstreamRule {
             host: "localhost".into(),

@@ -29,9 +29,31 @@ fn spawn<F: std::future::Future<Output = ()> + Send + 'static>(serve: F) {
 /// An HTTP/3 server on 127.0.0.1:`port` (any when 0) offering `alpn`, answering
 /// `<method> <path> <body>`. Returns its port and the connections it accepted.
 fn h3_server(dir: &std::path::Path, port: u16, alpn: &[&[u8]]) -> (u16, Arc<AtomicU64>) {
+    let socket = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    h3_on(dir, socket, alpn)
+}
+
+/// An HTTP/1.1 server answering `status` and a QUIC server offering `alpn` on the same port
+/// number. A free TCP port says nothing about the UDP one, which another process on a busy
+/// runner may hold, so a clash picks a new port.
+fn h1_with_h3(dir: &std::path::Path, status: u16, alt_svc: Option<String>, alpn: &[&[u8]]) -> u16 {
+    for _ in 0..20 {
+        let port = h1_server(dir, status, alt_svc.clone());
+        match std::net::UdpSocket::bind(("127.0.0.1", port)) {
+            Ok(socket) => {
+                h3_on(dir, socket, alpn);
+                return port;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("no port was free for both TCP and UDP");
+}
+
+fn h3_on(dir: &std::path::Path, socket: std::net::UdpSocket, alpn: &[&[u8]]) -> (u16, Arc<AtomicU64>) {
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls(dir, alpn)).unwrap();
     let config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    let socket = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
     let port = socket.local_addr().unwrap().port();
     let accepted = Arc::new(AtomicU64::new(0));
     let count = accepted.clone();
@@ -182,9 +204,8 @@ fn send_and_fuzz_over_http3() {
 #[test]
 fn falls_back_to_tcp_and_says_why() {
     let (dir, p) = project("http3-fallback");
-    let port = h1_server(&dir, 200, None);
     // QUIC on the same port, without h3: the handshake fails fast.
-    h3_server(&dir, port, &[b"not-h3"]);
+    let port = h1_with_h3(&dir, 200, None, &[b"not-h3"]);
     run(&["engagement", "start", "--target", "127.0.0.1"], &p, None);
     let d = run(&["send", "--http3", "--url", &format!("https://127.0.0.1:{port}/a")], &p, None);
     assert_eq!(d["response"]["status"], 200, "{d}");
@@ -206,8 +227,7 @@ fn the_active_scan_finds_access_control_that_only_covers_tcp() {
     let (dir, p) = project("http3-rule");
     // HTTP/3 at an advertised endpoint answers 200; TCP refuses with 403.
     let (alt, accepted) = h3_server(&dir, 0, &[b"h3"]);
-    let port = h1_server(&dir, 403, Some(format!(r#"h3=":{alt}""#)));
-    h3_server(&dir, port, &[b"not-h3"]);
+    let port = h1_with_h3(&dir, 403, Some(format!(r#"h3=":{alt}""#)), &[b"not-h3"]);
     run(&["engagement", "start", "--target", "127.0.0.1"], &p, None);
     let url = format!("https://127.0.0.1:{port}/admin");
     let d = run(&["scan", "active", &url, "--http3", "--rules=100006"], &p, None);
