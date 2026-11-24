@@ -267,16 +267,15 @@ impl ActiveArgs {
             || active::selected_rule_ids((!self.rules.is_empty()).then_some(&self.rules[..]), &self.exclude_rules);
         let skipped = || {
             let ran = ran();
-            active::all_rules().iter().map(|r| r.id()).filter(|id| !ran.contains(id)).collect::<Vec<u32>>()
+            let mut ids: Vec<u32> = active::all_rules().iter().map(|r| r.id()).filter(|id| !ran.contains(id)).collect();
+            ids.sort_unstable();
+            ids
         };
         ScanScope {
             origins,
             rules: (!self.rules.is_empty()).then(|| numbers(&ran())),
-            exclude_rules: if self.rules.is_empty() && !self.exclude_rules.is_empty() {
-                numbers(&skipped())
-            } else {
-                numbers(&self.exclude_rules)
-            },
+            // Without --rules the opt-in rules didn't run either, so they aren't covered.
+            exclude_rules: if self.rules.is_empty() { numbers(&skipped()) } else { numbers(&self.exclude_rules) },
             ported_rules: !self.no_rules,
             check_ids: if !self.checks.is_empty() && by_id_only { self.check_ids.clone() } else { vec![] },
             crawled: self.crawl,
