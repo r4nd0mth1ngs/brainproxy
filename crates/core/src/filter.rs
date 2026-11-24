@@ -805,13 +805,11 @@ impl Binder<'_> {
     }
 }
 
-/// `expr` contains `p`, ASCII letters in any case. instr reads every byte, where LIKE would stop
-/// at a NUL in a binary body. lower() folds ASCII only (SQLite is built without ICU) and keeps
-/// every byte, so a body that isn't UTF-8 is searched in full; instr walks a folded body by UTF-8
-/// lead bytes, which loses no match because a needle (a Rust string) never starts with a
-/// continuation byte.
+/// `expr` contains `p` in any case: UTF-8 text under Unicode full case folding, other bytes as
+/// stored (`store::case_fold`). Every byte is read, where LIKE would stop at a NUL in a binary
+/// body, and SQLite's own lower() folds ASCII only (it is built without ICU).
 pub(crate) fn contains(expr: &str, p: &str) -> String {
-    format!("instr(lower({expr}), lower({p})) > 0")
+    format!("fold_contains({expr}, {p})")
 }
 
 fn node_sql(n: &Node, b: &mut Binder) -> String {
@@ -967,11 +965,11 @@ mod tests {
     fn terms_and_words() {
         let (s, p) = sql("status:5xx resp.body:\"stack trace\"");
         assert!(s.starts_with("(coalesce((status BETWEEN ?1 AND ?2), 0) AND "), "{s}");
-        assert!(s.contains("instr(lower(resp_body), lower(?3)) > 0"), "{s}");
+        assert!(s.contains("fold_contains(resp_body, ?3)"), "{s}");
         assert_eq!(p, vec![Value::Integer(500), Value::Integer(599), Value::Text("stack trace".into())]);
 
         let (s, p) = sql("login");
-        assert!(s.contains("instr(lower(url), lower(?1))") && s.contains("method = upper(?1)"), "{s}");
+        assert!(s.contains("fold_contains(url, ?1)") && s.contains("method = upper(?1)"), "{s}");
         assert_eq!(p, vec![Value::Text("login".into())]);
     }
 
@@ -992,7 +990,7 @@ mod tests {
     fn placeholders_follow_the_statements_own() {
         let mut params = vec![Value::Integer(1)];
         let s = Query::parse("host:a status:2xx").unwrap().to_sql(&mut params, 3);
-        assert!(s.contains("lower(?4)") && s.contains("BETWEEN ?5 AND ?6"), "{s}");
+        assert!(s.contains("fold_contains(host, ?4)") && s.contains("BETWEEN ?5 AND ?6"), "{s}");
         assert_eq!(params.len(), 4, "pushed after what was there");
     }
 
@@ -1061,7 +1059,7 @@ mod tests {
             "{s}"
         );
         let (s, _) = sql("host:\"\"");
-        assert!(s.contains("instr(lower(host), lower(?1))"), "{s}");
+        assert!(s.contains("fold_contains(host, ?1)"), "{s}");
     }
 
     #[test]
@@ -1073,7 +1071,7 @@ mod tests {
         );
         assert_eq!(p, vec![Value::Text("authorization".into())]);
         let (s, p) = sql("url:\"*\"");
-        assert!(s.contains("instr(lower(url), lower(?1))"), "{s}");
+        assert!(s.contains("fold_contains(url, ?1)"), "{s}");
         assert_eq!(p[0], Value::Text("*".into()));
         assert!(err("req.header.:x").contains("unknown field"));
         // A header name the tokenizer can't read is refused, not searched as a word.

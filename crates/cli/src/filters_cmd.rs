@@ -17,9 +17,10 @@ use crate::output::{escape_controls, Out};
 /// The meta key holding the saved set (JSON): `{"v", "rev", "filters"}`.
 const KEY: &str = "traffic.filters";
 /// Format of the saved set. A build refuses to save over a newer one, whose fields it would drop.
-/// 2 added `ignoreCase`; a set is saved as 2 only when a filter turns it on, so a build that
-/// knows only 1 can still save over a set that holds nothing it would lose.
-const VERSION: u64 = 2;
+/// 2 added `ignoreCase` and 3 `regex`; a set is saved as the lowest format that holds what its
+/// filters turn on, so a build that knows only 1 can still save over a set that holds nothing it
+/// would lose.
+const VERSION: u64 = 3;
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_FILTERS: usize = 200;
 /// The most an agent can bring the set to through MCP, so a person always has room for theirs.
@@ -33,7 +34,8 @@ pub enum FiltersCmd {
     /// List the saved Traffic filters: name, what the text searches, the text, sources and checkboxes.
     #[command(after_help = "mode is url (the text filters URL, title and method in the app), contents \
         (`history list --contains`) or query (`history list --filter`). ignoreCase true is a contents search \
-        with `--ignore-case`; a set holding one is format 2 (v), which older builds list but don't save over. \
+        with `--ignore-case`, regex true one with `--regex`; a set holding one is format 2 or 3 (v), which \
+        older builds list but don't save over. \
         rev goes up with every save; `save --if-revision` checks it. origin is who saved a filter (gui, cli or mcp; unknown when an older \
         build did); a replace keeps it for a filter saved back unchanged.")]
     List,
@@ -41,7 +43,8 @@ pub enum FiltersCmd {
     #[command(after_help = "Reads JSON from stdin: {\"filters\": [{\"name\": \"server errors\", \"filter\": \
         {\"text\": \"status:5xx NOT path:/health\", \"query\": true, \"sources\": [\"proxy\"], \"hideAssets\": true}}]}. \
         A filter's fields: text, contents (search inside requests and responses), ignoreCase (the contents \
-        search matches ASCII letters in any case, as `history list --ignore-case`), query (text is a \
+        search matches in any case, as `history list --ignore-case`), regex (the contents search is a regex, \
+        as `history list --regex`, which must compile), query (text is a \
         `history list --filter` query, which must parse), sources (empty: every source), hideErrors (2xx/3xx \
         only), hideAssets, hideRefused (out-of-scope rows; true when left out). contents and query can't both be \
         on. Names are unique, at most 100 characters; at most 200 filters. An empty list leaves none. Through MCP \
@@ -74,11 +77,14 @@ struct Filter {
     text: String,
     #[serde(default)]
     contents: bool,
-    /// The contents search matches ASCII letters in any case (`history list --ignore-case`).
+    /// The contents search matches in any case (`history list --ignore-case`).
     /// Left out of the stored JSON when off, so a filter saved before it existed compares
     /// equal to the same filter saved again.
     #[serde(default, skip_serializing_if = "is_false")]
     ignore_case: bool,
+    /// The contents search is a regex (`history list --regex`). Left out when off, as ignoreCase.
+    #[serde(default, skip_serializing_if = "is_false")]
+    regex: bool,
     #[serde(default)]
     query: bool,
     #[serde(default)]
@@ -265,6 +271,10 @@ fn parse(input: &[u8]) -> Result<Set, Error> {
         // Only the contents search reads it: kept elsewhere it would make two equal URL or
         // query filters differ, and raise the format for older builds over nothing.
         f.ignore_case &= f.contents;
+        f.regex &= f.contents;
+        if f.regex && !f.text.trim().is_empty() {
+            regex::bytes::Regex::new(&f.text).map_err(|e| bad(format!("the text isn't a valid regex: {e}")))?;
+        }
         if f.query && !f.text.trim().is_empty() {
             brainproxy_core::filter::Query::parse(&f.text).map_err(|e| bad(e.to_string()))?;
         }
@@ -322,7 +332,14 @@ fn build(
         };
         filters.push(v);
     }
-    let v = if filters.iter().any(|f| f["filter"]["ignoreCase"] == true) { VERSION } else { 1 };
+    let on = |field: &str| filters.iter().any(|f| f["filter"][field] == true);
+    let v = if on("regex") {
+        3
+    } else if on("ignoreCase") {
+        2
+    } else {
+        1
+    };
     let json = serde_json::to_string(&json!({"v": v, "rev": rev, "filters": filters}))
         .map_err(|e| Error::InvalidInput(e.to_string()))?;
     if json.len() > MAX_BYTES {
@@ -424,11 +441,28 @@ mod tests {
 
     #[test]
     fn a_newer_format_is_not_saved_over() {
-        assert_eq!(current(Some(r#"{"v": 3, "rev": 4, "filters": []}"#), false).unwrap_err().kind(), "conflict");
+        assert_eq!(current(Some(r#"{"v": 4, "rev": 4, "filters": []}"#), false).unwrap_err().kind(), "conflict");
         assert_eq!(current(Some(r#"{"v": 2, "rev": 4, "filters": []}"#), false).unwrap().0, 4);
         assert_eq!(current(Some("not json"), false).unwrap().0, 0);
         assert!(current(Some("not json"), true).is_err());
         assert_eq!(current(Some(r#"{"v": 1, "rev": 4, "filters": [{}]}"#), true).unwrap().0, 4);
+    }
+
+    #[test]
+    fn regex_is_kept_on_a_contents_search_and_raises_the_format_to_3() {
+        let save = |input: &str| {
+            let (json, _) = build(parse(input.as_bytes()).unwrap(), Vec::new(), &[], "gui", 1, MAX_FILTERS).unwrap();
+            serde_json::from_str::<Value>(&json).unwrap()
+        };
+        let on =
+            save(r#"{"filters": [{"name": "t", "filter": {"text": "tok(en)?", "contents": true, "regex": true}}]}"#);
+        assert_eq!((on["v"].as_u64(), on["filters"][0]["filter"]["regex"].as_bool()), (Some(3), Some(true)));
+        let url = save(r#"{"filters": [{"name": "t", "filter": {"text": "(", "regex": true, "ignoreCase": true}}]}"#);
+        assert_eq!(url["v"], 1, "a URL filter keeps neither");
+        assert!(url["filters"][0]["filter"].get("regex").is_none());
+        assert!(err(r#"{"filters": [{"name": "t", "filter": {"text": "(", "contents": true, "regex": true}}]}"#)
+            .contains("isn't a valid regex"));
+        assert_eq!(current(Some(r#"{"v": 3, "rev": 4, "filters": []}"#), false).unwrap().0, 4);
     }
 
     #[test]

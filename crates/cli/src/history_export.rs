@@ -40,9 +40,12 @@ pub struct ExportArgs {
     /// unless --ignore-case).
     #[arg(long)]
     contains: Option<String>,
-    /// Make --contains match ASCII letters in any case, as `history list --ignore-case` does.
+    /// Make --contains match in any case, as `history list --ignore-case` does.
     #[arg(long, requires = "contains")]
     ignore_case: bool,
+    /// Read --contains as a regex, as `history list --regex` does.
+    #[arg(long, requires = "contains")]
+    regex: bool,
     /// A query in the filter language, as `history list --filter` takes it.
     #[arg(long)]
     filter: Option<String>,
@@ -82,6 +85,7 @@ pub fn export(project: &Path, a: ExportArgs, out: &Out) -> Result<(), Error> {
         origin: a.origin,
         contains: a.contains,
         ignore_case: a.ignore_case,
+        regex: a.regex,
         filter: a.filter,
         after_id: a.after,
         limit: Some(a.limit.saturating_add(1)),

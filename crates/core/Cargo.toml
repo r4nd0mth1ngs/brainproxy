@@ -22,6 +22,9 @@ rusqlite.workspace = true
 regex.workspace = true
 regex-syntax = "0.8"
 aho-corasick = "1.1"
+memchr = "2.7"
+# Unicode full case folding for the case-insensitive contents search (store::case_fold).
+caseless = "0.2.2"
 flate2.workspace = true
 brotli-decompressor.workspace = true
 ruzstd.workspace = true

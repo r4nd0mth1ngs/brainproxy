@@ -379,19 +379,23 @@ enum HistoryCmd {
         #[arg(long, value_parser = ["gui", "cli", "mcp", "unknown"])]
         origin: Option<String>,
         /// Text to search for in raw requests and responses, and in their decoded bodies (gzip,
-        /// deflate, br, chunked). Literal and case-sensitive (see --ignore-case): the bytes must
-        /// match as stored, so URL-encoded (a%40b.com) or JSON-escaped text and HTTP/2's
+        /// deflate, br, chunked). Literal (see --regex) and case-sensitive (see --ignore-case): the
+        /// bytes must match as stored, so URL-encoded (a%40b.com) or JSON-escaped text and HTTP/2's
         /// lower-case header names are searched as they appear.
         #[arg(long)]
         contains: Option<String>,
-        /// Make --contains match ASCII letters (A-Z, a-z) in any case, as the filter language's
-        /// FIELD:VALUE does. Every other byte must still match as stored: letters outside ASCII (é
-        /// and É) aren't folded, and bodies, binary ones too, are searched as bytes, not read as
-        /// text in any charset.
+        /// Make --contains match in any case, as the filter language's FIELD:VALUE does: UTF-8
+        /// text is compared under Unicode full case folding (é matches É, ß matches SS). Bytes that
+        /// aren't UTF-8 must still match as stored; bodies are searched as bytes, not read as text
+        /// in any other charset. With --regex it is the regex's (?i), which folds one character
+        /// to one (ß doesn't match SS).
         #[arg(long, requires = "contains")]
         ignore_case: bool,
+        /// Read --contains as a regex (Rust regex syntax), matched against the same bytes.
+        #[arg(long, requires = "contains")]
+        regex: bool,
         /// A query in the filter language, e.g. 'status:5xx AND resp.body:"stack trace"' or
-        /// 'host:api.test method=POST NOT path:/health'. FIELD:VALUE contains (ASCII letters in any case),
+        /// 'host:api.test method=POST NOT path:/health'. FIELD:VALUE contains (in any case),
         /// = equals, != differs, ~ and !~ match a regex, < <= > >= compare numbers and times,
         /// FIELD:* is present; a bare word searches the URL and title. Terms side by side must
         /// all match; AND, OR, NOT (in any case) and parentheses combine them. Fields: see the notes.
@@ -1484,7 +1488,20 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
     match cmd {
         HistoryCmd::Export(_) => unreachable!("handled above"),
-        HistoryCmd::List { host, method, status, source, tag, origin, contains, ignore_case, filter, after, limit } => {
+        HistoryCmd::List {
+            host,
+            method,
+            status,
+            source,
+            tag,
+            origin,
+            contains,
+            ignore_case,
+            regex,
+            filter,
+            after,
+            limit,
+        } => {
             let items = store.list(&HistoryFilter {
                 host,
                 method,
@@ -1494,6 +1511,7 @@ fn history(project: &Path, cmd: HistoryCmd, out: &Out) -> Result<(), Error> {
                 origin,
                 contains,
                 ignore_case,
+                regex,
                 filter,
                 after_id: after,
                 limit: Some(limit),

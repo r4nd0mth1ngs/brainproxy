@@ -568,9 +568,12 @@ pub struct HistoryFilter {
     /// Substring searched in the raw request and response, and in their decoded bodies
     /// (so a gzip or chunked body matches too). Case-sensitive unless `ignore_case`.
     pub contains: Option<String>,
-    /// `contains` matches ASCII letters in any case, as the filter language's `:` does. Other
-    /// bytes, UTF-8 letters outside ASCII included, must match as stored.
+    /// `contains` matches in any case, as the filter language's `:` does: UTF-8 text is
+    /// compared under Unicode full case folding (`ß` matches `SS`); bytes that aren't UTF-8
+    /// must match as stored. With `regex`, the regex's own `(?i)`, which folds simply.
     pub ignore_case: bool,
+    /// `contains` is a regex (the regex crate's syntax), matched against the bytes.
+    pub regex: bool,
     /// A query in the history filter language ([`crate::filter`]).
     pub filter: Option<String>,
     pub after_id: Option<i64>,
@@ -1484,7 +1487,15 @@ impl Store {
         }
         if let Some(c) = &f.contains {
             let cols = ["request", "response", "req_body", "resp_body"];
-            let cond: Vec<String> = if f.ignore_case {
+            let cond: Vec<String> = if f.regex {
+                let pattern = if f.ignore_case { format!("(?i){c}") } else { c.clone() };
+                // Checked here, so a bad pattern is the caller's error and not a failing row.
+                regex::bytes::Regex::new(&pattern)
+                    .map_err(|e| Error::InvalidInput(format!("the contents search isn't a valid regex: {e}")))?;
+                args.push(Box::new(pattern));
+                let n = args.len();
+                cols.iter().map(|col| format!("regexp_bytes(?{n}, {col})")).collect()
+            } else if f.ignore_case {
                 // The filter language's SQL, so `--contains X --ignore-case` and `req:X OR resp:X`
                 // agree. SQLite folds each row's value on its own, never every body at once.
                 args.push(Box::new(c.clone()));
@@ -1899,6 +1910,21 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
             ValueRef::Null => false,
         })
     })?;
+    // `fold_contains(haystack, needle)`: whether the needle is in the haystack under Unicode full
+    // case folding. NULL for a NULL haystack, as `instr` gives.
+    conn.create_scalar_function("fold_contains", 2, flags, |ctx| {
+        let needle =
+            ctx.get_or_create_aux(1, |v| -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(case_fold(v.as_bytes()?))
+            })?;
+        let found = |hay: &[u8]| memchr::memmem::find(&case_fold(hay), &needle).is_some();
+        Ok(match ctx.get_raw(0) {
+            ValueRef::Text(t) | ValueRef::Blob(t) => Some(found(t)),
+            ValueRef::Integer(i) => Some(found(i.to_string().as_bytes())),
+            ValueRef::Real(f) => Some(found(f.to_string().as_bytes())),
+            ValueRef::Null => None,
+        })
+    })?;
     for n_args in [2, 3] {
         conn.create_scalar_function("regexp_extract", n_args, flags, move |ctx| {
             let re = cached_regex(ctx, 1)?;
@@ -1908,6 +1934,29 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+/// `bytes` with every valid UTF-8 run case-folded (Unicode CaseFolding.txt, C and F: `ß`
+/// becomes `ss`, the Kelvin sign `k`). Bytes that aren't UTF-8 are kept as they are, so a binary
+/// body is still searched in full. A folded needle (valid UTF-8) can't match across a kept byte:
+/// an invalid sequence never continues a valid character, nor starts one.
+pub(crate) fn case_fold(bytes: &[u8]) -> Vec<u8> {
+    use caseless::Caseless;
+    let mut out = Vec::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if c.is_ascii() {
+                out.push(c.to_ascii_lowercase() as u8);
+            } else {
+                let mut buf = [0u8; 4];
+                for f in std::iter::once(c).default_case_fold() {
+                    out.extend_from_slice(f.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+        out.extend_from_slice(chunk.invalid());
+    }
+    out
 }
 
 fn cached_regex(ctx: &rusqlite::functions::Context, idx: i32) -> rusqlite::Result<Arc<Regex>> {
@@ -2875,7 +2924,7 @@ mod tests {
     }
 
     #[test]
-    fn contains_can_ignore_ascii_case() {
+    fn contains_can_ignore_case() {
         let s = Store::open_in_memory().unwrap();
         let target = Target::from_url("http://a.test").unwrap();
         let rec = |headers: &str, body: &[u8], gzip: bool| {
@@ -2903,6 +2952,10 @@ mod tests {
         let binary = rec("", b"\x00\xff\xfe\x80STACK\x00trace\x00\xc3StAcK TrAcE\xff", false);
         let gz = rec("", b"compressed STACK trace", true);
         let cafe = rec("", "CAF\u{c9}".as_bytes(), false);
+        let strasse = rec("", "Gro\u{df}e STRASSE".as_bytes(), false);
+        // The Kelvin sign, then the same word with a byte that isn't UTF-8 in it.
+        let kelvin = rec("", &[b"300".as_slice(), "\u{212a}".as_bytes(), b" \xff"].concat(), false);
+        let broken = rec("", b"CA\xffF\xc3\xa9 300k", false);
         let ids = |c: &str, ignore_case: bool| {
             let f = HistoryFilter { contains: Some(c.into()), ignore_case, ..Default::default() };
             s.list(&f).unwrap().iter().map(|h| h.id).collect::<Vec<_>>()
@@ -2910,9 +2963,31 @@ mod tests {
         assert!(ids("stack trace", false).is_empty());
         assert_eq!(ids("stack trace", true), [body, binary, gz]);
         assert_eq!(ids("x-api-token: ABC", true), [header]);
-        // ASCII folds, letters outside ASCII match only as stored.
+        // Letters outside ASCII fold too.
         assert_eq!(ids("caf\u{c9}", true), [cafe]);
-        assert!(ids("caf\u{e9}", true).is_empty());
+        assert_eq!(ids("caf\u{e9}", true), [cafe]);
+        assert!(ids("caf\u{e9}", false).is_empty());
+        // Full folding: one letter can fold to two.
+        assert_eq!(ids("strasse", true), [strasse]);
+        assert_eq!(ids("GROSSE", true), [strasse]);
+        assert_eq!(ids("300k", true), [kelvin, broken]);
+        assert_eq!(ids("300\u{212a}", true), [kelvin, broken]);
+        // Bytes that aren't UTF-8 are kept as they are: no match across them, and around them folding still works.
+        assert!(ids("caf", true).iter().all(|&i| i != broken));
+        assert_eq!(ids("f\u{c9} 300K", true), [broken]);
+        // A regex, matched against the same bytes; (?i) is the regex crate's simple folding.
+        let re = |c: &str, ignore_case: bool| {
+            let f = HistoryFilter { contains: Some(c.into()), ignore_case, regex: true, ..Default::default() };
+            s.list(&f).unwrap().iter().map(|h| h.id).collect::<Vec<_>>()
+        };
+        assert_eq!(re(r"Stack\s+TRACE", false), [body]);
+        assert_eq!(re(r"stack\s+trace", true), [body, binary, gz]);
+        assert_eq!(re("caf\u{e9}", true), [cafe]);
+        assert!(re("grosse", true).is_empty(), "simple folding: ß is not ss");
+        assert_eq!(re("^X-Api-Token: abc", false), Vec::<i64>::new(), "^ is the start of the whole message");
+        assert_eq!(re("(?m)^X-Api-Token: abc", false), [header]);
+        let f = HistoryFilter { contains: Some("(".into()), regex: true, ..Default::default() };
+        assert_eq!(s.list(&f).unwrap_err().kind(), "invalid_input");
         // The same rows as the filter language's req and resp fields, which fold the same way.
         let q = |q: &str| {
             let f = HistoryFilter { filter: Some(q.into()), ..Default::default() };
