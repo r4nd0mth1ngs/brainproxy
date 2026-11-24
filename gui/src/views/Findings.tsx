@@ -69,6 +69,8 @@ import { RateFindings } from "./RateFindings";
 import { clearCommands, issueRatingLine, type IssueRating, RATE_FINDING, ratable, ratableOf, ratedLine, ratedTitle, ratingOf } from "./findingRating.ts";
 import { ReportBuilder } from "./ReportBuilder";
 import { SuppressDialog, SuppressionRules } from "./Suppressions.tsx";
+import { AlertFilters, FilterDialog } from "./AlertFilters.tsx";
+import { canFilter } from "./alertFilter.ts";
 import { alertNames, canSuppress, rulesLabel, SUPPRESS_LIST_ARGS, suppressedBy, suppressedKey, type SuppressionList } from "./suppression.ts";
 
 const RISKS: Risk[] = ["critical", "high", "medium", "low", "info"];
@@ -185,6 +187,9 @@ export function FindingsView({ active }: { active: boolean }) {
   const [suppressing, setSuppressing] = useState<Finding | null>(null);
   const [showRules, setShowRules] = useState(false);
   const openRules = () => setShowRules(true);
+  // Alert filters: a new one from the open finding, and their list (which reads its own).
+  const [reRating, setReRating] = useState<Finding | null>(null);
+  const [showFilters, setShowFilters] = useState(false);
 
   const view = useMemo<ListView>(() => ({ hideClosed: hideFp, filter, compare: comparing ? { seen, want: compare } : null, issueTitles }), [hideFp, filter, comparing, seen, compare, issueTitles]);
   const groups = useMemo(() => {
@@ -699,6 +704,10 @@ export function FindingsView({ active }: { active: boolean }) {
   const reportName = app.temp ? "engagement" : app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
   const noFinding: string | false = finding ? false : "No finding is open";
   const noSuppress: string | false = noFinding || (finding && !canSuppress(finding) ? "A rule leaves findings added by hand alone" : false);
+  const noFilter: string | false = noFinding || (finding && !canFilter(finding) ? "A filter leaves findings added by hand alone" : false);
+  const filterOpen = () => {
+    if (finding && finding.id === selected && canFilter(finding)) setReRating(finding);
+  };
   // Not a finding still shown while the one just picked (J, K) loads, as rateOpen.
   const suppressOpen = () => {
     if (finding && finding.id === selected && canSuppress(finding)) setSuppressing(finding);
@@ -713,6 +722,17 @@ export function FindingsView({ active }: { active: boolean }) {
     { ...RATE_FINDING, hidden: !active, disabled: noFinding || (finding && !ratable(finding) ? "A finding added by hand has its own risk: Edit… it" : false), run: rateOpen },
     { id: "findings.new", title: "New finding…", group: "Findings", keywords: "write up manual issue", run: () => app.newFinding({}) },
     { id: "findings.suppress", title: "Suppress the open finding…", group: "Findings", keywords: "false positive rule ignore hide", hidden: !active, disabled: noSuppress, run: suppressOpen },
+    { id: "findings.filter", title: "Re-rate future findings like the open one…", group: "Findings", keywords: "alert filter rating risk confidence rule", hidden: !active, disabled: noFilter, run: filterOpen },
+    {
+      id: "findings.filters",
+      title: "Alert filters…",
+      group: "Findings",
+      keywords: "re-rate rating risk confidence rule remove",
+      run: () => {
+        app.setTab("findings");
+        setShowFilters(true);
+      },
+    },
     {
       id: "findings.suppressions",
       title: "Suppression rules…",
@@ -1066,6 +1086,11 @@ export function FindingsView({ active }: { active: boolean }) {
                 >
                   Ticket ▾
                 </button>
+                {canFilter(finding) && (
+                  <button className="btn small" onClick={() => setReRating(finding)} title="Give this alert (on this host, under a path, of a parameter, or by regex) a risk and/or confidence of your own wherever scans find it, now and later">
+                    Re-rate future findings…
+                  </button>
+                )}
                 {canSuppress(finding) && (
                   <button className="btn small" onClick={() => setSuppressing(finding)} title="Make this alert on this host (under a path, of a parameter) a false positive wherever scans find it, now and later">
                     Suppress…
@@ -1128,7 +1153,17 @@ export function FindingsView({ active }: { active: boolean }) {
                 {ratingOf(finding) && (
                   <>
                     <dt>Rating</dt>
-                    <dd>{ratedLine(ratingOf(finding)!)}</dd>
+                    <dd>
+                      {ratedLine(ratingOf(finding)!)}
+                      {ratingOf(finding)!.filter != null && (
+                        <>
+                          {" "}
+                          <button className="link" onClick={() => setShowFilters(true)} title="Show the alert filters">
+                            Alert filters…
+                          </button>
+                        </>
+                      )}
+                    </dd>
                   </>
                 )}
                 {issueRating && finding.issue_id != null && finding.source !== "manual" && (
@@ -1350,6 +1385,17 @@ export function FindingsView({ active }: { active: boolean }) {
         />
       )}
       {showRules && <SuppressionRules names={names} close={() => setShowRules(false)} changed={suppressionChanged} />}
+      {reRating && (
+        <FilterDialog
+          finding={reRating}
+          close={() => setReRating(null)}
+          added={(note) => {
+            setReRating(null);
+            suppressionChanged(note);
+          }}
+        />
+      )}
+      {showFilters && <AlertFilters names={names} close={() => setShowFilters(false)} changed={suppressionChanged} />}
     </div>
   );
 }

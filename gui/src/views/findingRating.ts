@@ -32,6 +32,7 @@ export interface RatedColumns {
   rated_at?: string | null;
   scanner_risk?: Risk | null;
   scanner_confidence?: string | null;
+  rated_by?: number | null;
 }
 
 /** A finding's rating from either `findings list --all` (`rated`) or `findings show` (columns). */
@@ -44,6 +45,7 @@ export function ratingOf(f: RatedColumns): Rated | null {
     reason: f.rated_reason ?? null,
     origin: f.rated_origin,
     at: f.rated_at ?? null,
+    ...(f.rated_by != null ? { filter: f.rated_by } : {}),
   };
 }
 
@@ -188,13 +190,16 @@ export function ratedLine(r: Rated): string {
   const when = r.at ? ` on ${new Date(r.at).toLocaleString()}` : "";
   const by = who(r.origin);
   const scanner = ratingWords(r.scanner_risk, r.scanner_confidence);
-  return `Rated by a person${by ? ` ${by}` : ""}${when}${r.reason ? `: ${r.reason}` : ""}.${scanner ? ` The scanner said ${scanner}.` : ""}`;
+  // An alert filter's rating is its author's, given to the findings it matched.
+  const rater = r.filter != null ? `Rated by filter ${r.filter} (added by a person${by ? ` ${by}` : ""})` : `Rated by a person${by ? ` ${by}` : ""}`;
+  return `${rater}${when}${r.reason ? `: ${r.reason}` : ""}.${scanner ? ` The scanner said ${scanner}.` : ""}`;
 }
 
 /** The list's tooltip on a rated finding's tag. */
 export function ratedTitle(f: Pick<FindingItem, "risk" | "confidence">, r: Rated): string {
   const scanner = ratingWords(r.scanner_risk, r.scanner_confidence);
-  return `Rated ${ratingWords(f.risk, f.confidence)} by a person${scanner ? `; the scanner said ${scanner}` : ""}${r.reason ? `. ${r.reason}` : ""}`;
+  const rater = r.filter != null ? `filter ${r.filter}` : "a person";
+  return `Rated ${ratingWords(f.risk, f.confidence)} by ${rater}${scanner ? `; the scanner said ${scanner}` : ""}${r.reason ? `. ${r.reason}` : ""}`;
 }
 
 /** The line under a finding whose issue is rated as a whole. */

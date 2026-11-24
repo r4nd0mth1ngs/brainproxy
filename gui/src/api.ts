@@ -245,6 +245,8 @@ export interface Rated {
   /** gui or cli. */
   origin: string;
   at: string | null;
+  /** The alert filter (`findings filter`) whose rating it is; null when a person rated it. */
+  filter?: number | null;
 }
 
 /** One change on a finding's timeline (`findings timeline`). */
@@ -296,6 +298,8 @@ export interface Finding extends FindingItem {
   rated_at?: string | null;
   scanner_risk?: Risk | null;
   scanner_confidence?: string | null;
+  /** The alert filter whose rating it has; null when a person rated it. */
+  rated_by?: number | null;
 }
 
 /** True when a body came as base64, i.e. `bodyText` gives one char per byte (Latin-1). */
