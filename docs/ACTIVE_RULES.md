@@ -117,6 +117,34 @@ These use IDs from 100000, so they never clash with ZAP's.
   send email below HIGH. The made-up host isn't in the scope, so through MCP the rule runs only
   with `scan active --host-header-test`; without it the scan leaves the rule out and lists it in
   the summary's `skipped`. From a terminal or the app it runs whenever it is selected.
+- **100012 GraphQL Misconfiguration**, once per GraphQL endpoint (origin and path). It runs on
+  a request that carries a GraphQL document (a `query` in a JSON body or batch, the URL, a form,
+  an `application/graphql` body or a multipart upload's `operations`), or on one answered with a
+  JSON object holding `data` or `errors` at a path where history has such a request (a persisted
+  query, say). It doesn't look for GraphQL at paths where none was recorded. Every request reads
+  `__typename` or the query type's name: no mutation is ever sent, and the base request's own
+  operation isn't sent again.
+  - 100012-1 *GraphQL Introspection Enabled* (low): `query{__schema{queryType{name}}}`, the
+    smallest introspection query, is answered with the type's name. The full introspection query
+    is never sent; `import api --graphql` reads the schema when you want it.
+  - 100012-2 *GraphQL Field Suggestions Enabled* (low; info when introspection is on anyway): a
+    root field the base request selects, misspelt (`userx` for `user`; for a persisted query, a
+    key of its answer's `data`), gets "Did you mean" in the errors. Without a root field to
+    misspell, this request isn't sent.
+  - 100012-3 *GraphQL Batching Allowed*: a JSON array of 10 `{__typename}` queries gets 10
+    answers (low), or failing that one query with 10 aliases (`a0:__typename` … `a9:__typename`)
+    is answered in full (info: almost every server allows aliases). The batch is always 10, enough
+    to show there's no limit, never a load test.
+  - 100012-4 *GraphQL Queries Accepted over GET or a Simple POST*: `{__typename}` is answered as a
+    GET query parameter, a form-encoded POST or a `text/plain` POST, the requests another site can
+    make a browser send without a preflight. These carry only the headers such a request would
+    (the cookies, `User-Agent`, `Accept*`; not `Authorization`, a CSRF token or other custom
+    headers), and the POSTs a made-up foreign `Origin`. Medium when the base request sends cookies,
+    low otherwise. Only a read is sent, so whether mutations go through the same way isn't tried.
+
+  The POSTs go with the base request's headers (and the scan's session) and `Content-Type:
+  application/json`; the GET carries a random cache-buster parameter. Requests per endpoint: 7, or
+  6 when there is no root field to misspell, at every strength.
 
 ## Rules
 
@@ -180,6 +208,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 100006 | Response Differs over HTTP/3 | page | medium | 100006-1, 100006-2 |
 | 100007 | JWT Weaknesses | page | high | 100007-1, 100007-2, 100007-3, 100007-4, 100007-5, 100007-6, 100007-7, 100007-8 |
 | 100010 | Host Header Injection | page | high | 100010-1, 100010-2, 100010-3 |
+| 100012 | GraphQL Misconfiguration | page | medium | 100012-1, 100012-2, 100012-3, 100012-4 |
 
 Scopes: `param` runs once per insertion point (query, form, JSON, XML, multipart; cookies,
 headers and URL path segments when enabled; the names of parameters, JSON keys, cookies and

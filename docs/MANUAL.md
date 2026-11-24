@@ -2548,7 +2548,11 @@ Crawl and active-scan scope and safety flags:
   `--graphql` with an endpoint's URL introspects it instead. Each query field becomes an
   operation with typed example variables, and mutations are opt-in as `--include-methods MUTATION`,
   like PUT and DELETE. Introspection that's turned off or needs a login says so; use a schema file,
-  or `--auth`.
+  or `--auth`. `scan active --api schema.graphql --base-url URL --rules 100012` (or `--graphql`
+  with the endpoint's URL) also tests the endpoint itself, once: introspection, field suggestions,
+  batching (an array of 10 queries, 10 aliases) and queries over GET or a form or `text/plain`
+  POST, in 7 requests that read `__typename` and never a mutation. The rule runs on recorded
+  GraphQL traffic too; see rule 100012 in [ACTIVE_RULES.md](ACTIVE_RULES.md).
 - The preview also lists what the document declares about OAuth (`oauth`: flow, token and sign-in
   URLs, scopes, an OpenID Connect discovery URL) and a Postman collection's AWS Signature settings
   (`aws`: region and service), to fill in a profile or signer. Client ids and secrets are never shown.
