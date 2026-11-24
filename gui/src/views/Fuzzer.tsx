@@ -13,10 +13,22 @@ import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
 import { useActions } from "../ui/useActions.ts";
 import { subTabActions } from "../nav";
+import {
+  extractProblem,
+  GENERATORS,
+  generatorUnavailable,
+  LIVE_STATES,
+  NEW_SET,
+  payloadSpec,
+  runControls,
+  usesExtract,
+  type Generator,
+  type Mode,
+  type PayloadSet,
+  type Source,
+} from "./fuzzPayloads.ts";
 
 const M = "§";
-
-type Mode = "sniper" | "battering-ram" | "pitchfork" | "cluster-bomb";
 
 const MODES: { id: Mode; label: string; help: string }[] = [
   { id: "sniper", label: "Sniper", help: "One payload set; each position in turn, the others keep their value." },
@@ -24,21 +36,6 @@ const MODES: { id: Mode; label: string; help: string }[] = [
   { id: "pitchfork", label: "Pitchfork", help: "One set per position, walked in step (the shortest set ends the attack)." },
   { id: "cluster-bomb", label: "Cluster bomb", help: "One set per position, every combination." },
 ];
-
-type Source = "builtin" | "list" | "range" | "file";
-
-interface PayloadSet {
-  source: Source;
-  wordlist: string; // built-in list name (`brainproxy wordlists list`)
-  list: string; // one payload per line
-  from: string;
-  to: string;
-  step: string;
-  file: string;
-  process: string; // comma-separated chain, e.g. "url,base64"
-}
-
-const NEW_SET: PayloadSet = { source: "builtin", wordlist: "sqli", list: "", from: "1", to: "100", step: "1", file: "", process: "" };
 
 interface Wordlist {
   name: string;
@@ -126,15 +123,6 @@ export function fillHost(raw: string, target: string): string {
   return raw.replace(/^(host:)[ \t]*(?=\r?\n|$)/im, `$1 ${target.replace(/^[a-z]+:\/\//i, "").replace(/\/.*$/, "")}`);
 }
 
-export function payloadSpec(s: PayloadSet): string {
-  if (s.source === "builtin") return `wordlist:${s.wordlist}`;
-  if (s.source === "range") return `range:${s.from}-${s.to}${s.step && s.step !== "1" ? `:${s.step}` : ""}`;
-  if (s.source === "file") return `file:${s.file}`;
-  // ponytail: list: escapes commas as \, ; a payload ending in a backslash before the next one is misread.
-  const items = s.list.split("\n").map((l) => l.replace(/\r$/, "")).filter((l) => l !== "");
-  return "list:" + items.map((p) => p.replace(/,/g, "\\,")).join(",");
-}
-
 export function FuzzerView() {
   const app = useApp();
   const [sub, setSub] = useState<"attack" | "results" | "runs">("attack");
@@ -202,6 +190,9 @@ function Attack({ onStarted, onShow, active }: { onStarted: (id: number) => void
   useEffect(() => {
     loadWordlists().then(setLists, () => {});
   }, []);
+  // OOB tokens are offered only while the project's listener runs.
+  const [oobStatus] = usePoll<{ running: boolean }>(() => run(["oob", "status"]), 5000, active);
+  const oobRunning = !!oobStatus?.running;
   const back = useRef<HTMLPreElement>(null);
 
   // A request sent from another tool replaces the template.
@@ -236,8 +227,10 @@ function Attack({ onStarted, onShow, active }: { onStarted: (id: number) => void
     const to = withScheme(target || guessTarget(raw));
     if (!to) return app.toast("Set a target (scheme://host[:port]) or a Host header", "error");
     if (!positions) return app.toast("Mark at least one payload position with §value§", "error");
-    setTarget(to);
     const used = sets.slice(0, needed);
+    const problem = extractProblem(used, opts.extract, opts.maxRequests);
+    if (problem) return app.toast(problem, "error");
+    setTarget(to);
     // The raw request goes on stdin: argv can't hold NUL bytes or megabytes, and `ps` shows it.
     const args = ["fuzz", "run", "--background", `--mode=${mode}`, `--target=${to}`];
     used.forEach((s, i) => {
@@ -357,9 +350,9 @@ function Attack({ onStarted, onShow, active }: { onStarted: (id: number) => void
                 {needed > 1 && <span className="muted small">position {i + 1}</span>}
                 <span className="grow" />
                 <div className="seg">
-                  {(["builtin", "list", "range", "file"] as Source[]).map((src) => (
+                  {(["builtin", "list", "range", "file", "generator"] as Source[]).map((src) => (
                     <button key={src} className={s.source === src ? "on" : ""} onClick={() => setSet(i, { source: src })}>
-                      {src === "builtin" ? "Built-in" : src === "list" ? "List" : src === "range" ? "Numbers" : "File"}
+                      {SOURCE_LABELS[src]}
                     </button>
                   ))}
                 </div>
@@ -400,6 +393,14 @@ function Attack({ onStarted, onShow, active }: { onStarted: (id: number) => void
               {s.source === "file" && (
                 <input className="input mono" placeholder="/path/to/wordlist.txt (one payload per line)" value={s.file} onChange={(e) => setSet(i, { file: e.target.value })} />
               )}
+              {s.source === "generator" && (
+                <GeneratorForm
+                  gen={s.gen}
+                  why={generatorUnavailable(s.gen.kind, mode, positions, oobRunning)}
+                  offered={GENERATORS.filter((g) => g.kind === s.gen.kind || !generatorUnavailable(g.kind, mode, positions, oobRunning))}
+                  onChange={(patch) => setSet(i, { gen: { ...s.gen, ...patch } })}
+                />
+              )}
               <div className="row gap">
                 <span className="muted">Processing</span>
                 <input
@@ -412,6 +413,9 @@ function Attack({ onStarted, onShow, active }: { onStarted: (id: number) => void
               </div>
             </section>
           ))}
+          {usesExtract(sets.slice(0, needed)) && (
+            <p className="muted small">An Extract set runs one request at a time: each response's Extract capture goes into the next request.</p>
+          )}
           <section>
             <div className="label">Match</div>
             <Field label="Grep">
@@ -467,6 +471,73 @@ function Attack({ onStarted, onShow, active }: { onStarted: (id: number) => void
           </section>
         </div>
       </Split>
+    </div>
+  );
+}
+
+const SOURCE_LABELS: Record<Source, string> = { builtin: "Built-in", list: "List", range: "Numbers", file: "File", generator: "Generator" };
+
+/** A generated set: the kind, and the few fields that kind takes. */
+function GeneratorForm(p: { gen: Generator; why: string | null; offered: typeof GENERATORS; onChange: (patch: Partial<Generator>) => void }) {
+  const { gen: g, onChange } = p;
+  const text = (key: keyof Generator, placeholder: string, width?: number) => (
+    <input
+      className={`input mono${width ? "" : " grow"}`}
+      style={width ? { width } : undefined}
+      placeholder={placeholder}
+      value={g[key]}
+      onChange={(e) => onChange({ [key]: e.target.value } as Partial<Generator>)}
+    />
+  );
+  const info = GENERATORS.find((x) => x.kind === g.kind);
+  return (
+    <div className="col gap">
+      <div className="row gap">
+        <select className="input" value={g.kind} onChange={(e) => onChange({ kind: e.target.value as Generator["kind"] })}>
+          {p.offered.map((x) => (
+            <option key={x.kind} value={x.kind}>
+              {x.label}
+            </option>
+          ))}
+        </select>
+        {g.kind === "null" && <Field label="Count">{text("count", "10", 80)}</Field>}
+        {g.kind === "oob" && (
+          <>
+            <Field label="Count">{text("count", "10", 80)}</Field>
+            <select className="input" value={g.oobForm} onChange={(e) => onChange({ oobForm: e.target.value as Generator["oobForm"] })}>
+              <option value="url">as a URL</option>
+              <option value="host">as a host</option>
+            </select>
+          </>
+        )}
+        {g.kind === "copy" && <Field label="Position">{text("position", "1", 60)}</Field>}
+      </div>
+      {g.kind === "dates" && (
+        <div className="row gap fz-wrap">
+          {text("dateFrom", "2024-01-01", 110)}
+          <span className="muted">to</span>
+          {text("dateTo", "2024-12-31", 110)}
+          <Field label="Step">{text("dateStep", "1d", 60)}</Field>
+          <Field label="Format">{text("dateFormat", "%Y-%m-%d", 110)}</Field>
+        </div>
+      )}
+      {g.kind === "brute" && (
+        <div className="row gap">
+          <Field label="Characters">{text("charset", "a-z0-9")}</Field>
+          <Field label="Length">{text("min", "1", 50)}</Field>
+          <span className="muted">to</span>
+          {text("max", "3", 50)}
+        </div>
+      )}
+      {(g.kind === "case" || g.kind === "subst") && <Field label="Word">{text("word", "admin")}</Field>}
+      {g.kind === "subst" && <Field label="Map">{text("map", "default: a=4@,e=3,i=1!,o=0,s=5$")}</Field>}
+      {g.kind === "bitflip" && <Field label="Value">{text("value", "empty: the position's value")}</Field>}
+      {g.kind === "extract" && <Field label="First">{text("value", "empty: the position's value")}</Field>}
+      {g.kind === "usernames" && (
+        <textarea className="code fz-list" spellCheck={false} placeholder="One full name per line, e.g. John Smith" value={g.names} onChange={(e) => onChange({ names: e.target.value })} />
+      )}
+      {info && <p className="muted small">{info.help}</p>}
+      {p.why && <p className="fz-caution small">{p.why}</p>}
     </div>
   );
 }
@@ -542,7 +613,12 @@ interface Result {
   history_id: number | null;
 }
 
-const LIVE = new Set(["queued", "running", "stopping"]);
+const LIVE = LIVE_STATES;
+
+/** Pauses, resumes or stops run `id`; `then` runs once the CLI has taken it. */
+function control(id: number, what: "pause" | "resume" | "stop", toast: (m: string, kind?: "error") => void, then?: () => void) {
+  run(["fuzz", what, String(id)]).then(() => then?.(), (e) => toast(e.message, "error"));
+}
 
 /** `fuzz results` rows: payloads and grep are JSON text in the cells. */
 function toResults(t: Table): Result[] {
@@ -653,7 +729,10 @@ function RunResults({ id, active }: { id: number; active: boolean }) {
     );
   }, [rows, filter, outliers]);
 
-  const stop = () => run(["fuzz", "stop", String(id)]).catch((e) => app.toast(e.message, "error"));
+  const stop = () => control(id, "stop", app.toast);
+  const pause = () => control(id, "pause", app.toast);
+  // A stopped or failed run relaunched is live again: its results are polled once more.
+  const resume = () => control(id, "resume", app.toast, () => setFinal(false));
 
   const columns = useMemo<Column<Result>[]>(
     () => [
@@ -706,6 +785,7 @@ function RunResults({ id, active }: { id: number; active: boolean }) {
 
   const s = summary?.run;
   const live = s ? LIVE.has(s.state) : true;
+  const can = runControls(s?.state);
   const b = summary?.baseline;
   return (
     <div className="col fill">
@@ -717,7 +797,16 @@ function RunResults({ id, active }: { id: number; active: boolean }) {
         <span className="muted">
           {s ? `${s.done}/${s.total} · ${s.matched} matched · ${s.errors} errors` : ""}
         </span>
-        <button className="btn" disabled={!s || !live || s.state === "stopping"} onClick={stop}>
+        {can.resume ? (
+          <button className="btn" onClick={resume} title="A paused run goes on; a stopped or failed one sends the requests it has no results for">
+            {can.resumeLabel}
+          </button>
+        ) : (
+          <button className="btn" disabled={!can.pause} onClick={pause} title="Requests in flight finish; no new ones start until you resume">
+            Pause
+          </button>
+        )}
+        <button className="btn" disabled={!can.stop} onClick={stop}>
           Stop
         </button>
         <span className="sep" />
@@ -770,18 +859,34 @@ function RunResults({ id, active }: { id: number; active: boolean }) {
 
 function Runs({ active, current, onOpen }: { active: boolean; current: number | null; onOpen: (id: number) => void }) {
   const [selected, setSelected] = useState<number | null>(current);
-  const [list] = usePoll<Table>(() => run(["fuzz", "list", "--limit", "200"]), 2000, active);
+  const app = useApp();
+  const [list, refresh] = usePoll<Table>(() => run(["fuzz", "list", "--limit", "200"]), 2000, active);
   const rows = useMemo(() => {
     if (!list) return [];
     const col = Object.fromEntries(list.columns.map((c, i) => [c, i]));
     return list.rows.map((r) => Object.fromEntries(Object.keys(col).map((k) => [k, r[col[k]]])) as unknown as RunInfo);
   }, [list]);
+  const picked = rows.find((r) => r.id === selected);
+  const can = runControls(picked?.state);
+  const act = (what: "pause" | "resume" | "stop") => selected != null && control(selected, what, app.toast, refresh);
 
   return (
     <div className="col fill">
       <div className="toolbar">
         <button className="btn primary" disabled={selected == null} onClick={() => selected != null && onOpen(selected)}>
           Open results
+        </button>
+        {can.resume ? (
+          <button className="btn" onClick={() => act("resume")}>
+            {can.resumeLabel}
+          </button>
+        ) : (
+          <button className="btn" disabled={!can.pause} onClick={() => act("pause")}>
+            Pause
+          </button>
+        )}
+        <button className="btn" disabled={!can.stop} onClick={() => act("stop")}>
+          Stop
         </button>
         <span className="muted">Double-click a run to open its results</span>
       </div>
