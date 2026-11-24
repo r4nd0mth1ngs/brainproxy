@@ -950,7 +950,9 @@ fn a_request_scripts_rewrite_goes_to_scan_baselines_and_meets_the_host_check() {
         env.run(&["scan", "active", &format!("http://127.0.0.1:{port}/danger?q=1"), "--strength", "low", "-c", "1"]);
     let got = lines.lock().unwrap().clone();
     assert!(got.iter().any(|l| l.starts_with("GET /safe")), "{got:?}");
-    assert!(!got.iter().any(|l| l.contains("/danger")), "{got:?}");
+    // Nothing went to a path the script rewrites (rules may still name the file elsewhere, as
+    // in a backup copy `/Copy of danger` or `/.svn/text-base/danger.svn-base`).
+    assert!(!got.iter().any(|l| l.split(' ').nth(1).is_some_and(|p| p.starts_with("/danger"))), "{got:?}");
     // The baseline's row says the script changed it.
     let baseline = env.rows("SELECT path, edited_by FROM history WHERE source = 'scan' ORDER BY id LIMIT 1");
     assert_eq!(baseline[0][0], "/safe", "{baseline:?}");

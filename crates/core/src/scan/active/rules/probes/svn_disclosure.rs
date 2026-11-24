@@ -5,7 +5,7 @@
 //! folder above, whose `nodes` table names the file's pristine copy. ZAP stops the whole rule
 //! at the first 4xx or 5xx answer, so on most sites it never reads a `wc.db`, and it never
 //! tries the root folder; here a missing file moves on to the next place, and the root is
-//! tried too.
+//! tried too. A `wc.db` is fetched once per scan, however many pages sit under it.
 
 use super::git_disclosure::{file_name, matches_extension, SOURCE_DESC};
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, Response, RuleScope, Strength};
@@ -144,7 +144,8 @@ impl ActiveRule for SvnDisclosure {
                     return;
                 }
                 let wc_db = format!("{dir}.svn/wc.db");
-                if let Ok(resp) = cx.send(cx.request_for("GET", &wc_db)).await {
+                // One working copy database serves every page under it: fetched once per scan.
+                if let Ok(resp) = cx.send_once(wc_db.as_bytes(), cx.send(cx.request_for("GET", &wc_db))).await {
                     if usable(cx, &resp) {
                         let relpath = path[dir.len()..].to_string();
                         let Some(file) = pristine(resp.body.clone(), relpath).await else { return };
@@ -224,10 +225,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_site_without_svn_and_a_catch_all() {
-        let safe = serve(|r| if r.path == "/a/b.php" { html("<html>b</html>") } else { not_found() });
-        let (s, found) = scan(42, vec![get(safe, "/a/b.php")], Opts::default()).await;
+        let safe =
+            serve(|r| if r.path == "/a/b.php" || r.path == "/a/c.php" { html("<html>b</html>") } else { not_found() });
+        let (s, found) = scan(42, vec![get(safe, "/a/b.php"), get(safe, "/a/c.php")], Opts::default()).await;
         assert!(found.is_empty());
-        assert_eq!(s.requests, 3, "text-base, then wc.db in /a/ and /");
+        assert_eq!(s.requests, 4, "a text-base per page, then wc.db in /a/ and / once for both");
         // Every path answers the page itself: nothing.
         let same = serve(|_| html("<html><?php in a page</html>"));
         let (_, found) = scan(42, vec![get(same, "/a/b.php")], Opts::default()).await;
