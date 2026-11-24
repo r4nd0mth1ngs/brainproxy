@@ -1,8 +1,9 @@
-//! End-to-end: the session rules through the real engine against an
+//! End-to-end: the session rules and SOAP action spoofing through the real engine against an
 //! in-test server with a vulnerable and a fixed version of each: a login that keeps the session
 //! cookie it was given and says whether the user exists, and one that renews it and doesn't; a
-//! page that ignores its session cookie and one that needs every cookie; and an upload served
-//! back as HTML and one served as a download.
+//! page that ignores its session cookie and one that needs every cookie; an upload served back
+//! as HTML and one served as a download; a SOAP service that ignores SOAPAction and one that
+//! checks it.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -226,6 +227,13 @@ fn upload(port: u16, path: &str) -> ScanTarget {
     post(port, path, "Content-Type: multipart/form-data; boundary=b\r\n", body)
 }
 
+fn soap(port: u16, path: &str) -> ScanTarget {
+    let body =
+        "<?xml version=\"1.0\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body>\
+                <m:GetPrice xmlns:m=\"urn:x\"><m:Item>apple</m:Item></m:GetPrice></soap:Body></soap:Envelope>";
+    post(port, path, "Content-Type: text/xml; charset=utf-8\r\nSOAPAction: \"urn:GetPrice\"\r\n", body)
+}
+
 /// An `--auth` profile for alice whose login is the form at `login`, already logged in.
 fn session(db: &std::path::Path, guard: &Arc<Guard>, port: u16, login: &str) -> Arc<AuthSession> {
     let profile = AuthProfile {
@@ -357,4 +365,16 @@ async fn an_upload_served_back_as_html_is_found_and_a_download_is_not() {
     assert_eq!(vulnerable.refs, ["40041-1", "40041-2"]);
     let fixed = scan(port, upload(port, "/upload-fixed"), &[40041], None).await;
     assert_eq!(fixed.refs, ["40041-2"], "the files left are still listed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_that_ignores_soapaction_is_found_and_one_that_checks_it_is_not() {
+    let port = spawn_app();
+    let vulnerable = scan(port, soap(port, "/soap"), &[90026], None).await;
+    assert_eq!(vulnerable.refs, ["90026"]);
+    let fixed = scan(port, soap(port, "/soap-fixed"), &[90026], None).await;
+    assert!(fixed.refs.is_empty(), "{:?}", fixed.refs);
+    // Not a SOAP request: nothing sent.
+    let plain = scan(port, get(port, "/", ""), &[90026], None).await;
+    assert_eq!(plain.summary.requests, 0);
 }

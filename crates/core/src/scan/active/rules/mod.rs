@@ -16,6 +16,7 @@ mod jwt_e2e;
 pub(super) mod params;
 pub(crate) mod probes;
 mod session;
+mod soap_action_spoofing;
 
 use crate::scan::active::ActiveRule;
 
@@ -26,6 +27,7 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(graphql::GraphqlMisconfiguration),
         Box::new(host_header::HostHeaderInjection),
         Box::new(jwt::JwtWeaknesses),
+        Box::new(soap_action_spoofing::SoapActionSpoofing),
     ];
     rules.extend(injection::all());
     rules.extend(params::all());
