@@ -480,6 +480,10 @@ The sidebar groups the tools by what you are doing.
   - **Actions:** right-click to send to Replay, Fuzzer, or Diff, copy the URL or the request
     as a curl command, add a note, highlight (*Remove highlight* on a highlighted row), or
     *Create finding…* for an issue you found by hand in that request.
+  - **CSRF proof of concept…** and **Clickjacking proof of concept…** (right-click, or the
+    palette for the selected row) write a page that sends the request from a visitor's
+    browser, or frames its URL under a decoy (see
+    [Proof-of-concept pages](#proof-of-concept-pages-poc)). The dialog shows the page's HTML as text (the app never renders it) with what the page can't do as the request did, and has **Copy**, **Save…**, and **Open in browser…**, which writes it to the temporary folder and opens it after a confirmation, since opening it sends the request from your browser outside brainproxy's scope checks.
   - **Scan this request…** asks first, naming the request, then runs an active scan of that
     request in the background (`scan active --history-id`, medium strength). Once the Nuclei
     templates are downloaded, those of high severity and up also run against its site, and
@@ -577,6 +581,10 @@ Edit a raw request and send it as often as you like, in separate tabs.
   The command runs outside brainproxy, so the engagement scope doesn't apply to it. Bodies
   over 128 KB may be too long for one shell argument; save those to a file and use
   `--data-binary @FILE`.
+- **CSRF PoC…** (also *CSRF proof of concept of this request…* and *Clickjacking proof of
+  concept of this request's URL…* in the palette): a proof-of-concept page for the request as
+  Send would send it, to the tab's target (`poc csrf --file - --target`; see
+  [Proof-of-concept pages](#proof-of-concept-pages-poc)). The dialog shows the page's HTML as text (the app never renders it) with what the page can't do as the request did, and has **Copy**, **Save…**, and **Open in browser…**, which writes it to the temporary folder and opens it after a confirmation, since opening it sends the request from your browser outside brainproxy's scope checks.
 - **Options** (per tab): each option that isn't the default shows as a chip next to the
   button, so you can see how the tab sends.
   - **HTTP/2**: send over HTTP/2 (`send --http2`). The request line can stay `HTTP/1.1`.
@@ -1304,7 +1312,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 199 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 201 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -3368,6 +3376,65 @@ the highest score of the alert type when one is rated. CVSS 3.1 vectors are refu
   `DD_DEDUPLICATION_ALGORITHM_PER_PARSER='{"Generic Findings Import": "unique_id_from_tool_or_hash_code"}'`
   matches brainproxy's findings by fingerprint and the others by hash as before. Every export names a finding by the same fingerprint
   as `report json`, SARIF and tickets.
+
+### Proof-of-concept pages (`poc`)
+
+`poc csrf` and `poc clickjacking` write an HTML page from a recorded request, for a report or
+to show a finding such as an absent anti-CSRF token (10202) or a missing anti-clickjacking
+header (10020). Nothing is sent: brainproxy only reads the project. Opening the page in a
+browser sends its requests from that browser straight to the target, outside brainproxy's
+scope checks (unless the browser uses the proxy), and with the browser's cookies for the site.
+
+```bash
+brainproxy poc csrf --history-id 42 [--technique form|fetch] [--auto-submit] [--drop-param NAME]... [-o FILE [--force]]
+brainproxy poc csrf --file - --target https://shop.example < request.txt
+brainproxy poc clickjacking (--history-id 42 | --url URL) [--opacity 0.5] [--decoy TEXT] [-o FILE [--force]]
+```
+
+- **`poc csrf`** takes the request by history id, or as a raw request file (`-` is stdin)
+  with `--target`, as Replay passes a tab's request. `--technique form` (the default) writes
+  an HTML form, a top-level navigation; `fetch` writes a script that sends it with the
+  visitor's cookies (`credentials: "include"`, `mode: "no-cors"` for what a form could send
+  too). `--auto-submit` sends it as soon as the page opens; otherwise the page has a button.
+  - A GET request's query and a urlencoded body become hidden inputs; a multipart body a
+    multipart form, whose file parts only `fetch` sends (as `FormData` with the recorded
+    bytes). A JSON or any other body goes as `text/plain`: in a form, as one field whose name
+    and value join at an `=` in the body, so the browser sends the body again byte for byte;
+    a JSON object without an `=` gains a member `"_": "="` to hold it (a warning says so), and
+    `fetch` sends the body exactly. Either way the server must accept `text/plain`.
+  - Recorded values are written into the page as they are. A parameter named like an
+    anti-CSRF token (the names rule 10202 knows: `csrf_token`, `_token`,
+    `authenticity_token`, ...) is kept, with a warning naming it: `--drop-param NAME` leaves
+    it out (or any field, query parameter or top-level JSON member; repeatable) to show
+    whether the server checks it. A field named like a secret (password, token, session,
+    ...) gets a warning too: replace or drop it before the page is shared.
+  - Warnings say what a page on another site can't do as the request did: a method other
+    than GET and POST (a form sends POST; `fetch` sends it after a CORS preflight the server
+    must allow, see rule 40040), headers a browser doesn't add by itself (`X-Requested-With`,
+    `Authorization`, a token header), no cookies at all, and cookies whose last recorded
+    `Set-Cookie` for the host says `SameSite=Strict`, or `Lax` for anything but a GET form
+    (Chromium-based browsers treat a cookie set without `SameSite` as `Lax`).
+  - JSON: `{"kind":"csrf","history_id","method","action","encoding","technique","fields":[{"name","value"}],"auto_submit","warnings":[...],"html","path"}`.
+    `method` is what the page sends, `encoding` one of `query`, `urlencoded`, `multipart`,
+    `json` or `text`, a file part's field has a `filename`, and `history_id` is null for
+    `--file`.
+- **`poc clickjacking`** frames the URL (a history entry's, or `--url`, whose newest recorded
+  response is read) over a decoy button. The page has an opacity slider (`--opacity`, 0 to 1,
+  is where it starts) and the decoy's position, typed or placed with a click while clicks
+  pass through the frame. `--decoy TEXT` is the button's text.
+  - JSON: `{"kind":"clickjacking","history_id","url","framing":{"x_frame_options","frame_ancestors","blocked"},"warnings","html","path"}`.
+    `blocked` is whether browsers refuse the recorded response in another site's frame:
+    `Content-Security-Policy` `frame-ancestors` decides where a policy has it (each policy
+    must allow `*`, `https:` or `http:`), else an `X-Frame-Options` value rule 10020 takes as
+    valid (DENY or SAMEORIGIN); `ALLOW-FROM` blocks nothing. It is null when no response is
+    recorded, with a warning. Cookies the framed page needs that are `SameSite=Lax` or
+    `Strict` (or set without it) get a warning: a cross-site frame loads without them.
+- Every value from the target is escaped: HTML-escaped in attributes and text, and in a
+  script JSON-encoded with `<`, `>` and `&` written as `\u` escapes, so a value can't close
+  the script or add markup. Only http and https URLs make a page.
+- Without `--output` the page is the text output (`> poc.html`), with the warnings on stderr;
+  `--output FILE` writes it to a new file, and an existing one is kept unless `--force`,
+  which is refused through MCP.
 
 ### Comparing findings and failing a build (`findings compare`)
 

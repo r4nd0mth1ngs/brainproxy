@@ -148,7 +148,9 @@ set, and a person changes anything.
   and a new pid, which `proxy_status` shows in `restart_gone`), `*_remove`, `*_clear`,
   `scope_set`, `scan_data_reset`. `replay_tabs_save` and `history_filters_save` are local and not
   destructive: through MCP they only add Replay tabs or saved Traffic filters (below), and they send nothing; nor are
-  `report`, `findings_repro`, `ca_export` and `ca_init`, whose `force` is refused (below).
+  `report`, `findings_repro`, `poc_csrf`, `poc_clickjacking`, `ca_export` and `ca_init`, whose `force` is refused
+  (below). `poc_csrf` and `poc_clickjacking` send nothing: they write a page from a recorded
+  request, and the reply's `html` holds it.
   `rules_edit` and `auth_macro_edit` are destructive locally (the version they change isn't
   kept); `findings_edit` isn't, since the values it changes stay on the finding's timeline. A command
   missing from the table gets the spec's cautious defaults (not read-only, destructive, not
@@ -255,7 +257,7 @@ Some arguments need a person, so a command run for a tool call (the server sets
   the resolved file is what is read), for `import_api`, `import_har`, `import_openapi`,
   `import_postman`, `import_graphql`'s `schema`, `scan_active`'s `api`, or any `environment`,
   whose text could reach the agent through the preview or an error; and for `send`'s and
-  `fuzz_run`'s `file`, `fuzz_run`'s `file:PATH` `payloads`, `ws_send`'s `file`,
+  `fuzz_run`'s `file`, `fuzz_run`'s `file:PATH` `payloads`, `ws_send`'s `file`, `poc_csrf`'s `file`,
   `auth_macro_add`'s `steps` files (also `ORIGIN=FILE`), `auth_add`'s `login_request`,
   `intercept_forward`'s `file`, `findings_compare`'s `baseline` and `current`, and a template
   file for `checks_validate`, `checks_list` or `scan_active`'s `checks`, whose bytes are sent to
@@ -288,9 +290,9 @@ Some arguments need a person, so a command run for a tool call (the server sets
   replaces or removes one in the app or a terminal.
 - `scan_policy_save` under a name that is already saved (`conflict`), for the same reason: an
   agent saves a new policy and runs `scan_active` with `policy`.
-- `report`, `findings_repro`, `history_export` and `ca_export` with `force`: `output` (`out`)
+- `report`, `findings_repro`, `history_export`, `poc_csrf`, `poc_clickjacking` and `ca_export` with `force`: `output` (`out`)
   would overwrite any file the server can write. An agent writes to a new file, or leaves out
-  `output` (`out`) to get the report, pack, HAR or certificate in the reply.
+  `output` (`out`) to get the report, pack, HAR, page or certificate in the reply.
 - `ca_init` with `force`: a new CA would make every client that trusts the person's stop
   trusting the proxy. Without it the CA is created only when missing; a person replaces it in a
   terminal.

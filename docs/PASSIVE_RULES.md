@@ -64,7 +64,7 @@ JSONP Endpoint** reports a response that calls the function a `callback`, `cb`, 
 | 10015 | Re-examine Cache-control Directives | info | 10015 |
 | 10017 | Cross-Domain JavaScript Source File Inclusion | low | 10017 |
 | 10019 | Content-Type Header Missing | info | 10019-1, 10019-2 |
-| 10020 | Anti-clickjacking Header | medium | 10020-1, 10020-2, 10020-3, 10020-4 |
+| 10020 | Anti-clickjacking Header (proof of concept: [`poc clickjacking`](MANUAL.md#proof-of-concept-pages-poc)) | medium | 10020-1, 10020-2, 10020-3, 10020-4 |
 | 10021 | X-Content-Type-Options Header Missing | low | 10021 |
 | 10023 | Information Disclosure - Debug Error Messages | low | 10023 |
 | 10024 | Information Disclosure - Sensitive Information in URL | info | 10024 |
@@ -101,7 +101,7 @@ JSONP Endpoint** reports a response that calls the function a `callback`, `cb`, 
 | 10108 | Reverse Tabnabbing | medium | 10108 |
 | 10109 | Modern Web Application | info | 10109 |
 | 10115 | Script Served From Malicious Domain (polyfill) | high | 10115-1, 10115-2 |
-| 10202 | Absence of Anti-CSRF Tokens | medium | 10202 |
+| 10202 | Absence of Anti-CSRF Tokens (proof of concept: [`poc csrf`](MANUAL.md#proof-of-concept-pages-poc)) | medium | 10202 |
 | 90001 | Insecure JSF ViewState | medium | 90001 |
 | 90002 | Java Serialization Object | medium | 90002 |
 | 90003 | Sub Resource Integrity Attribute Missing | medium | 90003 |
