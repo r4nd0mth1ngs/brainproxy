@@ -44,11 +44,38 @@ export function policyOf(s: Policy): Policy {
   return { enabled: s.enabled, strength: s.strength, threshold: s.threshold, rules: { ...(s.rules ?? {}) } };
 }
 
-/** How the policy runs one rule. */
-export function effective(p: Policy, id: number | string): { enabled: boolean; strength: Strength; threshold: Threshold; own: boolean } {
+/** An active rule as `scan rules --active` lists it. */
+export interface RuleInfo {
+  id: number;
+  name: string;
+  /** Off unless named (`--rules`) or turned on in a policy by name. */
+  opt_in?: boolean;
+}
+
+/** Why each opt-in rule is off until it is turned on. */
+const OPT_IN_WHY: Record<string, string> = {
+  "40023": "sends failed logins for the --auth user, which can lock the account",
+  "40041": "uploads test files, which stay on the server",
+};
+
+/** Why an opt-in rule is off until turned on, in a few words. */
+export function optInReason(id: number | string): string {
+  return OPT_IN_WHY[String(id)] ?? "its requests can change the site or harm an account";
+}
+
+/** The confirmation asked before an opt-in rule is turned on: title and text. */
+export function optInConfirm(rule: RuleInfo): [string, string] {
+  return [
+    `Turn on ${rule.name}?`,
+    `Rule ${rule.id} is off unless turned on: it ${optInReason(rule.id)}. Scans with this policy will run it.`,
+  ];
+}
+
+/** How the policy runs one rule; an opt-in rule (`optIn`) is off unless the policy turns it on. */
+export function effective(p: Policy, id: number | string, optIn = false): { enabled: boolean; strength: Strength; threshold: Threshold; own: boolean } {
   const r = p.rules[String(id)] ?? {};
   return {
-    enabled: r.enabled ?? p.enabled,
+    enabled: r.enabled ?? (p.enabled && !optIn),
     strength: r.strength ?? p.strength,
     threshold: r.threshold ?? p.threshold,
     own: Object.keys(r).length > 0,
@@ -69,14 +96,26 @@ export function setRule(p: Policy, id: number | string, patch: Partial<Record<ke
   return { ...p, rules };
 }
 
-/** Turns one rule on or off; the same as the policy's default leaves nothing of its own. */
-export function setEnabled(p: Policy, id: number | string, on: boolean): Policy {
-  return setRule(p, id, { enabled: on === p.enabled ? undefined : on });
+/**
+ * Turns one rule on or off; the same as the policy's default leaves nothing of its own. An
+ * opt-in rule's default is off, so turning it on is always kept.
+ */
+export function setEnabled(p: Policy, id: number | string, on: boolean, optIn = false): Policy {
+  return setRule(p, id, { enabled: on === (p.enabled && !optIn) ? undefined : on });
 }
 
-/** Rules the policy runs, out of `ids`. */
-export function enabledCount(p: Policy, ids: (number | string)[]): number {
-  return ids.filter((id) => effective(p, id).enabled).length;
+/** Rules the policy runs, out of `rules`. */
+export function enabledCount(p: Policy, rules: { id: number | string; opt_in?: boolean }[]): number {
+  return rules.filter((r) => effective(p, r.id, !!r.opt_in).enabled).length;
+}
+
+/**
+ * The opt-in rules a New scan leaves out: with "Only rules" given, none (only those run, and
+ * naming one turns it on); with a policy, those it doesn't turn on; otherwise all of them.
+ */
+export function optInsLeftOut(rules: RuleInfo[], only: string, policy?: Policy): RuleInfo[] {
+  if (only.split(",").some((s) => s.trim())) return [];
+  return rules.filter((r) => r.opt_in && !(policy && effective(policy, r.id, true).enabled));
 }
 
 /** What a policy name may be: what `scan policy save` takes. */
@@ -111,7 +150,11 @@ export function describe(s: PolicySummary): string {
 }
 
 /** What a finished scan's result says about its policy and thresholds, as facts to show. */
-export function policyFacts(r: { policy?: { name: string; strength: string; threshold: string; flags_over_policy?: string[] }; below_threshold?: Record<string, number> }): [string, string][] {
+export function policyFacts(r: {
+  policy?: { name: string; strength: string; threshold: string; flags_over_policy?: string[] };
+  below_threshold?: Record<string, number>;
+  skipped?: { rule: number; reason: string }[];
+}): [string, string][] {
   const out: [string, string][] = [];
   if (r.policy) {
     const flags = r.policy.flags_over_policy ?? [];
@@ -119,5 +162,7 @@ export function policyFacts(r: { policy?: { name: string; strength: string; thre
   }
   const below = Object.values(r.below_threshold ?? {}).reduce((a, b) => a + b, 0);
   if (below) out.push(["Below threshold", `${below} finding${below === 1 ? "" : "s"} not raised`]);
+  // Rules asked for that couldn't run (an opt-in rule nobody turned on isn't one).
+  for (const sk of r.skipped ?? []) out.push([`Skipped rule ${sk.rule}`, sk.reason]);
   return out;
 }

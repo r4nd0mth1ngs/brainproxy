@@ -12,6 +12,8 @@ import {
   effective,
   enabledCount,
   nameProblem,
+  optInConfirm,
+  optInReason,
   policyOf,
   saveCommand,
   setEnabled,
@@ -21,11 +23,10 @@ import {
   THRESHOLDS,
   type Policy,
   type PolicySummary,
+  type RuleInfo,
 } from "./scanPolicy";
 
-interface ActiveRule {
-  id: number;
-  name: string;
+interface ActiveRule extends RuleInfo {
   scope: string;
   max_risk: Risk;
 }
@@ -54,7 +55,7 @@ export function ScanPolicies({ active }: { active: boolean }) {
     setName(s ? n : "");
     setPolicy(s ? policyOf(s) : DEFAULT_POLICY);
   };
-  const ids = (rules?.rules ?? []).map((r) => r.id);
+  const all = rules?.rules ?? [];
   const problem = nameProblem(name);
   const replacing = !!saved?.policies.some((p) => p.name === name.trim());
 
@@ -92,21 +93,42 @@ export function ScanPolicies({ active }: { active: boolean }) {
     return (rules?.rules ?? []).filter((r) => !t || r.name.toLowerCase().includes(t) || String(r.id).includes(t));
   }, [rules, filter]);
 
+  const on = (r: ActiveRule) => effective(policy, r.id, !!r.opt_in);
+  // Turning on an opt-in rule asks first: it is off by default for a reason.
+  const toggle = async (r: ActiveRule, checked: boolean) => {
+    if (checked && r.opt_in && !(await confirm(...optInConfirm(r), "Turn on", "Keep off"))) return;
+    setPolicy(setEnabled(policy, r.id, checked, !!r.opt_in));
+  };
+
   const columns: Column<ActiveRule>[] = [
     {
       key: "on",
       label: "On",
       width: 40,
-      value: (r) => (effective(policy, r.id).enabled ? 1 : 0),
-      render: (r) => <input type="checkbox" checked={effective(policy, r.id).enabled} onChange={(e) => setPolicy(setEnabled(policy, r.id, e.target.checked))} />,
+      value: (r) => (on(r).enabled ? 1 : 0),
+      render: (r) => <input type="checkbox" checked={on(r).enabled} onChange={(e) => toggle(r, e.target.checked)} />,
     },
     { key: "id", label: "ID", width: 64, value: (r) => r.id, align: "right" },
-    { key: "name", label: "Name", width: 320, value: (r) => r.name },
+    {
+      key: "name",
+      label: "Name",
+      width: 320,
+      value: (r) => r.name,
+      render: (r) =>
+        r.opt_in ? (
+          <span className="row gap" title={`Off unless turned on here: it ${optInReason(r.id)}.`}>
+            {r.name}
+            <span className="muted small">opt-in</span>
+          </span>
+        ) : (
+          r.name
+        ),
+    },
     {
       key: "strength",
       label: "Strength",
       width: 150,
-      value: (r) => STRENGTHS.indexOf(effective(policy, r.id).strength),
+      value: (r) => STRENGTHS.indexOf(on(r).strength),
       render: (r) => (
         <select className="input small" value={policy.rules[String(r.id)]?.strength ?? ""} onChange={(e) => setPolicy(setRule(policy, r.id, { strength: e.target.value }))}>
           <option value="">policy's ({policy.strength})</option>
@@ -120,12 +142,12 @@ export function ScanPolicies({ active }: { active: boolean }) {
       key: "threshold",
       label: "Threshold",
       width: 150,
-      value: (r) => THRESHOLDS.indexOf(effective(policy, r.id).threshold),
+      value: (r) => THRESHOLDS.indexOf(on(r).threshold),
       render: (r) => (
         <select
           className="input small"
           value={policy.rules[String(r.id)]?.threshold ?? ""}
-          title={`Raises ${THRESHOLD_TEXT[effective(policy, r.id).threshold]}`}
+          title={`Raises ${THRESHOLD_TEXT[on(r).threshold]}`}
           onChange={(e) => setPolicy(setRule(policy, r.id, { threshold: e.target.value }))}
         >
           <option value="">policy's ({policy.threshold})</option>
@@ -152,9 +174,9 @@ export function ScanPolicies({ active }: { active: boolean }) {
       key: "own",
       label: "",
       width: 70,
-      value: (r) => (effective(policy, r.id).own ? 1 : 0),
+      value: (r) => (on(r).own ? 1 : 0),
       render: (r) =>
-        effective(policy, r.id).own ? (
+        on(r).own ? (
           <button className="link small" onClick={() => setPolicy(setRule(policy, r.id, { enabled: undefined, strength: undefined, threshold: undefined }))} title="Use the policy's settings for this rule">
             reset
           </button>
@@ -206,14 +228,14 @@ export function ScanPolicies({ active }: { active: boolean }) {
             ))}
           </select>
         </label>
-        <label className="check" title="Off: only the rules ticked below run, and rules added in a later version stay off">
+        <label className="check" title="Off: only the rules ticked below run, and rules added in a later version stay off. Opt-in rules stay off either way until ticked.">
           <input type="checkbox" checked={policy.enabled} onChange={(e) => setPolicy({ ...policy, enabled: e.target.checked })} /> Rules on unless turned off
         </label>
         <span className="grow" />
         <input className="input" style={{ width: 160 }} placeholder="Filter: name or id" value={filter} onChange={(e) => setFilter(e.target.value)} />
       </div>
       <p className="muted small sc-all">
-        {enabledCount(policy, ids)} of {ids.length} rules on. Threshold {policy.threshold} raises {THRESHOLD_TEXT[policy.threshold]}; a finding below
+        {enabledCount(policy, all)} of {all.length} rules on; opt-in rules are off until ticked. Threshold {policy.threshold} raises {THRESHOLD_TEXT[policy.threshold]}; a finding below
         its rule's threshold isn't raised (the scan counts it). A scan's own strength, rules or threshold win over its policy.
       </p>
       <DataTable rows={rows} columns={columns} rowKey={(r) => r.id} initialSort={{ key: "id", desc: false }} empty={rules ? "No rules match." : "Loading rules…"} />

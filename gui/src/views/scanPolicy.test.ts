@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_POLICY, describe, effective, enabledCount, nameProblem, policyFacts, policyScanArgs, saveCommand, setEnabled, setRule } from "./scanPolicy.ts";
+import { DEFAULT_POLICY, describe, effective, enabledCount, nameProblem, optInConfirm, optInReason, optInsLeftOut, policyFacts, policyScanArgs, saveCommand, setEnabled, setRule } from "./scanPolicy.ts";
 
 test("a rule takes what it sets and the policy the rest", () => {
   const p = { ...DEFAULT_POLICY, strength: "high" as const, rules: { "40018": { threshold: "high" as const } } };
@@ -23,13 +23,47 @@ test("setting a rule back to the policy's drops its entry", () => {
 test("turning a rule on or off is kept only where it differs from the policy", () => {
   let p = setEnabled(DEFAULT_POLICY, 40012, false);
   assert.deepEqual(p.rules, { "40012": { enabled: false } });
-  assert.equal(enabledCount(p, [40012, 40018]), 1);
+  assert.equal(enabledCount(p, [{ id: 40012 }, { id: 40018 }]), 1);
   p = setEnabled(p, 40012, true);
   assert.deepEqual(p.rules, {});
   // With others off, a rule turned on is the one kept.
   const only = setEnabled({ ...DEFAULT_POLICY, enabled: false }, 40018, true);
   assert.deepEqual(only.rules, { "40018": { enabled: true } });
-  assert.equal(enabledCount(only, [40012, 40018]), 1);
+  assert.equal(enabledCount(only, [{ id: 40012 }, { id: 40018 }]), 1);
+});
+
+test("an opt-in rule is off unless the policy turns it on, and turning it on is kept", () => {
+  assert.equal(effective(DEFAULT_POLICY, 40041, true).enabled, false);
+  assert.equal(effective(DEFAULT_POLICY, 40041).enabled, true, "not known as opt-in: the policy's default");
+  let p = setEnabled(DEFAULT_POLICY, 40041, true, true);
+  assert.deepEqual(p.rules, { "40041": { enabled: true } });
+  assert.equal(effective(p, 40041, true).enabled, true);
+  p = setEnabled(p, 40041, false, true);
+  assert.deepEqual(p.rules, {}, "off is its default");
+  const rules = [{ id: 40012 }, { id: 40041, opt_in: true }];
+  assert.equal(enabledCount(DEFAULT_POLICY, rules), 1);
+  assert.equal(enabledCount(setEnabled(DEFAULT_POLICY, 40041, true, true), rules), 2);
+});
+
+test("an opt-in rule says why it is off, and asks before it is turned on", () => {
+  assert.match(optInReason(40041), /stay on the server/);
+  assert.match(optInReason(40023), /lock the account/);
+  assert.match(optInReason(1), /change the site/);
+  const [title, text] = optInConfirm({ id: 40041, name: "File Upload", opt_in: true });
+  assert.equal(title, "Turn on File Upload?");
+  assert.match(text, /^Rule 40041 is off unless turned on: it uploads test files/);
+});
+
+test("New scan says which opt-in rules it leaves out", () => {
+  const rules = [
+    { id: 40012, name: "XSS" },
+    { id: 40023, name: "Possible Username Enumeration", opt_in: true },
+    { id: 40041, name: "File Upload", opt_in: true },
+  ];
+  assert.deepEqual(optInsLeftOut(rules, "").map((r) => r.id), [40023, 40041]);
+  assert.deepEqual(optInsLeftOut(rules, "40041, 40012"), [], "named rules are the only ones that run");
+  const p = setEnabled(DEFAULT_POLICY, 40041, true, true);
+  assert.deepEqual(optInsLeftOut(rules, " ", p).map((r) => r.id), [40023]);
 });
 
 test("a policy is saved as JSON on stdin, under its trimmed name", () => {
@@ -65,4 +99,5 @@ test("a scan's result says which policy applied and what it held back", () => {
     ["Below threshold", "3 findings not raised"],
   ]);
   assert.deepEqual(policyFacts({ below_threshold: { "1": 1 } }), [["Below threshold", "1 finding not raised"]]);
+  assert.deepEqual(policyFacts({ skipped: [{ rule: 40013, reason: "it needs --auth with a login" }] }), [["Skipped rule 40013", "it needs --auth with a login"]]);
 });

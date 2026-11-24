@@ -9,7 +9,7 @@ import { useActions } from "../ui/useActions.ts";
 import { subTabActions } from "../nav";
 import { browserFlag, browserProgress, hasChromium, type BrowserList } from "./browserCrawl";
 import { ScanPolicies, usePolicies } from "./ScanPolicies";
-import { describe as describePolicy, policyFacts, policyScanArgs } from "./scanPolicy";
+import { describe as describePolicy, optInReason, optInsLeftOut, policyFacts, policyOf, policyScanArgs, type RuleInfo } from "./scanPolicy";
 import { maxRiskLabel, passiveNote, SCRIPT_LIST_ARGS, type PassiveStats, type ScriptCheck } from "./scriptChecks.ts";
 import { AddScriptCheck, ScriptChecks } from "./ScriptChecks.tsx";
 import { HOST_HEADER_TEST_TITLE, hostHeaderTestArgs, jobEndedText, sourcesToggle } from "./scanJobs.ts";
@@ -568,6 +568,9 @@ function NewScan({ picked, onLaunched, active }: { picked: Set<number>; onLaunch
   // rather than quietly becoming every rule.
   const chosenPolicy = policies?.policies.find((x) => x.name === f.policy);
   const policyGone = !!f.policy && !!policies && !chosenPolicy;
+  // Opt-in rules run only when named in Only rules or turned on in the policy: say which won't.
+  const [activeRules] = usePoll<{ rules: RuleInfo[] }>(() => run(["scan", "rules", "--active"]), 300000);
+  const optInsOff = optInsLeftOut(activeRules?.rules ?? [], f.rules, chosenPolicy && policyOf(chosenPolicy));
   // The JavaScript crawl needs a Chromium-based browser on this machine.
   const [browsers] = usePoll<BrowserList>(() => run(["browser", "list"]), 60000);
   const canBrowse = hasChromium(browsers);
@@ -872,6 +875,18 @@ function NewScan({ picked, onLaunched, active }: { picked: Set<number>; onLaunch
             </label>
             {text("Only rules", "rules", f.policy ? "instead of the policy's" : "40018,40012 (or pick in Rules)")}
             {text("Skip rules", "excludeRules", "comma-separated ids")}
+            {!f.noRules && optInsOff.length > 0 && (
+              <p className="muted small sc-all">
+                Off unless named in Only rules{f.policy ? " or turned on in the policy" : " or turned on in a policy"}:{" "}
+                {optInsOff.map((r, i) => (
+                  <span key={r.id} title={`It ${optInReason(r.id)}.`}>
+                    {i > 0 && "; "}
+                    {r.id} {r.name} ({optInReason(r.id)})
+                  </span>
+                ))}
+                .
+              </p>
+            )}
             {text("Checks", "checks", "nuclei, local, all, or a path", "Declarative checks to run as well")}
             {text("Check tags", "checkTags", "cve,exposure")}
             <label className="sc-field">
@@ -984,6 +999,8 @@ interface Rule {
   id: number | string;
   name: string;
   enabled?: boolean;
+  /** An active rule that runs only when named or turned on in a policy. */
+  opt_in?: boolean;
   scope?: string;
   /** Null for a passive check written as a script: its findings say their own risk. */
   max_risk: Risk | null;
@@ -1062,7 +1079,21 @@ function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<num
           render: (r) => <input type="checkbox" checked={p.picked.has(Number(r.id))} onChange={(e) => pick(Number(r.id), e.target.checked)} />,
         },
     { key: "id", label: "ID", width: 64, value: (r) => r.id, align: "right" },
-    { key: "name", label: "Name", width: 340, value: (r) => r.name },
+    {
+      key: "name",
+      label: "Name",
+      width: 340,
+      value: (r) => r.name,
+      render: (r) =>
+        r.opt_in ? (
+          <span className="row gap" title={`Off unless picked here, named in Only rules, or turned on in a policy: it ${optInReason(r.id)}.`}>
+            {r.name}
+            <span className="muted small">opt-in</span>
+          </span>
+        ) : (
+          r.name
+        ),
+    },
     {
       key: "risk",
       label: "Max risk",
