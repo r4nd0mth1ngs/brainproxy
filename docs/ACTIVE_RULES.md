@@ -1,6 +1,6 @@
 # Active rules
 
-`brainproxy scan active` has 63 rules: 57 ported from OWASP ZAP's `ascanrules`, `ascanrulesBeta`, `ascanrulesAlpha` and
+`brainproxy scan active` has 64 rules: 57 ported from OWASP ZAP's `ascanrules`, `ascanrulesBeta`, `ascanrulesAlpha` and
 `soap` add-ons (and helpers from `commonlib`), https://github.com/zaproxy/zap-extensions, Apache License 2.0, and
 brainproxy's own (below).
 Each rule file names the ZAP class it came from; alert names, descriptions, solutions,
