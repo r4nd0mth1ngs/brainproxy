@@ -653,6 +653,9 @@ const HINTS: &[(&str, Hints)] = &[
     ("fuzz results", READ),
     ("fuzz list", READ),
     ("fuzz stop", REPLACE),
+    ("fuzz pause", SET),
+    // A stopped run relaunched sends what it hadn't yet.
+    ("fuzz resume", NET),
     ("crawl", NET),
     ("import api", NET),
     ("import openapi", NET),

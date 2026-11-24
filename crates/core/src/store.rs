@@ -328,7 +328,7 @@ CREATE TABLE IF NOT EXISTS fuzz_results (
 pub const FUZZ_RUN_COLUMNS: &[(&str, &str, &str)] = &[
     ("id", "INTEGER", "Run id"),
     ("time", "TEXT", "UTC start time"),
-    ("state", "TEXT", "queued, running, stopping, completed, stopped, failed"),
+    ("state", "TEXT", "queued, running, paused, stopping, completed, stopped, failed"),
     ("mode", "TEXT", "sniper, battering-ram, pitchfork, cluster-bomb"),
     ("target", "TEXT", "Origin requests were sent to"),
     ("positions", "INTEGER", "Number of payload positions in the template"),
@@ -921,6 +921,58 @@ impl Store {
             return Err(Error::NotFound(format!("fuzz run {id}")));
         }
         Ok(())
+    }
+
+    /// Moves a run to `to` if it is in one of `from` (read and written in one statement, so a
+    /// run that ended meanwhile isn't marked paused or running again). Whether it moved.
+    pub fn fuzz_transition(&self, id: i64, from: &[&str], to: &str) -> Result<bool> {
+        let from = serde_json::to_string(from).unwrap_or_default();
+        let n = self.conn.execute(
+            "UPDATE fuzz_runs SET state = ?1 WHERE id = ?2 AND state IN (SELECT value FROM json_each(?3))",
+            params![to, id, from],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Queues a stopped or failed run to be resumed: its error, pid and finish time cleared.
+    /// Whether it was stopped or failed.
+    pub fn fuzz_requeue(&self, id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE fuzz_runs SET state = 'queued', pid = NULL, error = NULL, finished_time = NULL
+             WHERE id = ?1 AND state IN ('stopped', 'failed')",
+            [id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// A run's request template, with its payload markers.
+    pub fn fuzz_template(&self, id: i64) -> Result<Vec<u8>> {
+        self.conn
+            .query_row("SELECT template FROM fuzz_runs WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("fuzz run {id}")))
+    }
+
+    /// The indexes a run has results for: what a resumed run doesn't send again.
+    pub fn fuzz_done_indexes(&self, id: i64) -> Result<std::collections::HashSet<u64>> {
+        let mut stmt = self.conn.prepare("SELECT idx FROM fuzz_results WHERE run_id = ?1")?;
+        let rows = stmt.query_map([id], |r| r.get::<_, i64>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for idx in rows {
+            out.insert(u64::try_from(idx?).unwrap_or(0));
+        }
+        Ok(out)
+    }
+
+    /// What `--extract` captured from a run's last recorded response (`Some(None)` for
+    /// nothing); None when it has no results.
+    pub fn fuzz_last_extract(&self, id: i64) -> Result<Option<Option<String>>> {
+        Ok(self
+            .conn
+            .query_row("SELECT extract FROM fuzz_results WHERE run_id = ?1 ORDER BY idx DESC LIMIT 1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?)
     }
 
     pub fn fuzz_state(&self, id: i64) -> Result<String> {

@@ -593,6 +593,8 @@ fn command_name(cmd: &Cmd) -> String {
             fuzz_cmd::FuzzCmd::Results { .. } => "fuzz results",
             fuzz_cmd::FuzzCmd::List { .. } => "fuzz list",
             fuzz_cmd::FuzzCmd::Stop { .. } => "fuzz stop",
+            fuzz_cmd::FuzzCmd::Pause { .. } => "fuzz pause",
+            fuzz_cmd::FuzzCmd::Resume { .. } => "fuzz resume",
         },
         Cmd::Diff(_) => "diff",
         Cmd::Poc(poc_cmd::PocCmd::Csrf(_)) => "poc csrf",

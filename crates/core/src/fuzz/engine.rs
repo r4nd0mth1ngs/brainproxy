@@ -2,6 +2,7 @@
 //! shared rate limit, response analysis (status, size, words, lines, grep,
 //! extract), and batched recording into the project database.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -56,6 +57,8 @@ pub struct EngineConfig {
     /// For a resumed run with an extract set: what the last recorded response gave (`Some(None)`
     /// for nothing), which the next request carries on from. None starts from the set's first value.
     pub last_extract: Option<Option<String>>,
+    /// Indexes not to send: those a resumed run already has results for.
+    pub skip: HashSet<u64>,
 }
 
 /// Outcome of one request.
@@ -159,6 +162,7 @@ pub async fn run(
     let stopped_by_user = Arc::new(AtomicBool::new(false));
     let matched_stop = Arc::new(AtomicBool::new(false));
     let extract_ended = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
     // An extract set feeds each response into the next request: one request at a time.
     let concurrency = if plan.feedback() { 1 } else { cfg.concurrency.max(1) };
     let limiter = cfg.rate.filter(|r| *r > 0.0).map(|r| Arc::new(Limiter::new(r)));
@@ -191,13 +195,16 @@ pub async fn run(
     let (template, plan, target, cfg) = (Arc::new(template), Arc::new(plan), Arc::new(target), Arc::new(cfg));
 
     let watcher = {
-        let (stop, by_user, project) = (stop.clone(), stopped_by_user.clone(), project.to_path_buf());
+        let (stop, by_user, paused, project) =
+            (stop.clone(), stopped_by_user.clone(), paused.clone(), project.to_path_buf());
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let p = project.clone();
                 let state = tokio::task::spawn_blocking(move || Store::open(&p)?.fuzz_state(run_id)).await;
                 if let Ok(Ok(s)) = state {
+                    // `fuzz pause` holds new requests (those in flight finish); `fuzz resume` lets them go.
+                    paused.store(s == "paused", Ordering::Relaxed);
                     if s == "stopping" {
                         by_user.store(true, Ordering::Relaxed);
                         stop.store(true, Ordering::Relaxed);
@@ -211,11 +218,12 @@ pub async fn run(
     let url_positions = Arc::new(template.url_positions());
     let mut workers = Vec::new();
     for _ in 0..concurrency.min(total.max(1).try_into().unwrap_or(usize::MAX)) {
-        let (next, stop, matched_stop, extract_ended, limiter, client, tx, rows, rules) = (
+        let (next, stop, matched_stop, extract_ended, paused, limiter, client, tx, rows, rules) = (
             next.clone(),
             stop.clone(),
             matched_stop.clone(),
             extract_ended.clone(),
+            paused.clone(),
             limiter.clone(),
             client.clone(),
             tx.clone(),
@@ -230,12 +238,22 @@ pub async fn run(
             // None before the first request, which takes the set's first value.
             let mut last: Option<Option<String>> = cfg.last_extract.clone();
             loop {
+                // Paused: no index is taken until it resumes (a run with nothing left ends).
+                while paused.load(Ordering::Relaxed)
+                    && !stop.load(Ordering::Relaxed)
+                    && next.load(Ordering::Relaxed) < total
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
                 let idx = next.fetch_add(1, Ordering::Relaxed);
                 if idx >= total {
                     break;
+                }
+                if cfg.skip.contains(&idx) {
+                    continue;
                 }
                 let extracted = match &last {
                     _ if !plan.feedback() => None,

@@ -55,7 +55,7 @@ pub enum FuzzCmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// Ask a running attack to stop (it finishes in-flight requests).
+    /// Ask a running or paused attack to stop (it finishes in-flight requests).
     Stop {
         run: i64,
         /// Only mark failed a run that can't be verified (its lock file isn't readable from
@@ -63,6 +63,13 @@ pub enum FuzzCmd {
         #[arg(long)]
         forget: bool,
     },
+    /// Pause a running attack: requests in flight finish and no new ones start until
+    /// `fuzz resume`.
+    Pause { run: i64 },
+    /// Resume a paused attack, or relaunch a stopped or failed one in the background, sending
+    /// only the requests it has no results for. A run with a set from stdin, an oob: or script:
+    /// set, or a payload file that changed since it started can't be relaunched.
+    Resume { run: i64 },
 }
 
 #[derive(clap::Args)]
@@ -128,6 +135,9 @@ pub struct RunArgs {
     top: usize,
     #[arg(long, hide = true)]
     attach_run: Option<i64>,
+    /// With --attach-run: the run is being resumed, so the requests it has results for are skipped.
+    #[arg(long, hide = true, requires = "attach_run")]
+    resume: bool,
     /// Request file a --background parent wrote for its child (read, then deleted).
     #[arg(long, hide = true)]
     attach_request: Option<String>,
@@ -180,7 +190,7 @@ pub fn fuzz_cmd(project: &Path, home: &Path, cmd: FuzzCmd, out: &Out) -> Result<
             reap_if_dead(&store, run)?;
             let mut summary = store.fuzz_summary(run, top)?;
             summary["run"]["other_pid_namespace"] = json!(process::work_elsewhere(&store, &lock_name(run)));
-            let live = matches!(summary["run"]["state"].as_str(), Some("running" | "stopping"));
+            let live = matches!(summary["run"]["state"].as_str(), Some("running" | "paused" | "stopping"));
             let pid = summary["run"]["pid"].as_u64().filter(|_| live).map(|p| p as u32);
             if let Some(pid) =
                 pid.filter(|&pid| process::work_liveness(&store, &lock_name(run), pid) == Liveness::Unverified)
@@ -233,7 +243,7 @@ pub fn fuzz_cmd(project: &Path, home: &Path, cmd: FuzzCmd, out: &Out) -> Result<
         FuzzCmd::Stop { run, forget: true } => {
             let store = Store::open(project)?;
             let state = store.fuzz_state(run)?;
-            if !matches!(state.as_str(), "running" | "stopping" | "queued") {
+            if !matches!(state.as_str(), "running" | "paused" | "stopping" | "queued") {
                 return Err(Error::Conflict(format!("fuzz run {run} is {state}")));
             }
             let pid = store.fuzz_run(run)?["pid"].as_u64().map(|p| p as u32);
@@ -252,14 +262,23 @@ pub fn fuzz_cmd(project: &Path, home: &Path, cmd: FuzzCmd, out: &Out) -> Result<
         }
         FuzzCmd::Stop { run, forget: false } => {
             let store = Store::open(project)?;
-            let state = store.fuzz_state(run)?;
-            if state != "running" && state != "queued" {
-                return Err(Error::Conflict(format!("fuzz run {run} is {state}")));
+            if !store.fuzz_transition(run, &["running", "paused", "queued"], "stopping")? {
+                return Err(Error::Conflict(format!("fuzz run {run} is {}", store.fuzz_state(run)?)));
             }
-            store.fuzz_set_state(run, "stopping", None, None, false)?;
             out.ok(json!({"run": run, "state": "stopping"}), || format!("stopping run {run}"));
             Ok(())
         }
+        FuzzCmd::Pause { run } => {
+            let store = Store::open(project)?;
+            reap_if_dead(&store, run)?;
+            if !store.fuzz_transition(run, &["running"], "paused")? {
+                let state = store.fuzz_state(run)?;
+                return Err(Error::Conflict(format!("fuzz run {run} is {state}; only a running run pauses")));
+            }
+            out.ok(json!({"run": run, "state": "paused"}), || format!("paused run {run}"));
+            Ok(())
+        }
+        FuzzCmd::Resume { run } => resume(project, home, run, out),
     }
 }
 
@@ -270,15 +289,15 @@ pub(crate) fn lock_name(run: i64) -> String {
 
 /// Marks a run whose process died as failed.
 fn reap_if_dead(store: &Store, run: i64) -> Result<(), Error> {
+    let live = |s: &str| matches!(s, "running" | "paused" | "stopping");
     let info = store.fuzz_run(run)?;
-    if !matches!(info["state"].as_str().unwrap_or(""), "running" | "stopping") {
+    if !live(info["state"].as_str().unwrap_or("")) {
         return Ok(());
     }
     let Some(pid) = info["pid"].as_u64() else { return Ok(()) };
     let name = lock_name(run);
     // It may have finished, and exited, since the state above was read.
-    if process::work_gone(store, &name, pid as u32) && matches!(store.fuzz_state(run)?.as_str(), "running" | "stopping")
-    {
+    if process::work_gone(store, &name, pid as u32) && live(&store.fuzz_state(run)?) {
         store.fuzz_set_state(run, "failed", None, Some("fuzz process exited unexpectedly"), true)?;
         process::forget_work_lock(store, &name);
     }
@@ -355,6 +374,11 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     for spec in &args.payloads {
         payload_specs.push(payload_source(project, spec)?);
     }
+    if let Some(why) = args.resume.then(|| not_resumable(&payload_specs)).flatten() {
+        return Err(Error::Conflict(format!("this run can't be resumed: {why}")));
+    }
+    // Recorded, so a resumed run can tell its sets are the ones it started with.
+    let payload_sha256 = payload_hashes(&payload_specs, None)?;
     // A request read from stdin is handed to the --background child in a file.
     let stdin_request = args.background && args.req.reads_stdin();
     if let Some(path) = &args.attach_request {
@@ -487,6 +511,21 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
         "match_status": args.match_status,
         "stop_on_match": args.stop_on_match,
         "store": match args.store { StoreArg::All => "all", StoreArg::Matches => "matches", StoreArg::None => "none" },
+        // What `fuzz resume` needs to start the run again as it was.
+        "max_requests": args.max_requests,
+        "auth": args.auth,
+        "no_encode": args.no_encode,
+        "send": {
+            "timeout": args.req.timeout,
+            "verify_tls": args.req.verify_tls,
+            "sni": args.req.sni,
+            "http2": args.req.http2,
+            "http3": args.req.http3,
+            "host_header_test": args.req.host_header_test,
+            "verbatim": args.req.verbatim,
+        },
+        "payload_sha256": payload_sha256,
+        "cwd": std::env::current_dir().ok().and_then(|d| d.to_str().map(String::from)),
     });
     if !scripts.is_empty() {
         config["process_scripts"] = json!(scripts);
@@ -501,6 +540,22 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
         );
     }
     let store = Store::open(project)?;
+    let feedback = plan.feedback();
+    // A resumed run sends what it has no results for, from sets that are still the ones it had.
+    let (skip, last_extract) = match args.attach_run.filter(|_| args.resume) {
+        Some(id) => {
+            let was = store.fuzz_run(id)?["config"].clone();
+            check_hashes(id, &payload_sha256, &was)?;
+            if json!(scripts) != was["process_scripts"] && !(scripts.is_empty() && was["process_scripts"].is_null()) {
+                return Err(Error::Conflict(format!(
+                    "fuzz run {id} can't be resumed: its --process scripts changed since it started"
+                )));
+            }
+            let last = if feedback { store.fuzz_last_extract(id)? } else { None };
+            (store.fuzz_done_indexes(id)?, last)
+        }
+        None => Default::default(),
+    };
 
     if args.background {
         let run_id = store.fuzz_create(
@@ -574,7 +629,8 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
         max_requests: args.max_requests,
         auth: auth.clone(),
         client: Some(client.clone()),
-        last_extract: None,
+        last_extract,
+        skip,
     };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let started = Instant::now();
@@ -614,18 +670,50 @@ fn spawn_background(
     host_warning: Option<String>,
     out: &Out,
 ) -> Result<(), Error> {
+    let mut options = vec!["--attach-run".to_string(), run_id.to_string()];
+    if let Some(bytes) = request {
+        options.push(format!("--attach-request={}", request_file(project, run_id, bytes)?.display()));
+    }
+    let argv = crate::jobs_cmd::with_options(crate::jobs_cmd::child_args(), options);
+    let log = start_child(project, home, run_id, &argv, None, store)?;
+    let info = store.fuzz_run(run_id)?;
+    let mut data = json!({
+        "run": info,
+        "log": log,
+        "next": format!("brainproxy fuzz status {run_id}   (or: fuzz stop {run_id})"),
+    });
+    if let Some(w) = host_warning {
+        data["host_warning"] = json!(w);
+    }
+    out.ok(data, || format!("fuzz run {run_id} started in the background"));
+    Ok(())
+}
+
+/// Writes a request for a child to read (and delete) with --attach-request.
+fn request_file(project: &Path, run_id: i64, bytes: &[u8]) -> Result<std::path::PathBuf, Error> {
+    let path = std::fs::canonicalize(project)?.with_extension(format!("fuzz-{run_id}.req"));
+    std::io::Write::write_all(&mut process::private_file(&path, false)?, bytes)?;
+    Ok(path)
+}
+
+/// Starts the process that runs a queued run, `brainproxy <argv>` in `cwd` (this one's by
+/// default), and waits for it to take the run up. Returns its log file.
+fn start_child(
+    project: &Path,
+    home: &Path,
+    run_id: i64,
+    argv: &[String],
+    cwd: Option<&Path>,
+    store: &Store,
+) -> Result<std::path::PathBuf, Error> {
     let project = std::fs::canonicalize(project)?;
     let log = project.with_extension(format!("fuzz-{run_id}.log"));
     let log_file = process::private_file(&log, true)?;
-    let mut options = vec!["--attach-run".to_string(), run_id.to_string()];
-    if let Some(bytes) = request {
-        let path = project.with_extension(format!("fuzz-{run_id}.req"));
-        std::io::Write::write_all(&mut process::private_file(&path, false)?, bytes)?;
-        options.push(format!("--attach-request={}", path.display()));
-    }
-    let argv = crate::jobs_cmd::with_options(crate::jobs_cmd::child_args(), options);
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&argv);
+    cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(argv);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
     brainproxy_core::provenance::pass_on(&mut cmd);
     process::detach(&mut cmd);
     let stdin = process::work_lock_stdin(store, &lock_name(run_id));
@@ -650,16 +738,148 @@ fn spawn_background(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let info = store.fuzz_run(run_id)?;
-    let mut data = json!({
-        "run": info,
-        "log": log,
-        "next": format!("brainproxy fuzz status {run_id}   (or: fuzz stop {run_id})"),
-    });
-    if let Some(w) = host_warning {
-        data["host_warning"] = json!(w);
+    Ok(log)
+}
+
+/// Why a run with these payload sources can't be relaunched, if it can't.
+fn not_resumable(specs: &[String]) -> Option<String> {
+    specs.iter().enumerate().find_map(|(i, spec)| {
+        let n = i + 1;
+        match spec.split_once(':').map(|(kind, _)| kind) {
+            _ if spec == "file:-" => Some(format!("payload set {n} was read from stdin, which can't be read again")),
+            Some("oob") => Some(format!(
+                "payload set {n} is OOB tokens, each tied to the request that carried it; new tokens would be other \
+                 payloads"
+            )),
+            Some("script") => Some(format!(
+                "payload set {n} was made by a script, which needn't make the same set again (index for index)"
+            )),
+            _ => None,
+        }
+    })
+}
+
+/// The SHA-256 of each payload file the sources read, by set number (from 1). A relative path
+/// is taken from `cwd` when given.
+fn payload_hashes(specs: &[String], cwd: Option<&Path>) -> Result<serde_json::Map<String, Value>, Error> {
+    let mut out = serde_json::Map::new();
+    for (i, spec) in specs.iter().enumerate() {
+        let Some(path) = fuzz::source_file(spec) else { continue };
+        let path = cwd.map_or_else(|| Path::new(path).to_path_buf(), |dir| dir.join(path));
+        let data =
+            std::fs::read(&path).map_err(|e| Error::InvalidInput(format!("payload file {}: {e}", path.display())))?;
+        out.insert((i + 1).to_string(), json!(brainproxy_core::fetch::sha256_hex(&data)));
     }
-    out.ok(data, || format!("fuzz run {run_id} started in the background"));
+    Ok(out)
+}
+
+/// Refuses to resume run `run` when a payload file's hash isn't the one recorded at its start:
+/// the set would be another, and its indexes other payloads.
+fn check_hashes(run: i64, now: &serde_json::Map<String, Value>, config: &Value) -> Result<(), Error> {
+    for (set, was) in config["payload_sha256"].as_object().into_iter().flatten() {
+        if now.get(set) != Some(was) {
+            return Err(Error::Conflict(format!(
+                "fuzz run {run} can't be resumed: the file of payload set {set} changed since the run started"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `fuzz resume`: lets a paused run go on, or relaunches a stopped or failed one.
+fn resume(project: &Path, home: &Path, run: i64, out: &Out) -> Result<(), Error> {
+    let store = Store::open(project)?;
+    reap_if_dead(&store, run)?;
+    let info = store.fuzz_run(run)?;
+    let state = info["state"].as_str().unwrap_or("").to_string();
+    if state == "paused" {
+        if !store.fuzz_transition(run, &["paused"], "running")? {
+            return Err(Error::Conflict(format!("fuzz run {run} is {}", store.fuzz_state(run)?)));
+        }
+        out.ok(json!({"run": run, "state": "running"}), || format!("resumed run {run}"));
+        return Ok(());
+    }
+    if state != "stopped" && state != "failed" {
+        return Err(Error::Conflict(format!(
+            "fuzz run {run} is {state}; a paused, stopped or failed run can be resumed"
+        )));
+    }
+    let config = &info["config"];
+    let Some(cwd) = config["cwd"].as_str() else {
+        return Err(Error::Conflict(format!(
+            "fuzz run {run} was started by an earlier brainproxy, which didn't record what resuming it needs"
+        )));
+    };
+    let strings = |key: &str| -> Vec<String> {
+        config[key].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect()
+    };
+    let payloads = strings("payloads");
+    if let Some(why) = not_resumable(&payloads) {
+        return Err(Error::Conflict(format!("fuzz run {run} can't be resumed: {why}")));
+    }
+    // What the relaunched run does is checked as when it started, through MCP as well.
+    if config["process_scripts"].as_array().is_some_and(|s| !s.is_empty()) {
+        crate::mcp::check_script("resuming a run whose --process runs a script")?;
+    }
+    if config["store"] != "all" {
+        let store_mode = config["store"].as_str().unwrap_or("");
+        crate::mcp::check_records_all(&format!("resuming a run with --store {store_mode}"))?;
+    }
+    let mut resolved = Vec::new();
+    for spec in &payloads {
+        resolved.push(payload_source(project, spec)?);
+    }
+    check_hashes(run, &payload_hashes(&resolved, Some(Path::new(cwd)))?, config)?;
+
+    let mut argv: Vec<String> = ["fuzz", "run", "--resume", "--attach-run"].map(String::from).to_vec();
+    argv.push(run.to_string());
+    let text = |v: &Value| v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
+    let mut flag = |name: &str, v: &Value| {
+        if !v.is_null() && *v != false {
+            argv.push(if *v == true { format!("--{name}") } else { format!("--{name}={}", text(v)) });
+        }
+    };
+    flag("target", &info["target"]);
+    for key in ["mode", "marker", "concurrency", "rate", "max_requests", "auth", "extract", "store"] {
+        flag(&key.replace('_', "-"), &config[key]);
+    }
+    for key in ["stop_on_match", "no_encode"] {
+        flag(&key.replace('_', "-"), &config[key]);
+    }
+    for (key, name) in [("payloads", "payloads"), ("process", "process"), ("grep", "grep")] {
+        for v in config[key].as_array().into_iter().flatten() {
+            flag(name, v);
+        }
+    }
+    let statuses: Vec<String> = config["match_status"].as_array().into_iter().flatten().map(text).collect();
+    if !statuses.is_empty() {
+        flag("match-status", &json!(statuses.join(",")));
+    }
+    for (key, v) in config["send"].as_object().into_iter().flatten() {
+        flag(&key.replace('_', "-"), v);
+    }
+
+    let (done, total) = (info["done"].as_u64().unwrap_or(0), info["total"].as_u64().unwrap_or(0));
+    if !store.fuzz_requeue(run)? {
+        return Err(Error::Conflict(format!("fuzz run {run} is {}", store.fuzz_state(run)?)));
+    }
+    let started = request_file(project, run, &store.fuzz_template(run)?).and_then(|path| {
+        argv.push(format!("--attach-request={}", path.display()));
+        start_child(project, home, run, &argv, Some(Path::new(cwd)).filter(|d| d.is_dir()), &store)
+    });
+    let log = match started {
+        Ok(log) => log,
+        Err(e) => {
+            // Back as it was, so it can be resumed once what failed is put right.
+            store.fuzz_set_state(run, "failed", None, Some(&e.to_string()), true)?;
+            return Err(e);
+        }
+    };
+    let state = store.fuzz_state(run)?;
+    let remaining = total.saturating_sub(done);
+    out.ok(json!({"run": run, "state": state, "resumed_from": done, "remaining": remaining, "log": log}), || {
+        format!("resumed run {run} in the background: {remaining} of {total} requests left")
+    });
     Ok(())
 }
 
@@ -769,4 +989,18 @@ pub fn wordlists(cmd: WordlistsCmd, out: &Out) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runs_with_sets_that_cant_be_made_again_dont_resume() {
+        let why = |specs: &[&str]| not_resumable(&specs.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(why(&["list:a", "file:/w.txt", "brute:ab:1-3", "extract", "copy:1"]), None);
+        assert!(why(&["list:a", "file:-"]).unwrap().starts_with("payload set 2 was read from stdin"));
+        assert!(why(&["oob:3"]).unwrap().contains("OOB tokens"));
+        assert!(why(&["list:a", "script:gen.js"]).unwrap().contains("made by a script"));
+    }
 }

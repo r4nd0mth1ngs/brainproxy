@@ -271,3 +271,137 @@ fn oob_tokens_are_payloads_tied_to_the_run() {
     assert_eq!(code, 0, "{v}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Every index from 0 to `total` once, and nothing else.
+fn assert_each_index_once(project: &Path, run_id: &str, total: u64) {
+    let sql =
+        format!("SELECT COUNT(*), COUNT(DISTINCT idx), MIN(idx), MAX(idx) FROM fuzz_results WHERE run_id = {run_id}");
+    let (code, v) = run(&["query", &sql], project);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["rows"][0], serde_json::json!([total, total, 0, total - 1]), "{v}");
+}
+
+#[test]
+fn a_paused_run_holds_until_it_is_resumed() {
+    let (dir, project) = setup("pause");
+    let (port, hits) = serve(Duration::from_millis(40), |_| "ok".into());
+    let url = format!("http://127.0.0.1:{port}/?n=§0§");
+    let (code, v) = run(&["fuzz", "run", "--url", &url, "-p", "range:1-120", "-c", "2", "--background"], &project);
+    assert_eq!(code, 0, "{v}");
+    let id = v["data"]["run"]["id"].to_string();
+    wait_for(&project, &id, |s| s["done"].as_u64().unwrap() >= 6);
+    let (code, v) = run(&["fuzz", "pause", &id], &project);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"], serde_json::json!({"run": id.parse::<i64>().unwrap(), "state": "paused"}));
+    let (code, v) = run(&["fuzz", "pause", &id], &project);
+    assert_eq!(v["error"]["kind"], "conflict", "{code} {v}");
+    // The engine sees it within half a second; what was in flight then finishes.
+    std::thread::sleep(Duration::from_millis(1200));
+    let (held, sent) = (status(&project, &id), hits.load(Ordering::SeqCst));
+    std::thread::sleep(Duration::from_millis(1500));
+    let still = status(&project, &id);
+    assert_eq!(still["state"], "paused", "{still}");
+    assert_eq!(still["done"], held["done"], "nothing finishes while paused: {held} {still}");
+    assert_eq!(hits.load(Ordering::SeqCst), sent, "nothing is sent while paused");
+    assert!(held["done"].as_u64().unwrap() < 120, "{held}");
+
+    let (code, v) = run(&["fuzz", "resume", &id], &project);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["state"], "running", "{v}");
+    let s = wait_for(&project, &id, |s| s["state"] == "completed");
+    assert_eq!(s["done"], 120, "{s}");
+    assert_each_index_once(&project, &id, 120);
+    assert_eq!(hits.load(Ordering::SeqCst), 120);
+
+    // A paused run can be stopped, and a stopped one isn't paused.
+    let (code, v) = run(&["fuzz", "run", "--url", &url, "-p", "range:1-500", "-c", "2", "--background"], &project);
+    assert_eq!(code, 0, "{v}");
+    let id = v["data"]["run"]["id"].to_string();
+    wait_for(&project, &id, |s| s["done"].as_u64().unwrap() >= 2);
+    assert_eq!(run(&["fuzz", "pause", &id], &project).0, 0);
+    let (code, v) = run(&["fuzz", "stop", &id], &project);
+    assert_eq!(code, 0, "{v}");
+    wait_for(&project, &id, |s| s["state"] == "stopped");
+    let (_, v) = run(&["fuzz", "pause", &id], &project);
+    assert_eq!(v["error"]["kind"], "conflict", "{v}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_stopped_run_resumes_with_what_it_has_not_sent() {
+    let (dir, project) = setup("resume");
+    let (port, hits) = serve(Duration::from_millis(20), |_| "ok".into());
+    let words = dir.join("words.txt");
+    std::fs::write(&words, (0..150).map(|i| format!("w{i}\n")).collect::<String>()).unwrap();
+    let url = format!("http://127.0.0.1:{port}/?a=§0§&b=§0§");
+    let spec = format!("file:{}", words.display());
+    let args = ["fuzz", "run", "--url", &url, "--mode", "pitchfork", "-p", &spec, "-p", "brute:xyz:1-5", "-c", "3"];
+    let (code, v) = run(&[&args[..], &["--background", "--timeout", "7"]].concat(), &project);
+    assert_eq!(code, 0, "{v}");
+    let id = v["data"]["run"]["id"].to_string();
+    wait_for(&project, &id, |s| s["done"].as_u64().unwrap() >= 20);
+    assert_eq!(run(&["fuzz", "stop", &id], &project).0, 0);
+    let stopped = wait_for(&project, &id, |s| s["state"] == "stopped");
+    let done = stopped["done"].as_u64().unwrap();
+    assert!(done < 150, "{stopped}");
+    assert_eq!(stopped["config"]["send"]["timeout"], 7.0, "{stopped}");
+
+    let (code, v) = run(&["fuzz", "resume", &id], &project);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["resumed_from"], done, "{v}");
+    assert_eq!(v["data"]["remaining"], 150 - done, "{v}");
+    let s = wait_for(&project, &id, |s| s["state"] == "completed");
+    assert_eq!(s["done"], 150, "{s}");
+    assert_each_index_once(&project, &id, 150);
+    assert_eq!(hits.load(Ordering::SeqCst), 150, "each request went out once");
+    // The payloads are the ones the plan gives each index, before and after the resume.
+    let rows = results(&project, &id);
+    assert_eq!(rows[0][1], r#"["w0","x"]"#);
+    assert_eq!(rows[149][1], r#"["w149","xyxxz"]"#, "{:?}", rows[149]);
+    let (_, v) = run(&["fuzz", "resume", &id], &project);
+    assert_eq!(v["error"]["kind"], "conflict", "a completed run doesn't resume: {v}");
+
+    // A payload file that changed since the start would make other payloads of the same indexes.
+    let (code, v) = run(&[&args[..], &["--background"]].concat(), &project);
+    assert_eq!(code, 0, "{v}");
+    let id = v["data"]["run"]["id"].to_string();
+    wait_for(&project, &id, |s| s["done"].as_u64().unwrap() >= 3);
+    assert_eq!(run(&["fuzz", "stop", &id], &project).0, 0);
+    wait_for(&project, &id, |s| s["state"] == "stopped");
+    std::fs::write(&words, "other\n").unwrap();
+    let (_, v) = run(&["fuzz", "resume", &id], &project);
+    assert_eq!(v["error"]["kind"], "conflict", "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("payload set 1 changed"), "{v}");
+    assert_eq!(status(&project, &id)["state"], "stopped");
+
+    // Nor is a set read from stdin, which can't be read again.
+    let mut child = bin()
+        .args(["--format", "json", "--project"])
+        .arg(&project)
+        .args(["fuzz", "run", "--url", &url.replace("&b=§0§", ""), "-p", "file:-", "-c", "1"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let lines: String = (0..500).map(|i| format!("s{i}\n")).collect();
+    child.stdin.take().unwrap().write_all(lines.as_bytes()).unwrap();
+    let (code, v) = run(&["fuzz", "list", "--limit", "1"], &project);
+    assert_eq!(code, 0, "{v}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let id = loop {
+        let (_, v) = run(&["fuzz", "list", "--limit", "1"], &project);
+        let row = &v["data"]["rows"][0];
+        if row[2] == "running" {
+            break row[0].to_string();
+        }
+        assert!(Instant::now() < deadline, "{v}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(run(&["fuzz", "stop", &id], &project).0, 0);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(parse(&out).1["data"]["outcome"], "stopped");
+    let (_, v) = run(&["fuzz", "resume", &id], &project);
+    assert_eq!(v["error"]["kind"], "conflict", "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("stdin"), "{v}");
+    let _ = std::fs::remove_dir_all(dir);
+}
