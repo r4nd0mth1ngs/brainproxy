@@ -3196,7 +3196,7 @@ Findings are records with a history, not just rows:
   rated, findings added by hand and triaged findings are left alone. When several things
   could rate a new finding: a suppression rule wins (it is a false positive, and not rated),
   then the rating of its issue as a whole (`findings rate --issue`), then the oldest matching
-  filter. `list` gives each filter (`id`, `time`, `alert_ref`, `host`, null for any, `port`,
+  filter, whatever state its issue's decision gives it (accepted risk, say). `list` gives each filter (`id`, `time`, `alert_ref`, `host`, null for any, `port`,
   `path_prefix`, `url_regex`, `param`, `param_regex`, `risk`, `confidence`, `reason`,
   `origin`, `by`) with `holds`, how many findings still have its rating. A person who rates
   one of them takes it from the filter. `remove` stops it rating new findings; `--unrate`

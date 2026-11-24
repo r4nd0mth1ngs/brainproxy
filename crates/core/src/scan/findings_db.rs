@@ -597,16 +597,17 @@ pub(crate) fn suppress_new(conn: &rusqlite::Connection, finding: i64, history_id
     Ok(false)
 }
 
-/// Gives an open scanner finding nobody rated `rule`'s rating, as the filter's author rated
-/// it, with its timeline naming the filter, and the filter in `rated_by`. Returns whether it
-/// changed.
+/// Gives a scanner finding nobody rated `rule`'s rating, as the filter's author rated it, with
+/// its timeline naming the filter, and the filter in `rated_by`. Returns whether it changed.
+/// Which states qualify is the caller's: adding a filter takes open findings only, while a new
+/// finding is rated in whatever state its issue's decision gave it (a rating isn't a state).
 fn rate_by(conn: &rusqlite::Connection, finding: i64, rule: &Rule, history_id: Option<i64>) -> Result<bool> {
     let fits: bool = conn
         .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM findings WHERE id = ?1 AND state = 'open' AND source != ?2
+            "SELECT EXISTS (SELECT 1 FROM findings WHERE id = ?1 AND state != ?3 AND source != ?2
                 AND rated_origin IS NULL)",
         )?
-        .query_row(params![finding, MANUAL_SOURCE], |r| r.get(0))?;
+        .query_row(params![finding, MANUAL_SOURCE, REMOVED], |r| r.get(0))?;
     if !fits {
         return Ok(false);
     }
@@ -3660,10 +3661,12 @@ mod tests {
         seen_at(&mut s, "/y");
         let y = at(&s, "/y");
         assert_eq!((y["risk"].as_str(), y["rated"]["filter"].as_i64()), (Some("medium"), None), "{y}");
-        // Without the issue's rating, the filter rates it.
+        // Without the issue's rating, the filter rates it, in the state the issue's decision gives it.
         s.findings_rate(&[], &[issue], None).unwrap();
+        s.findings_mark_issues(&[], &[issue], Some("accepted_risk"), None, None).unwrap();
         seen_at(&mut s, "/z");
-        assert_eq!(at(&s, "/z")["rated"]["filter"], fid);
+        let z = at(&s, "/z");
+        assert_eq!((z["state"].as_str(), z["rated"]["filter"].as_i64()), (Some("accepted_risk"), Some(fid)), "{z}");
         // A suppression rule and a filter are listed apart, and the suppression list is as before.
         let list = s.suppressions_list().unwrap();
         assert_eq!(list.len(), 1);
