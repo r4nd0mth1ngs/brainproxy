@@ -1,6 +1,6 @@
 # Active rules
 
-`brainproxy scan active` has 64 rules: 57 ported from OWASP ZAP's `ascanrules`, `ascanrulesBeta`, `ascanrulesAlpha` and
+`brainproxy scan active` has 75 rules: 68 ported from OWASP ZAP's `ascanrules`, `ascanrulesBeta`, `ascanrulesAlpha` and
 `soap` add-ons (and helpers from `commonlib`), https://github.com/zaproxy/zap-extensions, Apache License 2.0, and
 brainproxy's own (below).
 Each rule file names the ZAP class it came from; alert names, descriptions, solutions,
@@ -174,12 +174,18 @@ requests without the scan's session.
 | 0 | Directory Browsing | page | medium | 0 |
 | 6 | Path Traversal | param | high | 6-1, 6-2, 6-3, 6-6, 6-7 |
 | 7 | Remote File Inclusion | param | high | 7 |
+| 41 | Source Code Disclosure - Git | page | high | 41 |
+| 42 | Source Code Disclosure - SVN | page | medium | 42 |
 | 10045 | Source Code Disclosure - /WEB-INF Folder | host | high | 10045-1 |
 | 10047 | HTTPS Content Available via HTTP | page | low | 10047 |
 | 10048 | Remote Code Execution - Shell Shock | param | high | 10048-1, 10048-2 |
+| 10051 | Relative Path Confusion | page | medium | 10051 |
 | 10058 | GET for POST | page | info | 10058 |
+| 10095 | Backup File Disclosure | page | medium | 10095 |
 | 10104 | User Agent Fuzzer | page | info | 10104 |
 | 10106 | HTTP Only Site | host | medium | 10106 |
+| 10107 | Httpoxy - Proxy Header Misuse (needs `oob start` with a domain) | page | high | 10107 |
+| 20014 | HTTP Parameter Pollution | page | info | 20014 |
 | 20015 | Heartbleed OpenSSL Vulnerability | host | high | 20015 |
 | 20017 | Source Code Disclosure - CVE-2012-1823 | page | high | 20017 |
 | 20018 | Remote Code Execution - CVE-2012-1823 | page | high | 20018 |
@@ -201,6 +207,7 @@ requests without the scan's session.
 | 40021 | SQL Injection - Oracle (Time Based) | param | high | 40021 |
 | 40022 | SQL Injection - PostgreSQL (Time Based) | param | high | 40022 |
 | 40023 | Possible Username Enumeration (opt-in; needs `--auth` with a login) | host | info | 40023 |
+| 40024 | SQL Injection - SQLite (Time Based) | param | high | 40024 |
 | 40027 | SQL Injection - MsSQL (Time Based) | param | high | 40027 |
 | 40028 | ELMAH Information Leak | host | medium | 40028-1 |
 | 40029 | Trace.axd Information Leak | page | medium | 40029-1 |
@@ -208,6 +215,7 @@ requests without the scan's session.
 | 40033 | NoSQL Injection - MongoDB | param | high | 40033 |
 | 40034 | .env Information Leak | page | medium | 40034-1 |
 | 40035 | Hidden File Finder | host | medium | 40035 |
+| 40038 | Bypassing 403 | page | medium | 40038 |
 | 40040 | CORS Header / CORS Misconfiguration | page | high | 40040-1, 40040-2, 40040-3 |
 | 40041 | File Upload (opt-in) | page | high | 40041-1, 40041-2 |
 | 40042 | Spring Actuator Information Leak | host | medium | 40042 |
@@ -222,8 +230,11 @@ requests without the scan's session.
 | 90021 | XPath Injection | param | high | 90021 |
 | 90023 | XML External Entity Attack | page | high | 90023 |
 | 90024 | Generic Padding Oracle | param | high | 90024 |
+| 90025 | Expression Language Injection | param | high | 90025 |
 | 90026 | SOAP Action Spoofing (recorded SOAP 1.1 requests; no WSDL, so no spoofing to other operations) | page | info | 90026 |
 | 90027 | Cookie Slack Detector | page | low | 90027 |
+| 90028 | Insecure HTTP Method | page | medium | 90028-1, 90028-3, 90028-5, 90028-6 |
+| 90029 | SOAP XML Injection | param | high | 90029 |
 | 90034 | Cloud Metadata Potentially Exposed | host | high | 90034 |
 | 90035 | Server Side Template Injection | param | high | 90035 |
 | 90036 | Server Side Template Injection (Blind) | param | high | 90036 |
@@ -245,8 +256,12 @@ their own way (the MongoDB rules' `a[$ne]=` and operator objects) leave names al
 
 Every rule in ZAP's `ascanrules` add-on is ported (`zap-sync.json` lists the two
 `pscanrules` rules that aren't). From `ascanrulesBeta` so far: CORS (40040), Server Side
-Request Forgery (40046), and the two MongoDB rules (40033, 90039). From `ascanrulesAlpha`:
-LDAP Injection (40015), with its own checks (see below). Each file's header
+Request Forgery (40046), the two MongoDB rules (40033, 90039), Git and SVN source disclosure
+(41, 42), Relative Path Confusion (10051), Backup File Disclosure (10095), Httpoxy (10107),
+HTTP Parameter Pollution (20014), Bypassing 403 (40038), Expression Language Injection
+(90025) and Insecure HTTP Method (90028). From `ascanrulesAlpha`: LDAP Injection (40015),
+with its own checks (see below), and SQLite time based SQL injection (40024). From `soap`:
+SOAP XML Injection (90029). Each file's header
 lists where it differs from ZAP; for example, JSON attacks send a real operator object.
 The time based MongoDB rule keeps ZAP's small delay, because `sleep()` runs per document:
 the stall stays small, but it only fires on collections of roughly 1,000 documents.
@@ -291,6 +306,55 @@ those skips 40014. Prime and Spider never raise alerts themselves.
   default of 5 seconds. A passing high/low sequence is run a second time and must pass
   again (all time based rules: SQL 40019-40027, command injection 90037, MongoDB 90039,
   blind SSTI 90036, Shellshock 10048), so jittery latency doesn't line up by chance.
+- **Insecure HTTP Method (90028)** reads the page's `OPTIONS` answer (`Allow`, `Public`).
+  At medium strength it tests only the methods listed there, at high and insane every
+  insecure one, as ZAP. By default it sends only methods that change nothing: TRACE and
+  TRACK to a random path, with a made-up cookie an echo would give back (90028-3), and
+  PROPFIND with `Depth: 0` to the page (90028-5); ZAP sends TRACE to the page and PROPFIND
+  without a depth. PUT and PATCH (to a new random resource next to the page, as ZAP; 90028-6)
+  and WebDAV's COPY, LOCK, MKCOL, MOVE, PROPPATCH and UNLOCK go out only when
+  `--include-methods` names them (or says `all`). DELETE is never sent: an `Allow` listing it
+  is the finding (90028-1). ZAP's CONNECT test tunnels to a third-party site, which no scope
+  allows, so it isn't ported, nor are its LOW threshold "unverified" alerts (90028-2).
+- **Backup File Disclosure (10095)** keeps ZAP's names and per-strength budgets. For a file
+  in a folder below the root (`/app/admin/login.php`) a page costs 18 requests at low, 36 at
+  medium, 83 at high and 494 at insane (two of them ask for a made-up file and folder, to
+  know this server's answer for a missing one); at the root, without the folder names,
+  fewer. Only a 2xx that differs from that answer counts.
+- **Source Code Disclosure - Git (41)** reads `.git/index` versions 2 to 4, loose objects
+  and pack files (index versions 1 and 2, OFS and REF deltas) with brainproxy's own reader,
+  at most 20 Git files per page as in ZAP; an index or pack many pages share is fetched once
+  per scan. ZAP's PHP check (`<?php` as a regex) matches any `php`; the literal `<?php` is
+  used. **SVN (42)** reads `.svn/text-base/` copies (before SVN 1.7) and `.svn/wc.db` (1.7
+  to 1.14), the database opened read-only in a temporary file. ZAP stops at the first 4xx
+  or 5xx and never tries the root folder, so it rarely reaches a `wc.db`; here a missing
+  file moves on to the folder above, up to the root.
+- **Bypassing 403 (40038)** and **Httpoxy (10107)** put a random cache buster on every
+  attack, so a cache in front of the site can only keep the answer for a URL nobody else
+  asks for. 40038 doesn't follow redirects and doesn't count this host's page for a missing
+  path (ZAP does both), and its header tests name the in-scope host's own paths. 10107 names
+  the OOB listener in the `Proxy` header instead of a proxy ZAP starts on every local
+  address; a proxied request names the site it's for, not the proxy, so only the DNS
+  lookup of the listener's name carries the token: it needs `oob start` with a domain.
+- **SQLite time based SQL injection (40024)** keeps ZAP's twelve injection contexts but not
+  its `randomblob(N)` with N up to 1 GB, which allocates that much on the database server.
+  It counts rows in a recursive CTE instead, which holds no memory: it first finds how many
+  rows a second the server counts (1 row, then 100,000 and ten times more up to 100 million,
+  until the answer is 0.4 s slower), then asks for whole seconds of counting and judges the
+  times with the same check as the sleep based rules (a tenth more work than asked, so every
+  answer takes at least as long). It tries 1, 3, 6 or all 12 contexts by strength (ZAP sends
+  nothing at low). A SQLite syntax error the payload provokes is reported as well.
+- **HTTP Parameter Pollution (20014)** reports a link or form action on the answer that
+  carries the injected parameter decoded (`?q=shoes&bp1a2b3c4d=zaproxy`): the application
+  wrote the `&` into a URL unencoded. ZAP looks for the encoded payload as a parameter's
+  value, which only an empty input gives, and then shows correctly encoded output. The
+  parameter's name is random rather than `zap`.
+- **Relative Path Confusion (10051)** needs the made-up path's answer to be a 200 (ZAP also
+  judges error pages), and an empty link or one with a scheme (`javascript:`, `mailto:`)
+  isn't relative. HTML is read by brainproxy's lenient tokenizer instead of jsoup, so
+  `<base>` and `<meta http-equiv>` count anywhere in the page.
+- **SOAP XML Injection (90029)** attacks element values in the Body of a recorded SOAP 1.1
+  or 1.2 request (an XML insertion point; the request must be a well-formed envelope).
 - **SQL Injection (40018)** confirms before it reports, against false positives:
   - a comparison that finds SQL (expression, boolean, ORDER BY) is repeated: the
     original, the value that keeps the original page and the one that changes it are

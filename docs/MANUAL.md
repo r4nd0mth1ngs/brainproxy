@@ -2555,6 +2555,10 @@ Crawl and active-scan scope and safety flags:
   store or file. A check's PUT, PATCH, DELETE (or other method), or GraphQL mutation isn't sent
   without `--include-methods`; the output counts those in `check_skipped_methods`. Every request a
   check or rule does send is recorded in history (source `scan`), finding or not.
+- Insecure HTTP Method (90028) sends TRACE, TRACK and PROPFIND (`Depth: 0`) by itself, as they
+  change nothing; its PUT and PATCH tests (to a new random resource) and WebDAV's COPY, LOCK,
+  MKCOL, MOVE, PROPPATCH and UNLOCK need `--include-methods` naming them (or `all`). It never
+  sends DELETE. See [ACTIVE_RULES.md](ACTIVE_RULES.md#differences-from-zap).
 - `import api SOURCE`: an OpenAPI 3, Swagger 2.0 (JSON or YAML) or Postman v2 document, a
   GraphQL schema (SDL file or introspection result), or a HAR file (see `import har`), detected from its contents. Through MCP a local
   file (this, `import har`'s, `--schema`, `--environment` and `scan active --api`'s too) is read
