@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec;
 use crate::error::{Error, Result};
+use crate::fuzz::sets::{self, Gen, Set};
 
 pub const DEFAULT_MARKER: &str = "§";
 
@@ -140,146 +141,166 @@ pub struct Item {
 pub struct Plan {
     mode: Mode,
     defaults: Vec<Vec<u8>>,
-    sets: Vec<Vec<Vec<u8>>>,
-    total: u64,
+    sets: Vec<Set>,
+    /// None when every set that counts is unbounded (extract): the run's --max-requests ends it.
+    total: Option<u64>,
 }
 
 impl Plan {
-    pub fn new(mode: Mode, template: &Template, sets: Vec<Vec<Vec<u8>>>) -> Result<Self> {
+    pub fn new(mode: Mode, template: &Template, mut sets: Vec<Set>) -> Result<Self> {
         let n = template.positions();
+        let defaults = template.defaults();
+        let name = serde_json::to_value(mode).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
         let want = match mode {
             Mode::Sniper | Mode::BatteringRam => 1,
             Mode::Pitchfork | Mode::ClusterBomb => n,
         };
         if sets.len() != want {
             return Err(Error::InvalidInput(format!(
-                "{} mode with {n} position(s) needs {want} payload set(s), got {}",
-                serde_json::to_value(mode).unwrap().as_str().unwrap_or(""),
+                "{name} mode with {n} position(s) needs {want} payload set(s), got {}",
                 sets.len()
             )));
         }
-        if let Some(i) = sets.iter().position(Vec::is_empty) {
-            return Err(Error::InvalidInput(format!("payload set {} is empty", i + 1)));
+        let per_position = matches!(mode, Mode::Pitchfork | Mode::ClusterBomb);
+        let copies: Vec<bool> = sets.iter().map(|s| matches!(s, Set::Copy(_))).collect();
+        for (i, set) in sets.iter_mut().enumerate() {
+            let set_no = i + 1;
+            // The position whose value a set without one of its own takes.
+            let position = if per_position { Some(i) } else { (n == 1).then_some(0) };
+            match set {
+                Set::Copy(from) => {
+                    if !per_position {
+                        return Err(Error::InvalidInput(format!(
+                            "payload set {set_no}: copy: needs one set per position (pitchfork or cluster-bomb)"
+                        )));
+                    }
+                    if *from >= n || *from == i || copies[*from] {
+                        return Err(Error::InvalidInput(format!(
+                            "payload set {set_no}: copy:{} must name another position, 1 to {n}, that isn't a copy",
+                            *from + 1
+                        )));
+                    }
+                }
+                Set::Extract { first, .. } => {
+                    if mode == Mode::ClusterBomb {
+                        return Err(Error::InvalidInput(format!(
+                            "payload set {set_no}: extract: follows one response to the next, so it has no place in \
+                             cluster-bomb's combinations; use pitchfork"
+                        )));
+                    }
+                    if mode == Mode::Sniper && n > 1 {
+                        return Err(Error::InvalidInput(
+                            "extract: in sniper mode needs a single position; use battering-ram or pitchfork".into(),
+                        ));
+                    }
+                    if first.is_none() {
+                        *first = Some(defaults[position.unwrap_or(0)].clone());
+                    }
+                }
+                Set::Lazy { gen: Gen::BitFlip(value), .. } if value.is_none() => match position {
+                    Some(p) => *value = Some(defaults[p].clone()),
+                    None => {
+                        return Err(Error::InvalidInput(format!(
+                            "payload set {set_no}: bitflip without a value flips the position's value, so it needs a \
+                             single position or one set per position; give it one: bitflip:VALUE"
+                        )))
+                    }
+                },
+                _ => {}
+            }
+            if set.count() == Some(0) {
+                return Err(Error::InvalidInput(format!("payload set {set_no} is empty")));
+            }
         }
+        let lens: Vec<u64> = sets.iter().filter_map(Set::count).collect();
         let total = match mode {
-            Mode::Sniper => (n as u64) * sets[0].len() as u64,
-            Mode::BatteringRam => sets[0].len() as u64,
-            Mode::Pitchfork => sets.iter().map(|s| s.len() as u64).min().unwrap_or(0),
-            Mode::ClusterBomb => sets
-                .iter()
-                .try_fold(1u64, |acc, s| acc.checked_mul(s.len() as u64))
-                .ok_or_else(|| Error::InvalidInput("cluster bomb has too many combinations".into()))?,
+            Mode::Sniper => lens.first().map(|l| (n as u64).saturating_mul(*l)),
+            Mode::BatteringRam => lens.first().copied(),
+            Mode::Pitchfork => lens.iter().min().copied(),
+            Mode::ClusterBomb => Some(
+                lens.iter()
+                    .try_fold(1u64, |acc, l| acc.checked_mul(*l))
+                    .ok_or_else(|| Error::InvalidInput("cluster bomb has too many combinations".into()))?,
+            ),
         };
-        Ok(Self { mode, defaults: template.defaults().to_vec(), sets, total })
+        Ok(Self { mode, defaults: defaults.to_vec(), sets, total })
     }
 
+    /// The requests the plan makes; `u64::MAX` for an unbounded one (see [`Plan::bounded`]).
     pub fn total(&self) -> u64 {
-        self.total
+        self.total.unwrap_or(u64::MAX)
+    }
+
+    /// Whether the plan ends by itself: one made only of extract sets runs until nothing is
+    /// extracted, or to --max-requests.
+    pub fn bounded(&self) -> bool {
+        self.total.is_some()
+    }
+
+    /// Whether a set follows the previous response (`extract`): requests go one at a time.
+    pub fn feedback(&self) -> bool {
+        self.sets.iter().any(|s| matches!(s, Set::Extract { .. }))
+    }
+
+    pub fn sets(&self) -> &[Set] {
+        &self.sets
     }
 
     pub fn item(&self, index: u64) -> Item {
-        match self.mode {
+        self.item_with(index, None)
+    }
+
+    /// Request `index`, with `extracted` (what the previous response gave) in the extract
+    /// sets' positions; their first value when None.
+    pub fn item_with(&self, index: u64, extracted: Option<&[u8]>) -> Item {
+        let value = |set: &Set, i: u64| match set {
+            Set::Extract { first, each } => {
+                sets::apply_each(each, extracted.map(<[u8]>::to_vec).or_else(|| first.clone()).unwrap_or_default())
+            }
+            set => set.get(i),
+        };
+        let mut item = match self.mode {
             Mode::Sniper => {
                 let set = &self.sets[0];
-                let pos = (index / set.len() as u64) as usize;
-                let payload = set[(index % set.len() as u64) as usize].clone();
+                let len = set.count().unwrap_or(u64::MAX).max(1);
+                let pos = ((index / len) as usize).min(self.defaults.len().saturating_sub(1));
+                let payload = value(set, index % len);
                 let mut values = self.defaults.clone();
                 values[pos] = payload.clone();
                 Item { position: Some(pos), payloads: vec![payload], values }
             }
             Mode::BatteringRam => {
-                let payload = self.sets[0][index as usize].clone();
+                let payload = value(&self.sets[0], index);
                 Item { position: None, payloads: vec![payload.clone()], values: vec![payload; self.defaults.len()] }
             }
             Mode::Pitchfork => {
-                let values: Vec<Vec<u8>> = self.sets.iter().map(|s| s[index as usize].clone()).collect();
-                Item { position: None, payloads: values.clone(), values }
+                let values: Vec<Vec<u8>> = self.sets.iter().map(|s| value(s, index)).collect();
+                Item { position: None, payloads: Vec::new(), values }
             }
             Mode::ClusterBomb => {
-                // Mixed radix; the last position changes fastest.
+                // Mixed radix over the sets that have payloads; the last position changes fastest.
                 let mut rem = index;
                 let mut values = vec![Vec::new(); self.sets.len()];
                 for (i, set) in self.sets.iter().enumerate().rev() {
-                    values[i] = set[(rem % set.len() as u64) as usize].clone();
-                    rem /= set.len() as u64;
-                }
-                Item { position: None, payloads: values.clone(), values }
-            }
-        }
-    }
-}
-
-/// Parses a payload source:
-/// `list:a,b,c` (comma-separated; `\,` for a literal comma), `file:PATH` (one per
-/// line; `file:-` for stdin), `range:FROM-TO[:STEP]` (zero padding kept, e.g. 001-100), or
-/// `wordlist:NAME` (a built-in list; see `brainproxy wordlists list`).
-pub fn load_payloads(spec: &str, stdin: &mut dyn FnMut() -> Result<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
-    let (kind, arg) = spec.split_once(':').ok_or_else(|| bad_spec(spec))?;
-    match kind {
-        "list" => {
-            let mut out = Vec::new();
-            let mut cur = String::new();
-            let mut chars = arg.chars().peekable();
-            while let Some(c) = chars.next() {
-                match c {
-                    '\\' if chars.peek() == Some(&',') => {
-                        cur.push(',');
-                        chars.next();
+                    if let Some(len) = set.count().filter(|l| *l > 0) {
+                        values[i] = set.get(rem % len);
+                        rem /= len;
                     }
-                    ',' => out.push(std::mem::take(&mut cur).into_bytes()),
-                    c => cur.push(c),
                 }
+                Item { position: None, payloads: Vec::new(), values }
             }
-            out.push(cur.into_bytes());
-            Ok(out)
-        }
-        "file" => {
-            let data = if arg == "-" {
-                stdin()?
-            } else {
-                std::fs::read(arg).map_err(|e| Error::InvalidInput(format!("payload file {arg:?}: {e}")))?
-            };
-            Ok(data
-                .split(|&b| b == b'\n')
-                .map(|l| l.strip_suffix(b"\r").unwrap_or(l).to_vec())
-                .filter(|l| !l.is_empty())
-                .collect())
-        }
-        "range" => {
-            let (bounds, step) = match arg.rsplit_once(':') {
-                Some((b, s)) => (b, s.parse::<i64>().map_err(|_| bad_spec(spec))?),
-                None => (arg, 1),
-            };
-            let (from, to) = bounds
-                .strip_prefix('-')
-                .map(|rest| rest.split_once('-').map(|(a, b)| (format!("-{a}"), b.to_string())))
-                .unwrap_or_else(|| bounds.split_once('-').map(|(a, b)| (a.to_string(), b.to_string())))
-                .ok_or_else(|| bad_spec(spec))?;
-            let width = if from.starts_with('0') && from.len() > 1 { from.len() } else { 0 };
-            let (a, b): (i64, i64) =
-                (from.parse().map_err(|_| bad_spec(spec))?, to.parse().map_err(|_| bad_spec(spec))?);
-            if step <= 0 {
-                return Err(Error::InvalidInput("range step must be positive".into()));
+        };
+        // A copy takes its position's value once every other is known.
+        for (i, set) in self.sets.iter().enumerate() {
+            if let Set::Copy(from) = set {
+                item.values[i] = item.values[*from].clone();
             }
-            let count = ((a - b).abs() / step + 1) as u64;
-            if count > 10_000_000 {
-                return Err(Error::InvalidInput(format!("range {spec:?} has {count} values; max 10,000,000")));
-            }
-            let dir = if b >= a { 1 } else { -1 };
-            Ok((0..count as i64).map(|i| format!("{:0width$}", a + dir * i * step).into_bytes()).collect())
         }
-        "wordlist" => crate::wordlists::get(arg).map(|l| l.map(|e| e.as_bytes().to_vec()).collect()).ok_or_else(|| {
-            let names: Vec<&str> = crate::wordlists::names().collect();
-            Error::NotFound(format!("wordlist {arg:?}; built-in lists: {}", names.join(", ")))
-        }),
-        _ => Err(bad_spec(spec)),
+        if matches!(self.mode, Mode::Pitchfork | Mode::ClusterBomb) {
+            item.payloads = item.values.clone();
+        }
+        item
     }
-}
-
-fn bad_spec(spec: &str) -> Error {
-    Error::InvalidInput(format!(
-        "bad payload source {spec:?}; use list:a,b,c | file:PATH | range:1-100[:step] | wordlist:NAME"
-    ))
 }
 
 pub const PROCESSORS: &[&str] = &[
@@ -304,7 +325,7 @@ pub const PROCESSORS: &[&str] = &[
 ];
 
 /// One built-in step of a processing chain, applied to a payload.
-fn step(step: &str, v: Vec<u8>) -> Result<Vec<u8>> {
+pub(crate) fn step(step: &str, v: Vec<u8>) -> Result<Vec<u8>> {
     Ok(match step.split_once(':') {
         Some(("prefix", x)) => [x.as_bytes(), &v].concat(),
         Some(("suffix", x)) => [&v[..], x.as_bytes()].concat(),
@@ -382,6 +403,34 @@ impl Chain {
     /// Applies the chain to every payload of set `set` (counted from 1), left to right. A script
     /// that fails on a payload (it throws, runs past its time limit, or returns something that
     /// isn't a payload) fails the chain: no run starts on half-processed payloads.
+    /// Applies the chain to set `set_no` (counted from 1): a list's payloads now; a generated
+    /// set's, and an extracted value, as each is made (built-in steps only; a script is handed a
+    /// generated set of at most [`sets::MAX_COMBOS`] made in full). A copy is its position's
+    /// value as sent, so it has no processing of its own.
+    pub fn apply_set(&self, set_no: usize, set: &mut Set) -> Result<()> {
+        for s in &self.steps {
+            match (s, &mut *set) {
+                (_, Set::Copy(_)) => {
+                    return Err(Error::InvalidInput(format!(
+                        "payload set {set_no} is a copy of another position's value as sent; process that set instead"
+                    )))
+                }
+                (ChainStep::Builtin(name), Set::List(payloads)) => {
+                    for p in payloads.iter_mut() {
+                        *p = step(name, std::mem::take(p))?;
+                    }
+                }
+                (ChainStep::Builtin(name), Set::Lazy { each, .. } | Set::Extract { each, .. }) => {
+                    // Checked now, so a step that doesn't exist fails before the run.
+                    step(name, b"x".to_vec())?;
+                    each.push(name.clone());
+                }
+                (ChainStep::Script(_, hook), set) => hook.process(set_no, set.materialise(set_no)?)?,
+            }
+        }
+        Ok(())
+    }
+
     pub fn apply(&self, set: usize, payloads: &mut [Vec<u8>]) -> Result<()> {
         for s in &self.steps {
             match s {
@@ -419,6 +468,14 @@ fn split_chain(chain: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fuzz::sets::load_payloads;
+
+    fn list(set: Set) -> Vec<Vec<u8>> {
+        match set {
+            Set::List(v) => v,
+            other => panic!("not a list: {other:?}"),
+        }
+    }
 
     fn t(s: &str) -> Template {
         Template::parse(s.as_bytes(), DEFAULT_MARKER).unwrap()
@@ -435,13 +492,13 @@ mod tests {
     #[test]
     fn wordlist_payloads() {
         let mut no_stdin = || Ok(vec![]);
-        let sqli = load_payloads("wordlist:sqli", &mut no_stdin).unwrap();
+        let sqli = list(load_payloads("wordlist:sqli", &mut no_stdin).unwrap());
         assert!(sqli.len() > 100 && sqli.contains(&b"'".to_vec()));
         assert!(load_payloads("wordlist:nope", &mut no_stdin).unwrap_err().to_string().contains("content-discovery"));
     }
 
-    fn sets(v: &[&[&str]]) -> Vec<Vec<Vec<u8>>> {
-        v.iter().map(|s| s.iter().map(|p| p.as_bytes().to_vec()).collect()).collect()
+    fn sets(v: &[&[&str]]) -> Vec<Set> {
+        v.iter().map(|s| Set::List(s.iter().map(|p| p.as_bytes().to_vec()).collect())).collect()
     }
 
     fn rendered(plan: &Plan, tpl: &Template) -> Vec<String> {
@@ -478,15 +535,81 @@ mod tests {
         assert!(Plan::new(Mode::Pitchfork, &tpl, sets(&[&["1"]])).is_err());
     }
 
+    fn spec(s: &str) -> Set {
+        load_payloads(s, &mut || -> Result<Vec<u8>> { unreachable!() }).unwrap()
+    }
+
+    #[test]
+    fn a_copy_takes_its_positions_value_and_adds_no_dimension() {
+        let tpl = t("u=§a§&p=§b§&c=§c§");
+        let p = Plan::new(Mode::Pitchfork, &tpl, vec![spec("list:x,y"), spec("list:1,2,3"), spec("copy:2")]).unwrap();
+        assert_eq!(rendered(&p, &tpl), ["u=x&p=1&c=1", "u=y&p=2&c=2"]);
+        let p = Plan::new(Mode::ClusterBomb, &tpl, vec![spec("list:x,y"), spec("copy:1"), spec("list:1,2")]).unwrap();
+        assert_eq!(rendered(&p, &tpl), ["u=x&p=x&c=1", "u=x&p=x&c=2", "u=y&p=y&c=1", "u=y&p=y&c=2"]);
+        assert_eq!(p.item(1).payloads, [b"x".to_vec(), b"x".to_vec(), b"2".to_vec()]);
+        let e = |sets: Vec<Set>, mode| Plan::new(mode, &tpl, sets).unwrap_err().to_string();
+        assert!(e(vec![spec("list:x"), spec("copy:2"), spec("list:1")], Mode::Pitchfork).contains("another position"));
+        assert!(e(vec![spec("list:x"), spec("copy:3"), spec("copy:2")], Mode::Pitchfork).contains("isn't a copy"));
+        assert!(e(vec![spec("list:x"), spec("copy:9"), spec("list:1")], Mode::Pitchfork).contains("1 to 3"));
+        assert!(e(vec![spec("copy:1")], Mode::Sniper).contains("one set per position"));
+    }
+
+    #[test]
+    fn extract_and_bitflip_take_the_positions_value() {
+        let tpl = t("GET /?t=§start§&n=§1§");
+        let p = Plan::new(Mode::Pitchfork, &tpl, vec![spec("extract"), spec("range:1-3")]).unwrap();
+        assert!(p.bounded() && p.feedback() && p.total() == 3);
+        assert_eq!(p.item(0).values, [b"start".to_vec(), b"1".to_vec()]);
+        assert_eq!(p.item_with(1, Some(b"tok")).values, [b"tok".to_vec(), b"2".to_vec()]);
+        let p = Plan::new(Mode::Pitchfork, &tpl, vec![spec("extract:go"), spec("extract")]).unwrap();
+        assert!(!p.bounded() && p.total() == u64::MAX);
+        assert_eq!(p.item(0).values, [b"go".to_vec(), b"1".to_vec()]);
+        let e = Plan::new(Mode::ClusterBomb, &tpl, vec![spec("extract"), spec("list:a")]).unwrap_err();
+        assert!(e.to_string().contains("cluster-bomb"), "{e}");
+        assert!(Plan::new(Mode::Sniper, &tpl, vec![spec("extract")]).is_err());
+        let one = t("GET /?t=§AB§");
+        let p = Plan::new(Mode::Sniper, &one, vec![spec("bitflip")]).unwrap();
+        assert_eq!(p.total(), 16);
+        assert_eq!(p.item(0).values, [b"@B".to_vec()]);
+        let p = Plan::new(Mode::Pitchfork, &tpl, vec![spec("bitflip"), spec("bitflip:z")]).unwrap();
+        assert_eq!(p.total(), 8);
+        let e = Plan::new(Mode::Sniper, &tpl, vec![spec("bitflip")]).unwrap_err().to_string();
+        assert!(e.contains("bitflip:VALUE"), "{e}");
+        assert!(Plan::new(Mode::Sniper, &t("a=§§"), vec![spec("bitflip")]).unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn a_generated_set_is_processed_as_each_payload_is_made() {
+        let tpl = t("q=§x§");
+        let mut lazy = spec("brute:ab:1-2");
+        let mut eager = Set::List((0..6).map(|i| spec("brute:ab:1-2").get(i)).collect());
+        let chain = Chain::parse("upper,prefix:-").unwrap();
+        chain.apply_set(1, &mut lazy).unwrap();
+        chain.apply_set(1, &mut eager).unwrap();
+        assert!(matches!(lazy, Set::Lazy { .. }));
+        let (a, b) =
+            (Plan::new(Mode::Sniper, &tpl, vec![lazy]).unwrap(), Plan::new(Mode::Sniper, &tpl, vec![eager]).unwrap());
+        assert_eq!(rendered(&a, &tpl), rendered(&b, &tpl));
+        assert_eq!(rendered(&a, &tpl)[3], "q=-AB");
+        // A step that doesn't exist fails before any payload is made, and a copy has no chain.
+        assert!(Chain::parse("bogus").unwrap().apply_set(1, &mut spec("null:2")).is_err());
+        assert!(chain.apply_set(1, &mut Set::Copy(0)).unwrap_err().to_string().contains("process that set"));
+        // A script is handed a generated set made in full, up to a million payloads.
+        let mut big = spec("brute:a-z0-9:1-4");
+        let e = big.materialise(1).unwrap_err().to_string();
+        assert!(e.contains("at most 1000000"), "{e}");
+        assert_eq!(spec("null:3").materialise(1).unwrap().len(), 3);
+    }
+
     #[test]
     fn payload_sources_and_processing() {
         let mut no_stdin = || -> Result<Vec<u8>> { unreachable!() };
-        assert_eq!(load_payloads(r"list:a,b\,c", &mut no_stdin).unwrap(), [b"a".to_vec(), b"b,c".to_vec()]);
-        let r = load_payloads("range:008-011", &mut no_stdin).unwrap();
+        assert_eq!(list(load_payloads(r"list:a,b\,c", &mut no_stdin).unwrap()), [b"a".to_vec(), b"b,c".to_vec()]);
+        let r = list(load_payloads("range:008-011", &mut no_stdin).unwrap());
         assert_eq!(r, ["008", "009", "010", "011"].map(|s| s.as_bytes().to_vec()));
-        assert_eq!(load_payloads("range:10-0:5", &mut no_stdin).unwrap().len(), 3);
+        assert_eq!(load_payloads("range:10-0:5", &mut no_stdin).unwrap().count(), Some(3));
         let mut stdin = || Ok(b"x\r\n\ny\n".to_vec());
-        assert_eq!(load_payloads("file:-", &mut stdin).unwrap(), [b"x".to_vec(), b"y".to_vec()]);
+        assert_eq!(list(load_payloads("file:-", &mut stdin).unwrap()), [b"x".to_vec(), b"y".to_vec()]);
         assert!(load_payloads("nope", &mut no_stdin).is_err());
 
         assert_eq!(process("prefix:a\\,b,suffix:!,base64", b"x").unwrap(), b"YSxieCE=");

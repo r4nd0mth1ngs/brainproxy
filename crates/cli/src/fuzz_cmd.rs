@@ -319,18 +319,17 @@ fn text_summary(s: &Value) -> String {
 /// inside the project's folder, and one elsewhere is refused (see
 /// [`crate::mcp::local_document`]), as each line goes on the wire and into history.
 fn payload_source(project: &Path, spec: &str) -> Result<String, Error> {
-    match spec.split_once(':') {
-        Some(("file", path)) if path != "-" => Ok(format!(
-            "file:{}",
-            crate::mcp::local_file_arg(
-                project,
-                "--payloads file:",
-                path,
-                "pass the payloads on stdin (file:-), or use list:, range: or wordlist:",
-            )?
-        )),
-        _ => Ok(spec.to_string()),
-    }
+    let Some(path) = fuzz::source_file(spec) else { return Ok(spec.to_string()) };
+    let kind = &spec[..spec.len() - path.len()];
+    Ok(format!(
+        "{kind}{}",
+        crate::mcp::local_file_arg(
+            project,
+            &format!("--payloads {kind}"),
+            path,
+            "pass the payloads on stdin (file:-), or use list:, range: or wordlist:",
+        )?
+    ))
 }
 
 fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), Error> {
@@ -405,23 +404,28 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
         }
         let chain = fuzz::Chain::parse(chain)?;
         scripts.extend(chain.scripts().into_iter().cloned());
-        for (i, set) in sets.iter_mut().enumerate() {
-            if which.is_none_or(|n| n == i + 1) {
-                chain.apply(i + 1, set)?;
-            }
-        }
         if let Some(n) = which.filter(|n| *n == 0 || *n > args.payloads.len()) {
             return Err(Error::InvalidInput(format!("--process {n}=...: there is no payload set {n}")));
+        }
+        for (i, set) in sets.iter_mut().enumerate() {
+            // A chain for every set passes over copies, which are another position's value as sent.
+            if which.is_none_or(|n| n == i + 1) && !(which.is_none() && matches!(set, fuzz::Set::Copy(_))) {
+                chain.apply_set(i + 1, set)?;
+            }
         }
     }
     // A raw line break in the head is a CRLF-injection test a person may run; it can also start a
     // Host header, so through MCP it needs --host-header-test as a foreign Host does.
-    if raw_in_head && sets.iter().flatten().any(|p| p.contains(&b'\r') || p.contains(&b'\n')) && host_warning.is_none()
-    {
+    if raw_in_head && sets.iter().any(fuzz::Set::may_break_line) && host_warning.is_none() {
         let what = "(a payload with a line break, unencoded in the head)".to_string();
         host_warning = crate::mcp::check_host_setting("fuzz run", Some(what), args.req.host_header_test, out)?;
     }
     let plan = Plan::new(mode, &template, sets)?;
+    if !plan.bounded() && args.max_requests.is_none() {
+        return Err(Error::InvalidInput(
+            "every payload set is extract:, so the run has no end of its own; give --max-requests".into(),
+        ));
+    }
     let total = args.max_requests.map_or(plan.total(), |m| m.min(plan.total()));
 
     let mut config = json!({
