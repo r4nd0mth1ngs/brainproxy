@@ -238,6 +238,58 @@ jobs:
       - run: npm run build
       - run: npm test
 
+  # The native window, not just the browser build: a debug app under xvfb, driven over
+  # WebDriver (tauri-driver + WebKitWebDriver) by gui/e2e/native.mjs, which opens a project,
+  # checks that Traffic shows a row the CLI recorded, and keeps a screenshot of the window.
+  # Linux only: macOS has no WebDriver for WKWebView.
+  gui-native:
+    needs: gui-check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: gui-native
+          workspaces: |
+            . -> target
+            gui/src-tauri -> target
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+      - name: Webview, WebDriver and X server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            webkit2gtk-driver xvfb
+      - run: cargo install tauri-driver --locked --version 2.1.0
+      - run: cargo build -p brainproxy
+      - run: npm ci
+        working-directory: gui
+      # A debug app with the built frontend inside; the CLI comes from BRAINPROXY_BIN.
+      - run: npx tauri build --debug --no-bundle
+        working-directory: gui
+      - name: Screenshot test
+        working-directory: gui
+        env:
+          BRAINPROXY_BIN: ${{ github.workspace }}/target/debug/brainproxy
+          SCREENSHOT: ${{ github.workspace }}/native-window.png
+        run: xvfb-run -a --server-args="-screen 0 1440x900x24" npm run test:native
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-window-screenshot
+          path: native-window.png
+          if-no-files-found: warn
+
   # Desktop bundles with the CLI inside (Tauri sidecar), on tags and manual runs.
   gui:
     needs: [check, gui-check]
