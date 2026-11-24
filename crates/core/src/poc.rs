@@ -247,6 +247,12 @@ fn web_url(url: &str) -> Result<url::Url> {
     }
 }
 
+/// Whether two URLs name the same page, as written or once parsed (`HTTP://A.test` is
+/// `http://a.test/`).
+pub fn same_url(a: &str, b: &str) -> bool {
+    a == b || matches!((url::Url::parse(a), url::Url::parse(b)), (Ok(x), Ok(y)) if x == y)
+}
+
 /// The URL a request goes to: its absolute request target, or `target` and the path.
 fn request_url(target_line: &str, target: &Target) -> Result<url::Url> {
     let lower = target_line.to_ascii_lowercase();

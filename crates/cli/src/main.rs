@@ -19,6 +19,7 @@ mod jobs_cmd;
 mod mcp;
 mod oob_cmd;
 mod output;
+mod poc_cmd;
 mod policy_cmd;
 mod process;
 mod project_cmd;
@@ -229,6 +230,11 @@ enum Cmd {
 
     /// Compare two history entries (Comparer): line, word, or byte diff.
     Diff(fuzz_cmd::DiffArgs),
+
+    /// Proof-of-concept pages from a recorded request: CSRF and clickjacking. Nothing is sent;
+    /// opening a page in a browser sends its requests outside brainproxy's scope checks.
+    #[command(subcommand)]
+    Poc(poc_cmd::PocCmd),
 
     /// Browse recorded requests and responses.
     #[command(subcommand)]
@@ -589,6 +595,8 @@ fn command_name(cmd: &Cmd) -> String {
             fuzz_cmd::FuzzCmd::Stop { .. } => "fuzz stop",
         },
         Cmd::Diff(_) => "diff",
+        Cmd::Poc(poc_cmd::PocCmd::Csrf(_)) => "poc csrf",
+        Cmd::Poc(poc_cmd::PocCmd::Clickjacking(_)) => "poc clickjacking",
         Cmd::Ws(c) => match c {
             ws_cmd::WsCmd::List { .. } => "ws list",
             ws_cmd::WsCmd::Show { .. } => "ws show",
@@ -746,6 +754,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Browser(cmd) => browser_cmd::browser(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Fuzz(cmd) => fuzz_cmd::fuzz_cmd(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Diff(args) => fuzz_cmd::diff_cmd(&cli.project, args, out)?,
+        Cmd::Poc(cmd) => poc_cmd::poc(&cli.project, cmd, out)?,
         Cmd::Ws(cmd) => ws_cmd::ws(&cli.project, cmd, out)?,
         Cmd::Sse(cmd) => sse_cmd::sse(&cli.project, cmd, out)?,
         Cmd::Scan(cmd) => scan_cmd::scan(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,

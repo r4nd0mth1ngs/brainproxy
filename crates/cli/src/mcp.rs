@@ -727,6 +727,9 @@ const HINTS: &[(&str, Hints)] = &[
     // --output writes a new file: through MCP --force is refused, so nothing is overwritten.
     ("report", ADD),
     ("diff", READ),
+    // Nothing is sent: a page only. --output writes a new file: through MCP --force is refused.
+    ("poc csrf", ADD),
+    ("poc clickjacking", ADD),
     ("history list", READ),
     ("history show", READ),
     // --output writes a new file: through MCP --force is refused, so nothing is overwritten.
@@ -1619,6 +1622,7 @@ mod tests {
             "scan active --api",
             "scan active --checks",
             "scan active --environment",
+            "poc csrf --file",
             "send --file",
             "ws send --file",
         ];
@@ -1678,6 +1682,8 @@ mod tests {
             "history list --source",
             "intercept enable --path",
             "oob start --log",
+            "poc clickjacking --output",
+            "poc csrf --output",
             "proxy restart --authz_skip_path",
             "proxy restart --log",
             "proxy restart --redirect",
