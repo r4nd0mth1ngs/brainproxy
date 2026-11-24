@@ -568,7 +568,7 @@ fn disposition_params(line: &[u8]) -> Vec<(String, Range<usize>)> {
 /// The values of an XML document: leaf element text and attributes (namespace
 /// declarations aside), each with its dotted name, decoded value and byte range.
 /// `None` for anything malformed, so that other text sent as XML yields no points.
-fn xml_values(body: &[u8]) -> Option<Vec<(String, String, Range<usize>)>> {
+pub(crate) fn xml_values(body: &[u8]) -> Option<Vec<(String, String, Range<usize>)>> {
     let s = std::str::from_utf8(body).ok()?;
     if !s.strip_prefix('\u{feff}').unwrap_or(s).trim_start().starts_with('<') {
         return None;

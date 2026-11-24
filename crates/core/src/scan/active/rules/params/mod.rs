@@ -4,15 +4,18 @@
 mod buffer_overflow;
 pub(in crate::scan::active) mod common;
 mod cross_site_scripting;
+mod expression_language;
 mod external_redirect;
 mod format_string;
 mod log4shell;
 mod padding_oracle;
+mod parameter_pollution;
 mod parameter_tamper;
 mod path_traversal;
 mod persistent_xss;
 mod remote_file_include;
 mod server_side_include;
+mod soap_xml_injection;
 mod ssrf;
 mod ssti;
 mod xpath_injection;
@@ -41,6 +44,9 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(persistent_xss::PersistentXssPrime),
         Box::new(persistent_xss::PersistentXssSpider),
         Box::new(persistent_xss::PersistentXss),
+        Box::new(parameter_pollution::ParameterPollution),
+        Box::new(expression_language::ExpressionLanguage),
+        Box::new(soap_xml_injection::SoapXmlInjection),
     ]
 }
 

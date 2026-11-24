@@ -30,6 +30,7 @@ mod sql_injection_mssql_timing;
 mod sql_injection_mysql_timing;
 mod sql_injection_oracle_timing;
 mod sql_injection_postgresql_timing;
+mod sql_injection_sqlite_timing;
 mod ssti_blind;
 mod timing;
 
@@ -46,6 +47,7 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(sql_injection_oracle_timing::SqlInjectionOracleTiming),
         Box::new(sql_injection_postgresql_timing::SqlInjectionPostgreSqlTiming),
         Box::new(sql_injection_mssql_timing::SqlInjectionMsSqlTiming),
+        Box::new(sql_injection_sqlite_timing::SqlInjectionSqLiteTiming),
         Box::new(code_injection::CodeInjection),
         Box::new(command_injection::CommandInjection),
         Box::new(ssti_blind::SstiBlind),
@@ -70,7 +72,8 @@ mod tests {
         assert_eq!(
             ids,
             HashSet::from([
-                40015, 40018, 40019, 40020, 40021, 40022, 40027, 40033, 90019, 90020, 90036, 90037, 90039, 100003
+                40015, 40018, 40019, 40020, 40021, 40022, 40024, 40027, 40033, 90019, 90020, 90036, 90037, 90039,
+                100003
             ])
         );
         let mut refs = HashSet::new();
