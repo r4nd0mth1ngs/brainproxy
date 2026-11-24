@@ -426,6 +426,13 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
             "every payload set is extract:, so the run has no end of its own; give --max-requests".into(),
         ));
     }
+    if plan.feedback() && args.extract.is_none() {
+        return Err(Error::InvalidInput(
+            "an extract: set sends what --extract captured from the previous response; give --extract REGEX".into(),
+        ));
+    }
+    // Each response feeds the next request, so they go one at a time; the record says so.
+    let concurrency = if plan.feedback() { 1 } else { args.concurrency.clamp(1, 1000) };
     let total = args.max_requests.map_or(plan.total(), |m| m.min(plan.total()));
 
     let mut config = json!({
@@ -433,7 +440,7 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
         "payloads": args.payloads,
         "process": args.process,
         "marker": args.marker,
-        "concurrency": args.concurrency,
+        "concurrency": concurrency,
         "rate": args.rate,
         "grep": args.grep,
         "extract": args.extract,
@@ -443,6 +450,12 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     });
     if !scripts.is_empty() {
         config["process_scripts"] = json!(scripts);
+    }
+    if plan.feedback() {
+        config["note"] = json!(
+            "an extract: set sends what --extract captured from each response in the next request, so requests go \
+             one at a time"
+        );
     }
     let store = Store::open(project)?;
 
@@ -492,7 +505,7 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     };
     let client = brainproxy_core::http::Client::new(send.clone());
     let engine_cfg = EngineConfig {
-        concurrency: args.concurrency.clamp(1, 1000),
+        concurrency,
         rate: args.rate,
         send,
         grep: args.grep.clone(),
@@ -509,6 +522,7 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
         max_requests: args.max_requests,
         auth: auth.clone(),
         client: Some(client.clone()),
+        last_extract: None,
     };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let started = Instant::now();

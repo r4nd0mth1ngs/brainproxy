@@ -53,6 +53,9 @@ pub struct EngineConfig {
     /// The client to send with, made with `send` (a clone shares its connections and what it
     /// noted, so the caller can read [`Client::h3_notes`] afterwards); one is made when None.
     pub client: Option<Client>,
+    /// For a resumed run with an extract set: what the last recorded response gave (`Some(None)`
+    /// for nothing), which the next request carries on from. None starts from the set's first value.
+    pub last_extract: Option<Option<String>>,
 }
 
 /// Outcome of one request.
@@ -97,6 +100,8 @@ pub enum Outcome {
     Completed,
     StoppedOnMatch,
     Stopped,
+    /// An extract set's chain broke: a response gave nothing for --extract to capture.
+    ExtractEnded,
 }
 
 struct Compiled {
@@ -153,6 +158,9 @@ pub async fn run(
     let stop = Arc::new(AtomicBool::new(false));
     let stopped_by_user = Arc::new(AtomicBool::new(false));
     let matched_stop = Arc::new(AtomicBool::new(false));
+    let extract_ended = Arc::new(AtomicBool::new(false));
+    // An extract set feeds each response into the next request: one request at a time.
+    let concurrency = if plan.feedback() { 1 } else { cfg.concurrency.max(1) };
     let limiter = cfg.rate.filter(|r| *r > 0.0).map(|r| Arc::new(Limiter::new(r)));
     let client = Arc::new(cfg.client.clone().unwrap_or_else(|| Client::new(cfg.send.clone())));
     // With `--store all`, each request's row is written before it goes out.
@@ -202,11 +210,12 @@ pub async fn run(
 
     let url_positions = Arc::new(template.url_positions());
     let mut workers = Vec::new();
-    for _ in 0..cfg.concurrency.max(1).min(total.max(1) as usize) {
-        let (next, stop, matched_stop, limiter, client, tx, rows, rules) = (
+    for _ in 0..concurrency.min(total.max(1).try_into().unwrap_or(usize::MAX)) {
+        let (next, stop, matched_stop, extract_ended, limiter, client, tx, rows, rules) = (
             next.clone(),
             stop.clone(),
             matched_stop.clone(),
+            extract_ended.clone(),
             limiter.clone(),
             client.clone(),
             tx.clone(),
@@ -217,6 +226,9 @@ pub async fn run(
         let (template, plan, target, cfg, compiled, fuzzed) =
             (template.clone(), plan.clone(), target.clone(), cfg.clone(), compiled.clone(), fuzzed.clone());
         workers.push(tokio::spawn(async move {
+            // What the previous response gave --extract (the only worker, with an extract set):
+            // None before the first request, which takes the set's first value.
+            let mut last: Option<Option<String>> = cfg.last_extract.clone();
             loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -225,10 +237,20 @@ pub async fn run(
                 if idx >= total {
                     break;
                 }
+                let extracted = match &last {
+                    _ if !plan.feedback() => None,
+                    None => None,
+                    Some(Some(v)) => Some(v.as_bytes()),
+                    // Nothing to carry on with: the chain ends here.
+                    Some(None) => {
+                        extract_ended.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                };
                 if let Some(l) = &limiter {
                     l.wait().await;
                 }
-                let mut item = plan.item(idx);
+                let mut item = plan.item_with(idx, extracted);
                 if cfg.encode_payloads {
                     for (v, url) in item.values.iter_mut().zip(url_positions.iter()) {
                         if *url {
@@ -334,6 +356,9 @@ pub async fn run(
                     (None, Some(c)) => History::Capture(Box::new(Capture { sni: client.sni(&target), ..c })),
                     (None, None) => History::None,
                 };
+                if plan.feedback() {
+                    last = Some(res.extract.clone());
+                }
                 if res.matched && cfg.stop_on_match {
                     matched_stop.store(true, Ordering::Relaxed);
                     stop.store(true, Ordering::Relaxed);
@@ -358,6 +383,8 @@ pub async fn run(
         Outcome::Stopped
     } else if matched_stop.load(Ordering::Relaxed) {
         Outcome::StoppedOnMatch
+    } else if extract_ended.load(Ordering::Relaxed) {
+        Outcome::ExtractEnded
     } else {
         Outcome::Completed
     })
