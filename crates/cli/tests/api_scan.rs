@@ -114,6 +114,7 @@ fn handle(mut s: TcpStream, hits: &Mutex<Vec<Hit>>, document: Option<&str>, sign
         hits.lock().unwrap().push(hit);
         let text = match document.filter(|_| target == "/spec") {
             Some(d) => d.to_string(),
+            None if target == "/graphql" => graphql_answer(body),
             None => r#"{"ok":true}"#.to_string(),
         };
         let reply = if good {
@@ -124,6 +125,26 @@ fn handle(mut s: TcpStream, hits: &Mutex<Vec<Hit>>, document: Option<&str>, sign
         if s.write_all(reply.as_bytes()).is_err() {
             return;
         }
+    }
+}
+
+/// A GraphQL endpoint that answers introspection and batches of queries, and nothing over GET
+/// or form posts.
+fn graphql_answer(body: &[u8]) -> String {
+    let one = |op: &Value| {
+        let q = op["query"].as_str().unwrap_or_default();
+        if q.contains("__schema") {
+            json!({"data": {"__schema": {"queryType": {"name": "Query"}}}})
+        } else if q.contains("__typename") {
+            json!({"data": {"__typename": "Query"}})
+        } else {
+            json!({"data": {"user": {"name": "ann"}}})
+        }
+    };
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Array(ops)) => Value::Array(ops.iter().map(one).collect()).to_string(),
+        Ok(op) => one(&op).to_string(),
+        Err(_) => r#"{"errors":[{"message":"bad request"}]}"#.to_string(),
     }
 }
 
@@ -977,6 +998,35 @@ fn baselines_with_no_response_are_counted_and_not_scanned() {
     let o = run(&p, &["scan", "active", &dead]);
     assert_eq!(o.code, 3, "{}", o.all);
     assert!(o.json["error"]["message"].as_str().unwrap().contains("nothing to scan"), "{}", o.all);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_graphql_schema_scanned_with_its_rule_tests_the_endpoint_once() {
+    let (dir, p) = setup("graphql", "127.0.0.1");
+    let api = Api::start();
+    let sdl = "type Query { user(id: ID!): User\n users: [User] }\ntype User { name: String }\n\
+        type Mutation { deleteUser(id: ID!): Boolean }\n";
+    let arg = format!("--api={}", write_doc(&dir, "schema.graphql", sdl));
+    let base = format!("--base-url={}/graphql", api.origin());
+    let r = ok(&p, &["scan", "active", &arg, &base, "--rules", "100012", "--strength", "low"]);
+    // Two queries, one endpoint; the mutation stays unsent without --include-methods MUTATION.
+    assert_eq!((r["targets"].as_u64(), r["import"]["sent"].as_u64()), (Some(2), Some(2)), "{r}");
+    let raised = &r["raised"];
+    assert_eq!(
+        (&raised["100012-1"], &raised["100012-3"], &raised["100012-4"]),
+        (&json!(1), &json!(1), &json!(1)),
+        "{r}"
+    );
+    assert!(raised.get("100012-2").is_none(), "{r}");
+    assert_eq!(r["requests"], 7, "{r}");
+    let hits = api.hits();
+    assert!(!hits.iter().any(|h| h.body.contains("mutation") || h.body.contains("deleteUser")), "{hits:?}");
+    // The two baselines, then the rule's seven: one with a root field misspelt.
+    assert_eq!(hits.len(), 9, "{hits:?}");
+    assert!(hits.iter().any(|h| h.body.contains("query{userx}") || h.body.contains("query{usersx}")), "{hits:?}");
+    let found = ok(&p, &["query", "SELECT alert_ref, risk FROM findings WHERE rule_id = 100012 ORDER BY alert_ref"]);
+    assert_eq!(found["rows"], json!([["100012-1", "low"], ["100012-3", "low"], ["100012-4", "low"]]), "{found}");
     let _ = std::fs::remove_dir_all(dir);
 }
 

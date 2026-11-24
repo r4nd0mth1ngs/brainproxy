@@ -3,6 +3,9 @@
 mod crlf_injection;
 mod differential;
 pub(crate) mod env_file;
+mod graphql;
+#[cfg(test)]
+mod graphql_e2e;
 mod host_header;
 #[cfg(test)]
 mod host_header_e2e;
@@ -19,6 +22,7 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
     let mut rules: Vec<Box<dyn ActiveRule>> = vec![
         Box::new(crlf_injection::CrlfInjection),
         Box::new(env_file::EnvFile),
+        Box::new(graphql::GraphqlMisconfiguration),
         Box::new(host_header::HostHeaderInjection),
         Box::new(jwt::JwtWeaknesses),
     ];
@@ -56,7 +60,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(rules.len(), 58, "expected all active rules");
+        assert_eq!(rules.len(), 59, "expected all active rules");
         // No active rule id collides with a passive rule id.
         let passive: HashSet<u32> = crate::scan::passive::all_rules().iter().map(|r| r.id()).collect();
         for id in &ids {
