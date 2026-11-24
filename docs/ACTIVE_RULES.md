@@ -88,6 +88,35 @@ These use IDs from 100000, so they never clash with ZAP's.
   was judged against (the real token's and the one without a token). `findings verify`
   sends all three again and says whether the forged token still gets the real one's answer
   and the request without a token doesn't; a weak secret, found offline, isn't verified.
+- **100010 Host Header Injection**, once per page (method and path, whatever the query; images,
+  fonts, audio and video are left out). A made-up host, `bp` and 16 random hex digits under
+  `.invalid` (a name that never resolves), is put where an application may read its own host
+  from, one request each: `X-Forwarded-Host`, `X-Host`, `X-Forwarded-Server`,
+  `X-Original-Host`, `Forwarded: host=`, an absolute-URI request line
+  (`GET http://bp….invalid/path`) with the real Host kept, and a second `Host` after the real
+  one. The connection always goes to the scanned host, through the scope guard. Over HTTP/2
+  and HTTP/3 the last two are left out, as `:authority` can't say them. Every request carries a
+  random cache-buster query parameter (`bp1a2b3c4d=…`), so a cache in front can only keep a
+  poisoned answer under a URL nobody else asks for.
+  - 100010-1 *Host Header Injection* (medium): the response uses the made-up host as a URL's
+    host in a `Location`, `Content-Location`, `Refresh` or `Link` header, or in a page's link,
+    form action, `<base>`, script or stylesheet URL or meta refresh (or, outside HTML, an
+    absolute URL anywhere in the body, slashes escaped or not), and the baseline doesn't.
+    A page that only echoes the header's text isn't building links from it and raises nothing.
+  - With `oob start --domain` running, the made-up host is an OOB host instead (one per
+    request), and a callback raises 100010-2 *Routing-Based SSRF via Host Header* (high), or on
+    a form that may send email 100010-3 *Password Reset Poisoning* (high: a mail scanner or the
+    user opening the emailed link is the only sign of it a scan can see). In host mode a
+    payload's token is in its path, not its host, so the `.invalid` host is used.
+  - A form that may send email (a path naming `reset`, `forgot`, `recover` or a lost password,
+    or a parameter whose name has `mail`, `reset` or `forgot` in it) gets only
+    `X-Forwarded-Host` below strength HIGH, as each request may email a real user; the
+    finding's other info says so. At HIGH and INSANE it gets all of them.
+
+  Requests per page: 7 (5 over HTTP/2 or HTTP/3), with or without OOB; 1 on a form that may
+  send email below HIGH. The made-up host isn't in the scope, so through MCP the rule runs only
+  with `scan active --host-header-test`; without it the scan leaves the rule out and lists it in
+  the summary's `skipped`. From a terminal or the app it runs whenever it is selected.
 
 ## Rules
 
@@ -150,6 +179,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 100003 | HQL Injection | param | high | 100003 |
 | 100006 | Response Differs over HTTP/3 | page | medium | 100006-1, 100006-2 |
 | 100007 | JWT Weaknesses | page | high | 100007-1, 100007-2, 100007-3, 100007-4, 100007-5, 100007-6, 100007-7, 100007-8 |
+| 100010 | Host Header Injection | page | high | 100010-1, 100010-2, 100010-3 |
 
 Scopes: `param` runs once per insertion point (query, form, JSON, XML, multipart; cookies,
 headers and URL path segments when enabled; the names of parameters, JSON keys, cookies and

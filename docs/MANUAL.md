@@ -194,7 +194,10 @@ keeps its row, with the refusal as its error, and a scan never picks such a row 
 same way, request by request, and their summaries list the host in `out_of_scope_hosts`.
 `scan active` checks its base requests (URLs, API items, recorded rows, a session's) the same
 way and lists the hosts of those it doesn't attack in `refused_hosts`; a rule's own Host is its
-test (below). A fuzz payload with a raw line break that goes into the head unencoded (a
+test (below), except rule 100010 (Host header injection), whose whole test is a made-up host in
+forwarding headers and the request line: through MCP it runs only with `--host-header-test`, and
+without it the scan leaves it out and lists it in `skipped` (`[{"rule": 100010, "reason": …}]`,
+omitted when nothing was skipped) while the other rules run. A fuzz payload with a raw line break that goes into the head unencoded (a
 CRLF-injection test) needs `--host-header-test` through MCP, as it can start a Host header.
 
 Settings that put a Host on requests still to come are checked when they are saved too: an auth
@@ -222,7 +225,8 @@ nothing runs into the `:authority`.
 
 Not checked: what active scan rules and check templates put in the Host header themselves
 (Cloud Metadata names the metadata service, for one; `scan active --inject-header Host` puts
-payloads there), which are Host-header tests by nature and connect to the scanned in-scope host;
+payloads there), which are Host-header tests by nature and connect to the scanned in-scope host
+(rule 100010 still runs through MCP only with `--host-header-test`, above);
 requests sent again as they were recorded (`findings retest`, `findings verify`); and a proxied client's own
 requests.
 
@@ -809,6 +813,11 @@ attack type, and pick payloads:
     *Include Nuclei templates* (on when installed, high severity and above by default). With a
     policy, *Strength* is the policy's unless you pick one, and a strength, *Only rules* or
     *Skip rules* given here win over the policy's (see [Scan policies](#scan-policies)).
+  - **Host-header test** (Active scan and Targeted): passes `--host-header-test`, saying the
+    scan's foreign Host values are a deliberate test. The app runs rule 100010 (Host header
+    injection) whenever it is selected either way; the flag puts the intent on record, and the
+    same command run through MCP needs it for 100010 to run and for base requests whose Host
+    names a host the scope doesn't list to be attacked.
   - **Keep only attack requests that back a finding:** off by default, so every attack request
     stays in history. On, a scan deletes when it ends (finished, stopped with *Stop*, or out
     of time) the attack requests it sent that nothing refers to. It is saved for the project and shared with
@@ -909,7 +918,10 @@ project (`findings list --source active` lists those). `errors` counts rule unit
 crashed; `failed_requests` counts attack requests that went out and got no response (timed
 out, refused or reset), with a `failed_requests_hint` when there are any. A target that stops
 answering finds nothing, so a scan with many failed requests is no clean bill of health: check
-the target and scan again, slower if it was overloaded.
+the target and scan again, slower if it was overloaded. `skipped` lists the rules selected that
+didn't run, each with its `rule` id and a `reason` (rule 100010 through MCP without
+`--host-header-test`; see *Engagement scope* under [Concepts](#concepts)); it is left out when
+none was.
 
 ### Access
 Access control across users: does the app let bob read alice's data? See

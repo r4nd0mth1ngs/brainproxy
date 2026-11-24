@@ -316,7 +316,10 @@ Some arguments need a person, so a command run for a tool call (the server sets
   servers may read differently: Content-Length twice with different values, or with
   Transfer-Encoding), is refused (`out_of_scope`) as it goes on the wire, after a session or signer changed it;
   `send` (races and sequences too), `fuzz_run` (also for payloads with raw line breaks into the head),
-  `ws_send`, `scan_active` (for its base requests: a rule's own Host is its test),
+  `ws_send`, `scan_active` (for its base requests: a rule's own Host is its test, except rule
+  100010, Host header injection, which runs only with `host_header_test`; without it the scan
+  leaves 100010 out and lists it in `skipped`, `[{"rule": 100010, "reason": …}]`, while the other
+  rules run),
   `auth_login`, `auth_status`, `auth_macro_run` and `intercept_forward` (for hosts an edit
   brings in) send it when `host_header_test` is set, so request smuggling tests (CL.TE, TE.CL, a
   request after the body) need it too. A match-and-replace rule an agent added (raw or structured: a
