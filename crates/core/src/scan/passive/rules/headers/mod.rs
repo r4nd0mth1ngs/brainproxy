@@ -4,6 +4,7 @@ mod alt_svc_h3;
 pub(crate) mod anti_clickjacking;
 mod big_redirects;
 mod cache_control;
+mod cacheability;
 pub(crate) mod common;
 mod content_security_policy;
 mod content_type_missing;
@@ -11,9 +12,11 @@ mod cross_domain_misconfiguration;
 mod csp_missing;
 mod heartbleed;
 mod insecure_authentication;
+mod permissions_policy;
 pub(crate) mod php2shell;
 mod retrieved_from_cache;
 mod server_header;
+mod site_isolation;
 mod strict_transport_security;
 mod x_aspnet_version;
 mod x_backend_server;
@@ -46,6 +49,9 @@ pub fn all() -> Vec<Box<dyn PassiveRule>> {
         Box::new(heartbleed::HeartBleed),
         Box::new(php2shell::Php2Shell),
         Box::new(insecure_authentication::InsecureAuthentication),
+        Box::new(permissions_policy::PermissionsPolicy),
+        Box::new(site_isolation::SiteIsolation),
+        Box::new(cacheability::Cacheability),
     ]
 }
 
@@ -57,7 +63,7 @@ mod tests {
     fn rule_ids_and_alert_refs_are_unique() {
         let rules = super::all();
         let ids: HashSet<u32> = rules.iter().map(|r| r.id()).collect();
-        assert_eq!(ids.len(), 20);
+        assert_eq!(ids.len(), 23);
         let mut seen = HashSet::new();
         for r in &rules {
             for a in r.alerts() {

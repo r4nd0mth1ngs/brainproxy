@@ -22,6 +22,10 @@
     {
       "upstream": "addOns/retire/src/main/resources/org/zaproxy/addon/retire/resources/jsrepository.json",
       "ours": "crates/core/src/scan/passive/data/jsrepository.json"
+    },
+    {
+      "upstream": "addOns/pscanrulesBeta/src/main/zapHomeFiles/txt/js-function-list.txt",
+      "ours": "crates/core/src/scan/passive/data/js-function-list.txt"
     }
   ],
   "skipped": {

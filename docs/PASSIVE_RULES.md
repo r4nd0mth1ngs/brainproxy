@@ -1,8 +1,9 @@
 # Passive rules
 
-brainproxy's passive scanner runs 52 rules ported from OWASP ZAP's `pscanrules` add-on and
-one (10003) from its `retire` add-on (https://github.com/zaproxy/zap-extensions, Apache
-License 2.0). Each rule file names the ZAP class it came from, and alert names, descriptions,
+brainproxy's passive scanner runs 52 rules ported from OWASP ZAP's `pscanrules` add-on, one
+(10003) from its `retire` add-on, five from `pscanrulesBeta` (10026, 10049, 10063, 10110,
+90004), one from `pscanrulesAlpha` (10094) and one from `soap` (90030)
+(https://github.com/zaproxy/zap-extensions, Apache License 2.0). Each rule file names the ZAP class it came from, and alert names, descriptions,
 solutions, and references are ZAP's.
 
 Rules run automatically on proxy traffic and `send` results (sources are configurable with
@@ -69,6 +70,7 @@ JSONP Endpoint** reports a response that calls the function a `callback`, `cb`, 
 | 10023 | Information Disclosure - Debug Error Messages | low | 10023 |
 | 10024 | Information Disclosure - Sensitive Information in URL | info | 10024 |
 | 10025 | Information Disclosure - Sensitive Information in HTTP Referrer Header | info | 10025 |
+| 10026 | HTTP Parameter Override | medium | 10026 |
 | 10027 | Information Disclosure - Suspicious Comments | info | 10027 |
 | 10028 | Off-site Redirect | medium | 10028 |
 | 10029 | Cookie Poisoning | info | 10029 |
@@ -87,6 +89,7 @@ JSONP Endpoint** reports a response that calls the function a `callback`, `cb`, 
 | 10042 | HTTPS to HTTP Insecure Transition in Form Post | medium | 10042 |
 | 10043 | User Controllable JavaScript Event (XSS) | info | 10043 |
 | 10044 | Big Redirect Detected (Potential Sensitive Information Leak) | low | 10044-1, 10044-2 |
+| 10049 | Content Cacheability | info | 10049-1, 10049-2, 10049-3 |
 | 10050 | Retrieved from Cache | info | 10050-1, 10050-2 |
 | 10052 | X-ChromeLogger-Data (XCOLD) Header Information Leak | medium | 10052 |
 | 10054 | Cookie without SameSite Attribute | low | 10054-1, 10054-2, 10054-3 |
@@ -94,19 +97,24 @@ JSONP Endpoint** reports a response that calls the function a `callback`, `cb`, 
 | 10056 | X-Debug-Token Information Leak | low | 10056 |
 | 10061 | X-AspNet-Version Response Header | low | 10061 |
 | 10062 | PII Disclosure | high | 10062 |
+| 10063 | Permissions Policy Header Not Set | low | 10063-1, 10063-2 |
+| 10094 | Base64 Disclosure | info | 10094-3 |
 | 10096 | Timestamp Disclosure | low | 10096 |
 | 10097 | Hash Disclosure | high | 10097-1, 10097-2, 10097-3, 10097-4, 10097-5, 10097-6, 10097-7, 10097-8 |
 | 10098 | Cross-Domain Misconfiguration | medium | 10098 |
 | 10105 | Weak Authentication Method | medium | 10105-1, 10105-2 |
 | 10108 | Reverse Tabnabbing | medium | 10108 |
 | 10109 | Modern Web Application | info | 10109 |
+| 10110 | Dangerous JS Functions | low | 10110 |
 | 10115 | Script Served From Malicious Domain (polyfill) | high | 10115-1, 10115-2 |
 | 10202 | Absence of Anti-CSRF Tokens (proof of concept: [`poc csrf`](MANUAL.md#proof-of-concept-pages-poc)) | medium | 10202 |
 | 90001 | Insecure JSF ViewState | medium | 90001 |
 | 90002 | Java Serialization Object | medium | 90002 |
 | 90003 | Sub Resource Integrity Attribute Missing | medium | 90003 |
+| 90004 | Insufficient Site Isolation Against Spectre Vulnerability | low | 90004-1, 90004-2, 90004-3 |
 | 90011 | Charset Mismatch | info | 90011-1, 90011-2, 90011-4 |
 | 90022 | Application Error Disclosure | medium | 90022 |
+| 90030 | WSDL File Detection | info | 90030 |
 | 90033 | Loosely Scoped Cookie | info | 90033 |
 | 100001 | PHP2Shell PHP Remote Code Execution (Indicative) | high | 100001 |
 | 100005 | HTTP/3 Offered (Alt-Svc) | info | 100005 |
@@ -149,6 +157,16 @@ Behaviour follows ZAP's default (MEDIUM) alert threshold. The main differences:
   declaration instead of Jericho's XML detection.
 - **Viewstate (10032)** lists analyzer matches sorted; malformed split viewstates raise
   nothing instead of aborting the scan.
+- **HTTP Parameter Override (10026)** is raised by ZAP only at LOW threshold, for contexts
+  whose technology includes JSP/Servlet (every context by default). Here it is raised when
+  the exchange shows a Java servlet container: a `JSESSIONID` cookie, a `.jsp`, `.jspx`,
+  `.do` or `.action` path, or `Servlet` or `JSP` in `X-Powered-By`.
+- **Base64 Disclosure (10094)** passes over Base64 data with an ASP.NET ViewState preamble,
+  which Viewstate (10032) reports; ZAP decodes it here as well (10094-1, 10094-2).
+- **Dangerous JS Functions (10110)** reads ZAP's `js-function-list.txt`, refreshed with the
+  other ZAP rule data (`scan data update`); ZAP's custom payloads aren't supported.
+- **Content Cacheability (10049)** reports one informational finding per response, as ZAP
+  does; turn it off (`scan disable 10049`) where that is too much.
 - **Findings are de-duplicated:** the same alert, method, URL (without its query) and
   parameter is one finding with a `hits` count; the first evidence is kept. ZAP lists each
   differing evidence separately (for example two `Server` headers in one response).

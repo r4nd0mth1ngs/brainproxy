@@ -63,9 +63,9 @@ brainproxy scan data reset                   # back to the embedded copies
 
 - The files are the ones in `zap-sync.json`: `application_errors.xml` (90022),
   `debug-error-messages.txt` (10023), `URL-information-disclosure-messages.txt`
-  (10024, 10025), `hidden_files.json` (40035), and `jsrepository.json` (10003, the
-  Retire.js database of vulnerable JavaScript library versions, which ZAP refreshes from
-  Retire.js regularly).
+  (10024, 10025), `hidden_files.json` (40035), `js-function-list.txt` (10110), and
+  `jsrepository.json` (10003, the Retire.js database of vulnerable JavaScript library
+  versions, which ZAP refreshes from Retire.js regularly).
 - The ref is resolved to a commit (GitHub API) and every file is fetched at that commit
   from raw.githubusercontent.com. A full 40-character commit id is used as it is, with no
   API request; this matters when GitHub's limit for unauthenticated API requests (60 an

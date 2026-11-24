@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::fetch::{sha256_hex, GitHub};
 use crate::scan::active::rules::probes::hidden_files;
-use crate::scan::passive::rules::content::{application_error, debug_errors, vulnerable_js};
+use crate::scan::passive::rules::content::{application_error, debug_errors, js_function, vulnerable_js};
 use crate::scan::passive::rules::params::common as params_common;
 
 pub const ZAP_REPO: &str = "zaproxy/zap-extensions";
@@ -35,7 +35,7 @@ pub struct DataFile {
     pub rules: &'static [u32],
 }
 
-pub static FILES: [DataFile; 5] = [
+pub static FILES: [DataFile; 6] = [
     DataFile {
         name: "application_errors.xml",
         upstream: "addOns/pscanrules/src/main/zapHomeFiles/xml/application_errors.xml",
@@ -70,6 +70,13 @@ pub static FILES: [DataFile; 5] = [
         embedded: vulnerable_js::EMBEDDED,
         validate: vulnerable_js::validate,
         rules: &[10003],
+    },
+    DataFile {
+        name: "js-function-list.txt",
+        upstream: "addOns/pscanrulesBeta/src/main/zapHomeFiles/txt/js-function-list.txt",
+        embedded: js_function::EMBEDDED,
+        validate: js_function::validate,
+        rules: &[10110],
     },
 ];
 

@@ -1,6 +1,7 @@
 //! Response body content rules, ported from ZAP's pscanrules add-on (Apache License 2.0).
 
 pub(crate) mod application_error;
+mod base64_disclosure;
 mod charset_mismatch;
 pub(crate) mod common;
 mod cross_domain_script;
@@ -9,6 +10,7 @@ mod directory_browsing;
 mod exposure;
 mod hash_disclosure;
 mod in_page_banner;
+pub(crate) mod js_function;
 mod jsf_viewstate;
 mod jso;
 mod jwt;
@@ -24,6 +26,7 @@ mod suspicious_comments;
 mod timestamp;
 mod viewstate;
 pub(crate) mod vulnerable_js;
+mod wsdl_file;
 
 use crate::scan::PassiveRule;
 
@@ -55,5 +58,8 @@ pub fn all() -> Vec<Box<dyn PassiveRule>> {
         Box::new(exposure::PrometheusMetrics),
         Box::new(exposure::SourceMap),
         Box::new(exposure::JsonpEndpoint),
+        Box::new(base64_disclosure::Base64Disclosure),
+        Box::new(js_function::JsFunction),
+        Box::new(wsdl_file::WsdlFile),
     ]
 }

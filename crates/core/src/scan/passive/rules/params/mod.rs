@@ -15,6 +15,7 @@ mod insecure_form_post;
 mod javascript_event;
 mod mixed_content;
 mod open_redirect;
+mod parameter_override;
 mod session_id_url;
 mod user_controlled_charset;
 
@@ -37,5 +38,6 @@ pub fn all() -> Vec<Box<dyn PassiveRule>> {
         Box::new(cookie_same_site::CookieSameSite),
         Box::new(csrf_countermeasures::CsrfCountermeasures),
         Box::new(cookie_loosely_scoped::CookieLooselyScoped),
+        Box::new(parameter_override::ParameterOverride),
     ]
 }
