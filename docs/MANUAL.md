@@ -979,9 +979,21 @@ crashed; `failed_requests` counts attack requests that went out and got no respo
 out, refused or reset), with a `failed_requests_hint` when there are any. A target that stops
 answering finds nothing, so a scan with many failed requests is no clean bill of health: check
 the target and scan again, slower if it was overloaded. `skipped` lists the rules selected that
-didn't run, each with its `rule` id and a `reason` (rule 100010 through MCP without
-`--host-header-test`; see *Engagement scope* under [Concepts](#concepts)); it is left out when
-none was.
+didn't run, each with its `rule` id and a `reason`: rule 100010 through MCP without
+`--host-header-test` (see *Engagement scope* under [Concepts](#concepts)), and the rules that
+send the login themselves (40013 session fixation, 40023 username enumeration) without
+`--auth`, or with a profile whose login isn't one request with a username ("it needs --auth
+with a login…"). It is left out when none was.
+
+**Opt-in rules.** `scan rules --active` gives each rule `opt_in`: true for the rules that are
+off unless asked for, because what they send can do harm (40041 file upload leaves files on
+the server; 40023 username enumeration sends failed logins, which can lock the account). A
+scan that names no rules leaves them out, and so does a policy that doesn't turn them on by
+name. Turn one on by naming it, `scan active --rules 40041` (or `--rules 40041,40012` with
+others), or in a policy, `scan policy save NAME --enable 40041`; an agent turns one on the same
+way. An opt-in rule left out isn't listed in `skipped`, which is for rules asked for that
+couldn't run. In the app, *Scans › Policies* asks before ticking one and *New scan* says which
+it leaves out; see [ACTIVE_RULES.md](ACTIVE_RULES.md#opt-in-rules).
 
 ### Access
 Access control across users: does the app let bob read alice's data? See
@@ -3110,7 +3122,9 @@ brainproxy scan active https://app.acme.test/ --crawl --policy api
   isn't registered. ZAP's OFF threshold is a rule turned off (`--disable`).
 - **On and off:** with `--others on` (the default) every rule runs except those the policy turns
   off; with `--others off` only the rules it turns on run, so a rule added in a later version
-  stays off. Rules the turned-on ones depend on (the persistent XSS rule's Prime and Spider)
+  stays off. An opt-in rule (`scan rules --active`, `opt_in`) runs only when the policy turns it
+  on by name (`--enable 40041`, or `"enabled": true` for it in `--json`), whatever `--others`
+  says; `rules_disabled` and `policy show` count it as off until then. Rules the turned-on ones depend on (the persistent XSS rule's Prime and Spider)
   run with them unless the policy turns them off.
 - `save` builds on `--from POLICY` or `--json` (inline, or `-` for stdin), then applies the
   flags: `--strength`, `--threshold`, `--others`, `--inject-names on|off|auto` (whether its
@@ -3831,7 +3845,7 @@ where the tool reads stdin, anything else comes in the call's `stdin`.
 
 ## Rules, checks, and wordlists
 
-- **ZAP rules.** The passive (53) and active (53) scan rules are ported from OWASP ZAP,
+- **ZAP rules.** The passive (53) and active (57) scan rules are ported from OWASP ZAP,
   whose code is Apache-2.0. Their pattern files (error messages, hidden files, and similar)
   are built in, and *Rules and checks › ZAP rule data* fetches the latest ones.
 - **Outdated software.** *Vulnerable JS Library* (10003, from ZAP's retire add-on) checks

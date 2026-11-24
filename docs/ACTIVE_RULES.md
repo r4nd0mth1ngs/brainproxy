@@ -1,7 +1,8 @@
 # Active rules
 
-`brainproxy scan active` runs 53 rules ported from OWASP ZAP's `ascanrules`, `ascanrulesBeta` and `ascanrulesAlpha` add-ons (and
-helpers from `commonlib`), https://github.com/zaproxy/zap-extensions, Apache License 2.0.
+`brainproxy scan active` has 63 rules: 57 ported from OWASP ZAP's `ascanrules`, `ascanrulesBeta`, `ascanrulesAlpha` and
+`soap` add-ons (and helpers from `commonlib`), https://github.com/zaproxy/zap-extensions, Apache License 2.0, and
+brainproxy's own (below).
 Each rule file names the ZAP class it came from; alert names, descriptions, solutions,
 and references are ZAP's.
 
@@ -146,6 +147,26 @@ These use IDs from 100000, so they never clash with ZAP's.
   application/json`; the GET carries a random cache-buster parameter. Requests per endpoint: 7, or
   6 when there is no root field to misspell, at every strength.
 
+## Opt-in rules
+
+Two rules are off unless asked for, because what they send can do harm: **40041 File Upload**
+leaves files on the server, and **40023 Possible Username Enumeration** sends failed logins for
+the `--auth` user, which can lock the account. `scan rules --active` marks them `"opt_in": true`.
+A scan that names no rules leaves them out, and so does a policy that doesn't turn them on by
+name (`scan policy save NAME --enable 40041`, or `"enabled": true` for the rule in its JSON):
+"on unless turned off" doesn't cover them. Naming one with `--rules 40041` turns it on, by a
+person or an agent alike; there is no other switch. An opt-in rule left out isn't listed in
+the summary's `skipped`, which lists only rules that were asked for and couldn't run.
+
+## Rules that log in
+
+**40013 Session Fixation** and **40023 Possible Username Enumeration** send the `--auth`
+profile's login request themselves, so they need a profile with a login URL and a username
+whose login is one request (not a browser, OAuth or one-time-code login). Without `--auth`, or
+with another kind of profile, the scan leaves them out and lists them in `skipped` with the
+reason. Both run once per login, from a target on the login URL's origin, and send their
+requests without the scan's session.
+
 ## Rules
 
 | ID | Rule | Scope | Max risk | Alert refs |
@@ -169,6 +190,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 40008 | Parameter Tampering | param | medium | 40008 |
 | 40009 | Server Side Include | param | high | 40009 |
 | 40012 | Cross Site Scripting (Reflected) | param | high | 40012 |
+| 40013 | Session Fixation (needs `--auth` with a login) | host | high | 40013-4 |
 | 40014 | Cross Site Scripting (Persistent) | param | high | 40014-1, 40014-2, 40014-3 |
 | 40015 | LDAP Injection | param | high | 40015-1, 40015-2 |
 | 40016 | Cross Site Scripting (Persistent) - Prime | param | (none) | |
@@ -178,6 +200,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 40020 | SQL Injection - Hypersonic SQL (Time Based) | param | high | 40020 |
 | 40021 | SQL Injection - Oracle (Time Based) | param | high | 40021 |
 | 40022 | SQL Injection - PostgreSQL (Time Based) | param | high | 40022 |
+| 40023 | Possible Username Enumeration (opt-in; needs `--auth` with a login) | host | info | 40023 |
 | 40027 | SQL Injection - MsSQL (Time Based) | param | high | 40027 |
 | 40028 | ELMAH Information Leak | host | medium | 40028-1 |
 | 40029 | Trace.axd Information Leak | page | medium | 40029-1 |
@@ -186,6 +209,7 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 40034 | .env Information Leak | page | medium | 40034-1 |
 | 40035 | Hidden File Finder | host | medium | 40035 |
 | 40040 | CORS Header / CORS Misconfiguration | page | high | 40040-1, 40040-2, 40040-3 |
+| 40041 | File Upload (opt-in) | page | high | 40041-1, 40041-2 |
 | 40042 | Spring Actuator Information Leak | host | medium | 40042 |
 | 40043 | Log4Shell (needs `oob start`) | param | high | 40043-1, 40043-2 |
 | 40044 | Exponential Entity Expansion (Billion Laughs Attack) | page | medium | 40044 |
@@ -198,6 +222,8 @@ These use IDs from 100000, so they never clash with ZAP's.
 | 90021 | XPath Injection | param | high | 90021 |
 | 90023 | XML External Entity Attack | page | high | 90023 |
 | 90024 | Generic Padding Oracle | param | high | 90024 |
+| 90026 | SOAP Action Spoofing (recorded SOAP 1.1 requests; no WSDL, so no spoofing to other operations) | page | info | 90026 |
+| 90027 | Cookie Slack Detector | page | low | 90027 |
 | 90034 | Cloud Metadata Potentially Exposed | host | high | 90034 |
 | 90035 | Server Side Template Injection | param | high | 90035 |
 | 90036 | Server Side Template Injection (Blind) | param | high | 90036 |
@@ -436,6 +462,36 @@ those skips 40014. Prime and Spider never raise alerts themselves.
 - **XSLT Injection (90017)** applies ZAP's per-strength request limit per insertion point
   (ZAP counts it across all parameters of a page).
 - **Per-file references** for Hidden Files (40035) are added to the finding's other-info.
+- **Session Fixation (40013)** tests the login itself rather than every page: it fetches
+  the login page without a session, keeps the cookies it hands out, logs in once with them,
+  and reports the ones the login didn't renew. With a check URL and a `--logged-in` or
+  `--logged-out` pattern on the profile it fetches the check URL with those cookies alone:
+  logged in there is high risk, high confidence; without a way to tell, medium risk, low
+  confidence. ZAP's other alerts of this rule (session ids in URLs, cookie flags and expiry)
+  are left to the passive cookie rules. Its login runs outside the scan's session; an
+  application that allows one session per user may end the scan's, which then logs in again.
+- **Username Enumeration (40023)** builds the login from the profile and varies only the
+  username, with one wrong password: 2, 3, 5 or 10 attempts per username at low, medium, high
+  and insane (ZAP: 3, 5, 15, 50), as each is a failed login. It compares the lines every
+  response of a set has instead of ZAP's longest common subsequence, doesn't follow redirects,
+  and masks the username each request sent in its own response.
+- **Cookie Slack Detector (90027)** sends one fresh baseline and one request per cookie (the
+  base request's and the `--auth` session's), each without that cookie; ZAP sends each twice,
+  the second to restore the session, which the scan's session never loses here. A dropped
+  session cookie stays out: the session neither puts it back nor learns from the answer.
+- **File Upload (40041)** isn't a zap-extensions rule: 40041 is the id of the separate
+  file-upload add-on, whose attack list informed it. On a recorded multipart request with a
+  file part it uploads harmless marker files (HTML and SVG with no script, plain text, and at
+  high strength a `.jpg.html` name): one at low strength, three at medium, four at high and
+  insane, each followed by up to seven fetches where it might be served. 40041-1 (high) is an
+  HTML or SVG file served back inline as `text/html` or `image/svg+xml`; 40041-2 (info) lists
+  every file left on the server, and where each is served, whenever an upload was accepted.
+  Each upload endpoint is tested once.
+- **SOAP Action Spoofing (90026)** can't spoof to another operation: ZAP takes those from an
+  imported WSDL, and brainproxy keeps none. It sends the recorded envelope with an empty and a
+  random `SOAPAction` and reports only when the server answers as it did the original (ZAP's
+  "SOAPAction ignored"); a fault, an empty or an unreadable answer means the action was
+  checked and isn't reported (ZAP: low). SOAP 1.2's action in the Content-Type isn't tested.
 - **Low-threshold-only alerts** (e.g. the 401/403 "may be protected" informational
   alerts of the file probes, the JSON XSS weakness alert) are not raised.
 - Smaller per-rule differences are documented in comments in each rule file.

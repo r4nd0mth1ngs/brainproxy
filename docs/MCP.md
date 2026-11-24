@@ -294,7 +294,10 @@ Some arguments need a person, so a command run for a tool call (the server sets
   its company, logo and sections, may be a person's. An agent saves a new name; a person
   replaces or removes one in the app or a terminal.
 - `scan_policy_save` under a name that is already saved (`conflict`), for the same reason: an
-  agent saves a new policy and runs `scan_active` with `policy`.
+  agent saves a new policy and runs `scan_active` with `policy`. Opt-in rules (40041 file
+  upload, 40023 username enumeration: `scan_rules` with `active` marks them `opt_in`) aren't
+  refused: an agent turns one on as a person does, by naming it in `scan_active`'s `rules` or
+  in a policy it saves with `enable`. Without that, a scan leaves them out.
 - `report`, `findings_repro`, `history_export`, `poc_csrf`, `poc_clickjacking` and `ca_export` with `force`: `output` (`out`)
   would overwrite any file the server can write. An agent writes to a new file, or leaves out
   `output` (`out`) to get the report, pack, HAR, page or certificate in the reply.
