@@ -90,6 +90,10 @@ pub enum WsCmd {
         /// Only connections with an id greater than this (for incremental polling).
         #[arg(long)]
         after: Option<i64>,
+        /// Only connections with an id less than this. With --newest, the --limit connections just
+        /// before it: page back through older ones by passing the lowest id each page returned.
+        #[arg(long, value_name = "ID")]
+        before: Option<i64>,
         #[arg(long, default_value_t = 100)]
         limit: u32,
         /// The newest --limit connections (still listed oldest first) instead of the oldest.
@@ -233,15 +237,22 @@ pub struct SendArgs {
 
 pub fn ws(project: &Path, cmd: WsCmd, out: &Out) -> Result<(), Error> {
     match cmd {
-        WsCmd::List { host, source, state, after, limit, newest } => {
+        WsCmd::List { host, source, state, after, before, limit, newest } => {
             let store = Store::open(project)?;
             close_abandoned(&store, project)?;
             let state = state.map(|s| match s {
                 ConnState::Open => "open".to_string(),
                 ConnState::Closed => "closed".to_string(),
             });
-            let items =
-                store.ws_connections(&ConnectionFilter { host, source, state, after_id: after, limit, newest })?;
+            let items = store.ws_connections(&ConnectionFilter {
+                host,
+                source,
+                state,
+                after_id: after,
+                before_id: before,
+                limit,
+                newest,
+            })?;
             let data = json!({"count": items.len(), "items": items});
             out.ok(data, || {
                 items

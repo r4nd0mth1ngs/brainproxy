@@ -596,6 +596,38 @@ fn ws_send_reads_messages_from_stdin() {
 }
 
 #[test]
+fn ws_list_pages_back_with_before() {
+    let env = Env::new("before");
+    let port = spawn_ws_echo();
+    for i in 0..5 {
+        let url = format!("ws://127.0.0.1:{port}/c{i}");
+        env.ok_with_stdin(
+            &["ws", "send", "--url", &url, "--input-json", "--until", "echo"],
+            br#"{"messages": ["hi"]}"#,
+        );
+    }
+    let ids = |args: &[&str]| -> Vec<i64> {
+        let v = env.ok(&[&["ws", "list"][..], args].concat());
+        v["items"].as_array().unwrap().iter().map(|c| c["id"].as_i64().unwrap()).collect()
+    };
+    let all = ids(&["--limit=10"]);
+    assert_eq!(all.len(), 5, "{all:?}");
+    // The newest page, then the pages before it, each still listed oldest first.
+    let newest = ids(&["--newest", "--limit=2"]);
+    assert_eq!(newest, all[3..]);
+    let older = ids(&["--newest", "--limit=2", &format!("--before={}", newest[0])]);
+    assert_eq!(older, all[1..3]);
+    let oldest = ids(&["--newest", "--limit=2", &format!("--before={}", older[0])]);
+    assert_eq!(oldest, all[..1]);
+    assert!(ids(&["--newest", &format!("--before={}", all[0])]).is_empty());
+    // With --after: the ids between the two.
+    assert_eq!(ids(&[&format!("--after={}", all[0]), &format!("--before={}", all[4])]), all[1..4]);
+    // sse list takes it too.
+    let v = env.ok(&["sse", "list", "--newest", "--before=1"]);
+    assert_eq!(v["count"], 0, "{v}");
+}
+
+#[test]
 fn ws_send_reads_binary_messages_from_stdin() {
     let env = Env::new("stdin-binary");
     let port = spawn_ws_echo();

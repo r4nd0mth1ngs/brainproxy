@@ -26,6 +26,10 @@ pub enum SseCmd {
         /// Only streams with an id greater than this (for incremental polling).
         #[arg(long)]
         after: Option<i64>,
+        /// Only streams with an id less than this. With --newest, the --limit streams just before
+        /// it: page back through older ones by passing the lowest id each page returned.
+        #[arg(long, value_name = "ID")]
+        before: Option<i64>,
         #[arg(long, default_value_t = 100)]
         limit: u32,
         /// The newest --limit streams (still listed oldest first) instead of the oldest.
@@ -82,12 +86,20 @@ pub enum StreamState {
 pub fn sse(project: &Path, cmd: SseCmd, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
     match cmd {
-        SseCmd::List { host, source, state, after, limit, newest } => {
+        SseCmd::List { host, source, state, after, before, limit, newest } => {
             let state = state.map(|s| match s {
                 StreamState::Open => "open".to_string(),
                 StreamState::Closed => "closed".to_string(),
             });
-            let items = store.sse_streams(&StreamFilter { host, source, state, after_id: after, limit, newest })?;
+            let items = store.sse_streams(&StreamFilter {
+                host,
+                source,
+                state,
+                after_id: after,
+                before_id: before,
+                limit,
+                newest,
+            })?;
             out.ok(json!({"count": items.len(), "items": items}), || {
                 items
                     .iter()

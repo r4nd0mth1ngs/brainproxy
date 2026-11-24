@@ -168,6 +168,8 @@ pub struct ConnectionFilter {
     pub source: Option<String>,
     pub state: Option<String>,
     pub after_id: Option<i64>,
+    /// Only ids below this one: with `newest`, the page before it (paging back).
+    pub before_id: Option<i64>,
     pub limit: u32,
     /// The newest `limit` connections (still listed oldest first) instead of the oldest.
     pub newest: bool,
@@ -355,11 +357,12 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT * FROM (SELECT {CONN_COLS} FROM ws_connections
                 WHERE (?1 IS NULL OR host = ?1) AND (?2 IS NULL OR source = ?2) AND (?3 IS NULL OR state = ?3)
-                    AND (?4 IS NULL OR id > ?4)
+                    AND (?4 IS NULL OR id > ?4) AND (?6 IS NULL OR id < ?6)
                 ORDER BY id {order} LIMIT ?5)
              ORDER BY id"
         ))?;
-        let rows = stmt.query_map(params![f.host, f.source, f.state, f.after_id, f.limit], row_to_connection)?;
+        let rows =
+            stmt.query_map(params![f.host, f.source, f.state, f.after_id, f.limit, f.before_id], row_to_connection)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 

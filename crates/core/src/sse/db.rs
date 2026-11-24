@@ -175,6 +175,8 @@ pub struct StreamFilter {
     pub source: Option<String>,
     pub state: Option<String>,
     pub after_id: Option<i64>,
+    /// Only ids below this one: with `newest`, the page before it (paging back).
+    pub before_id: Option<i64>,
     pub limit: u32,
     /// The newest `limit` streams (still listed oldest first) instead of the oldest.
     pub newest: bool,
@@ -392,11 +394,12 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT * FROM (SELECT {STREAM_COLS} FROM sse_streams
                 WHERE (?1 IS NULL OR host = ?1) AND (?2 IS NULL OR source = ?2) AND (?3 IS NULL OR state = ?3)
-                    AND (?4 IS NULL OR id > ?4)
+                    AND (?4 IS NULL OR id > ?4) AND (?6 IS NULL OR id < ?6)
                 ORDER BY id {order} LIMIT ?5)
              ORDER BY id"
         ))?;
-        let rows = stmt.query_map(params![f.host, f.source, f.state, f.after_id, f.limit], row_to_stream)?;
+        let rows =
+            stmt.query_map(params![f.host, f.source, f.state, f.after_id, f.limit, f.before_id], row_to_stream)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -561,6 +564,11 @@ mod tests {
         s.sse_record(&[open(5), open(6)], &mut ids).unwrap();
         let newest = s.sse_streams(&StreamFilter { limit: 1, newest: true, ..Default::default() }).unwrap();
         assert_eq!(newest[0].id, 3);
+        // Paging back: the newest below an id.
+        let ids_of = |f: StreamFilter| s.sse_streams(&f).unwrap().iter().map(|x| x.id).collect::<Vec<_>>();
+        assert_eq!(ids_of(StreamFilter { limit: 1, newest: true, before_id: Some(3), ..Default::default() }), [2]);
+        assert_eq!(ids_of(StreamFilter { limit: 5, before_id: Some(3), ..Default::default() }), [1, 2]);
+        assert!(ids_of(StreamFilter { limit: 5, before_id: Some(1), ..Default::default() }).is_empty());
         let open_ones = StreamFilter { state: Some("open".into()), limit: 10, ..Default::default() };
         assert_eq!(s.sse_streams(&open_ones).unwrap().len(), 2);
         assert_eq!(s.sse_close_stale("proxy", "proxy stopped").unwrap(), 2);
