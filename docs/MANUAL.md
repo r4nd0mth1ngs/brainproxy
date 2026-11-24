@@ -992,7 +992,8 @@ scan that names no rules leaves them out, and so does a policy that doesn't turn
 name. Turn one on by naming it, `scan active --rules 40041` (or `--rules 40041,40012` with
 others), or in a policy, `scan policy save NAME --enable 40041`; an agent turns one on the same
 way. An opt-in rule left out isn't listed in `skipped`, which is for rules asked for that
-couldn't run. In the app, *Scans › Policies* asks before ticking one and *New scan* says which
+couldn't run, and `findings compare --scan` doesn't count a scan that left one out as
+covering it. In the app, *Scans › Policies* asks before ticking one and *New scan* says which
 it leaves out; see [ACTIVE_RULES.md](ACTIVE_RULES.md#opt-in-rules).
 
 ### Access
