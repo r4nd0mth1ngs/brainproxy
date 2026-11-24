@@ -524,6 +524,13 @@ fn rules_for(
         let (Ok(url_regex), Ok(param_regex)) = (compile(url_regex), compile(param_regex)) else {
             continue;
         };
+        // Nor does a rating no build can give (a hand-edited row): it would fail the whole scan's
+        // write, not just this rule.
+        if risk.as_deref().is_some_and(|r| Risk::parse(r).is_none())
+            || confidence.as_deref().is_some_and(|c| Confidence::parse(c).is_none())
+        {
+            continue;
+        }
         rules.push(Rule { id, port, path_prefix, param, url_regex, param_regex, risk, confidence, reason, origin });
     }
     Ok(rules)
@@ -3634,6 +3641,17 @@ mod tests {
         let (again, _) = s.filter_add(&filter("10037", Some("info"), "again")).unwrap();
         assert_eq!(s.filter_remove(again, false).unwrap(), 0);
         assert_eq!(at(&s, "/w")["risk"], "info");
+        // A row no build could have added is passed over, and the scan still records its findings.
+        s.conn
+            .execute(
+                "INSERT INTO suppressions (action, alert_ref, host, reason, origin, risk, url_regex)
+                 VALUES ('rate', '10037', '', 'hand-edited', 'cli', 'severe', NULL),
+                        ('rate', '10037', '', 'hand-edited', 'cli', 'high', '(')",
+                [],
+            )
+            .unwrap();
+        seen_at(&mut s, "/v");
+        assert!(at(&s, "/v")["rated"].is_null());
     }
 
     #[test]
