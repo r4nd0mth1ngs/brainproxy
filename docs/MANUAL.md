@@ -424,17 +424,22 @@ The sidebar groups the tools by what you are doing.
     literal: it matches the bytes as stored, so `a@b.com` doesn't find `a%40b.com`, a
     JSON-escaped value has to be typed escaped, and HTTP/2 header names are lower-case. It is
     case-sensitive while **Aa** (match case, beside the list) is on, the default; turn it off
-    to match ASCII letters in any case (`history list --ignore-case`). Letters outside ASCII
-    (`é`, `É`) and other bytes still match only as stored, and binary bodies are searched as
-    bytes. Changing **Aa** searches again, as changing the text does. Text that is only spaces
-    is ignored. The other filters still apply, and changing one doesn't search again. New
-    traffic that matches shows up as it arrives. A search stops at the first 10,000 matches the
-    other filters show and says so; narrow it to see later ones.
+    to match in any case (`history list --ignore-case`): UTF-8 text is compared under Unicode
+    full case folding, so `é` matches `É` and `ß` matches `SS`, while bytes that aren't UTF-8
+    match only as stored and binary bodies are searched as bytes. **.\*** beside it makes the
+    text a regex (`history list --regex`, Rust syntax, matched against the same bytes; `(?m)`
+    makes `^` and `$` match at each line). With both on, case is the regex's own `(?i)`, which
+    folds one character to one: `ß` doesn't match `SS` there. Changing **Aa** or **.\***
+    searches again, as changing the text does; a regex that doesn't compile says why and isn't
+    run until you change it. Text that is only spaces is ignored. The other filters still
+    apply, and changing one doesn't search again. New traffic that matches shows up as it
+    arrives. The search runs to the newest row however many rows match; from 10,000 matches the
+    toolbar says how many are loaded.
   - **Query:** the text is a query in the filter language, run by the CLI (`history list
-    --filter`) like a contents search, with the same live updates and 10,000-match stop. For
+    --filter`) like a contents search, with the same live updates. For
     example `status:5xx resp.body:"stack trace"`, `host:api.acme.test method=POST NOT
     path:/health` or `resp.header.server~"(?i)nginx" OR req.header.authorization:*`:
-    - `FIELD:VALUE` contains the value, ASCII letters in any case; `=` equals (the same way), `!=` differs, `~`
+    - `FIELD:VALUE` contains the value in any case (Unicode full case folding, as `--ignore-case`); `=` equals, ASCII letters in any case, `!=` differs, `~`
       and `!~` match a Rust regex (case-sensitive unless it starts with `(?i)`), `<`, `<=`,
       `>`, `>=` compare numbers and times, and `FIELD:*` is present.
     - Fields: `id`, `method`, `scheme`, `host`, `port`, `path`, `query`, `url`, `status` (also
@@ -463,10 +468,11 @@ The sidebar groups the tools by what you are doing.
     - The same language picks what Intercept holds (its filter box, `intercept enable
       --filter`), with the fields known when a message is held.
   - **Saved filters:** *Save…* names the current filters (text and what it searches, sources
-    and the checkboxes, and **Aa** for a contents search); pick one from the list to apply it
+    and the checkboxes, and **Aa** and **.\*** for a contents search); pick one from the list to apply it
     again, or *Delete* it. A set with a contents filter that has **Aa** off is saved in a newer
-    format: 0.9.0 and older still list and apply it, case-sensitively, but can't save over it
-    until updated. They are kept in the project file (`history filters list` and `history
+    format (2), and one with **.\*** on in format 3: older builds still list and apply them
+    (literally and case-sensitively where they don't know the setting), but can't save over
+    them until updated. They are kept in the project file (`history filters list` and `history
     filters save`), so they travel with it and an agent can read them, or add one under a new name; an agent can't change or
     remove yours. Each records who saved it (`origin`: gui, cli or mcp; `history filters list`
     marks an agent's). A saved search for a token or password stays in the project until you delete
@@ -687,16 +693,20 @@ Edit a raw request and send it as often as you like, in separate tabs.
   (more than 500 tabs or 16 MB), the app says so and the tabs stay open; *Save as…* keeps
   the temporary engagement open, and switching project asks first. From the command
   line or an agent: `replay tabs list` and `replay tabs save`, so an agent can prepare tabs
-  for you to send (through MCP it can only add tabs, never replace or clear yours). Tabs
-  saved from elsewhere while the project is open in the app are added to the open ones when
-  the app next saves or its window comes back to the front; the app never saves over them.
+  for you to send (through MCP it can only add tabs, never replace or clear yours). Each tab
+  has an `id` that stays the same while it is kept, so the app tells an edit from a new tab.
+  While Replay is shown the app checks the saved set every 2 seconds (and when it saves, or
+  its window comes back to the front) and merges it with its open tabs by id: a tab added
+  elsewhere is added, one changed or closed elsewhere is changed or closed here unless you
+  changed it here since (then yours stays, and one closed elsewhere is kept and the app says
+  so), and a tab you closed stays closed.
   A request sent over from history keeps its live `Cookie` or `Authorization` values, and
   `replay tabs list` returns them in full, so anyone with a copy of the project file can
   read them: replace them with `«auth:…»` placeholders before you keep or share the
   project. A project whose tabs were saved by a newer brainproxy shows them but doesn't
-  save over them. Tabs holding a binary WebSocket message are saved in a newer format
-  (2), so brainproxy 0.9.0 and older show them but don't save over them; other tabs stay
-  in the format those read and save.
+  save over them. Tabs holding a binary WebSocket message are saved in format 2, and tabs
+  with ids (every save from this version on gives them) in format 3, so older builds show
+  them but don't save over them, and can't put back tabs closed elsewhere.
 
 ### Fuzzer
 Mark payload positions with `§value§` (*Add §*, *Auto §* for every parameter), choose an
@@ -1361,7 +1371,13 @@ byte, side by side or unified.
     the proxy runs (the proxy reads it in its own process).
 - **TLS / CA:** the certificate to trust in other tools, with per-OS instructions.
 - **Rules & Updates:** update the ZAP rule data and Nuclei templates; check for a new
-  brainproxy daily, download it automatically, or check now.
+  brainproxy daily, download it automatically, or check now. *Checks and feed tools* checks
+  that template files or a folder of them load (`checks validate`, with why each one that
+  doesn't), verifies a feed folder (`checks feed verify`), makes a signing key (`checks feed
+  keygen`, with a save dialog) and signs a folder with it (`checks feed sign`). A feed signed
+  with a key made there won't verify, on that build or a release build: the keys a build
+  trusts are compiled in (`TRUSTED_KEYS`), so signing is for the maintainers' key or for trying
+  the format out.
 - **Project:** project information, the engagement, and *Start the proxy when a project
   opens* (on the port set under *Proxy*). While it is on, a proxy the app started (when the
   project opened, or from the proxy pill, *Open browser*, *Start proxy* or *Record a login*)
@@ -1377,7 +1393,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 206 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 208 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -1428,12 +1444,13 @@ brainproxy fuzz resume 4                       # a stopped run sends what it had
 brainproxy wordlists list
 
 brainproxy ws list                                        # WebSocket connections seen by the proxy
+brainproxy ws list --newest --limit 5000 --before 8123     # the page before connection 8123 (page back)
 brainproxy ws messages 3 --contains token                 # their messages, both ways
 brainproxy ws send --from 3 -m '{"op":"whoami"}' --until whoami   # replay with a new connection
 echo '{"messages":["token=..."]}' | brainproxy ws send --from 3 --input-json   # messages off the command line
 echo '{"messages":[{"hex":"08 96 01"},{"base64":"AJ+Slg=="}]}' | brainproxy ws send --from 3 --input-json   # binary
 
-brainproxy sse list                                       # event streams (text/event-stream) seen by the proxy
+brainproxy sse list                                       # event streams (text/event-stream) seen by the proxy; --before ID too
 brainproxy sse events 2 --contains token                  # a stream's events; sse event 41 shows one
 brainproxy send --url https://app.acme.test/api/stream --stream-wait 10 --max-events 20   # read one, then stop
 
@@ -1449,9 +1466,11 @@ brainproxy findings add --title "Order IDOR" --risk high --history-id 42 --param
     --description-file idor.md                # an issue found by hand; nothing is sent
 brainproxy query "SELECT url, status FROM history WHERE status >= 500"
 brainproxy history list --contains apiKey --source proxy   # in requests and responses, bodies decoded; case-sensitive
-brainproxy history list --contains 'stack trace' --ignore-case   # ASCII letters in any case; é, É differ
+brainproxy history list --contains 'stack trace' --ignore-case   # in any case: Unicode full case folding (ß is SS)
+brainproxy history list --contains 'Bearer [A-Za-z0-9._-]{20,}' --regex   # a regex over the same bytes
 brainproxy history list --filter 'status:5xx resp.body:"stack trace" NOT path:/health'   # the filter language (Traffic's Query)
 brainproxy intercept enable --filter 'method=POST NOT path:/static'   # hold only what the same language matches
+brainproxy intercept set --path '^/api' --filter 'method=POST'   # the same filters, intercept left on or off
 brainproxy history filters list                           # the app's saved Traffic filters, kept in the project
 echo '{"filters":[{"name":"errors","filter":{"text":"status:5xx","query":true}}]}' \
     | brainproxy history filters save --append            # adds one (replaces them without --append)
@@ -1578,7 +1597,12 @@ brainproxy intercept enable --filter 'req.header.authorization:* NOT path:/stati
 brainproxy intercept enable --responses --filter 'status:5xx OR resp.body:"stack trace"'
 brainproxy intercept enable --ws-to-server --filter 'host:chat.acme.test path:/socket'
 brainproxy intercept enable --method POST --filter 'req.body~"(?i)role"'   # all must match
+brainproxy intercept set --responses --filter 'status:5xx'   # change what is held without turning it on
 ```
+
+`intercept set` takes the same flags as `intercept enable` and replaces every setting the same
+way, but leaves intercept on or off as it was: Settings › Intercept options uses it, so saving
+filters while intercept is off holds nothing meanwhile. It returns `{"settings", "warning"}`.
 
 - A held request is matched by itself, as it would go out (after match-and-replace rules and
   the auth session; one forwarded edited goes through the request rules' scripts again, see
@@ -2602,8 +2626,8 @@ Crawl and active-scan scope and safety flags:
   type, to tell a static asset) or stored: each request is sent again, and the live answer is
   recorded. A HAR fetched from a URL is recorded like any document, its body omitted.
 - `history export har`: history rows as a HAR 1.2 file, chosen with `history list`'s filters
-  (`--host`, `--method`, `--status`, `--source`, `--tag`, `--origin`, `--contains` and
-  `--ignore-case`, `--filter`, `--after`),
+  (`--host`, `--method`, `--status`, `--source`, `--tag`, `--origin`, `--contains` with
+  `--ignore-case` and `--regex`, `--filter`, `--after`),
   oldest first, up to `--limit` (1000; `truncated` says when more matched). Session secrets are
   masked as reports mask them (cookie values, `Authorization` credentials, API-key headers, token
   and password parameters, JWTs, the project's auth profile secrets, and each value wherever else
@@ -3217,7 +3241,13 @@ Findings are records with a history, not just rows:
   they were. `--if-state STATE` changes only findings still in that state: if any has been
   changed since you read it, the call fails (kind `conflict`) and nothing changes. `--suggest`
   records the given `--state` and/or `--note` as a suggestion on each finding's timeline (kind
-  `suggested`) and changes nothing else. `findings list` and `report` show work still to do by
+  `suggested`) and changes nothing else. A suggestion waits for a person until the finding's
+  state or note changes after it, or someone dismisses it: `findings dismiss ID --event
+  EVENT_ID` (the suggestion's event id from `findings timeline`) records a `dismissed` event
+  whose `old` is that id, and returns `{"id", "event", "dismissed"}` (`dismissed` false, nothing
+  recorded, when it was dismissed already). The app's *Dismiss* runs it, so a dismissal is
+  seen on every machine and by the command line. Refused through MCP: whether a suggestion is
+  wanted is the person's call. `findings list` and `report` show work still to do by
   default: open, confirmed and retest pending.
 - **Decisions that stick:** `findings mark --issue ISSUE --state false_positive` (or
   `accepted_risk`) is the issue's decision, not only its findings': a finding of the issue

@@ -106,7 +106,8 @@ findings nobody has seen yet (an agent reads the filters with `findings_filter_l
 suggests a rating with `findings_mark` and `suggest`; both commands refuse a tool call too); and
 `findings rate`, since a risk or confidence in place of the scanner's is a
 person's call (an agent suggests one with `findings_mark` and `suggest`; the command refuses a
-tool call too); and `ca install-system`, since every program that uses the system trust store
+tool call too); and `findings dismiss`, since whether an agent's suggestion is wanted is the
+person's call (the command refuses a tool call too); and `ca install-system`, since every program that uses the system trust store
 would then trust whatever the CA signs, a person's decision for their machine (the command
 refuses a tool call too). (`connection review`, `browser open` and the `scan script` commands
 are left out too; see below.)
