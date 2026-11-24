@@ -203,6 +203,79 @@ fn issues_retests_and_the_timeline() {
 }
 
 #[test]
+fn an_alert_filter_re_rates_what_a_scan_finds_and_the_report_says_so() {
+    let port = serve(Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+    let (dir, project) = setup("filter");
+    let base = format!("http://127.0.0.1:{port}");
+    ok(&project, &["send", "--url", &format!("{base}/a")]);
+    let of = |path: &str| {
+        let all = ok(&project, &["findings", "list", "--all", "--alert", "10037", "--state", "all"]);
+        all["items"].as_array().unwrap().iter().find(|f| f["url"].as_str().unwrap().ends_with(path)).cloned()
+    };
+    let scanner = of("/a").unwrap()["risk"].as_str().unwrap().to_string();
+    assert_ne!(scanner, "high");
+
+    // A false positive isn't a rating.
+    let o = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .args(["--format", "json", "--project"])
+        .arg(&project)
+        .args(["findings", "filter", "add", "--alert", "10037", "--risk", "false_positive", "--reason", "x"])
+        .output()
+        .unwrap();
+    let said = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(!o.status.success() && said.contains("findings suppress"), "{said}");
+
+    let host = format!("127.0.0.1:{port}");
+    let add = ok(
+        &project,
+        &[
+            "findings",
+            "filter",
+            "add",
+            "--alert",
+            "10037",
+            "--host",
+            &host,
+            "--url-regex",
+            "/b$",
+            "--risk",
+            "high",
+            "--reason",
+            "the admin app",
+        ],
+    );
+    assert_eq!(add["rated"], 0, "{add}");
+    let id = add["id"].as_i64().unwrap();
+    // Scanned again: the new finding arrives re-rated, the other keeps the scanner's rating.
+    ok(&project, &["send", "--url", &format!("{base}/b")]);
+    let b = of("/b").unwrap();
+    assert_eq!((b["risk"].as_str(), b["rated"]["filter"].as_i64()), (Some("high"), Some(id)), "{b}");
+    assert_eq!(b["rated"]["scanner_risk"].as_str(), Some(scanner.as_str()), "{b}");
+    assert!(of("/a").unwrap()["rated"].is_null());
+    let shown = ok(&project, &["findings", "show", &b["id"].to_string()]);
+    assert_eq!(shown["rated_by"], id, "{shown}");
+    assert!(kinds(&project, b["id"].as_i64().unwrap()).contains(&"rated".to_string()));
+
+    let report = dir.join("r.json");
+    ok(&project, &["report", "json", "--no-evidence", "--output", report.to_str().unwrap()]);
+    let r: Value = serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    let group = r["alerts"].as_array().unwrap().iter().find(|g| g["alert_ref"] == "10037").unwrap();
+    let inst = group["instances"].as_array().unwrap().iter().find(|i| i["id"] == b["id"]).unwrap();
+    assert_eq!((inst["risk"].as_str(), inst["rated"]["filter"].as_i64()), (Some("high"), Some(id)), "{inst}");
+    assert_eq!(group["risk"], "high");
+
+    let list = ok(&project, &["findings", "filter", "list"]);
+    assert_eq!((list["count"].as_i64(), list["filters"][0]["holds"].as_i64()), (Some(1), Some(1)), "{list}");
+    assert_eq!(list["filters"][0]["url_regex"], "/b$");
+    // Suppression rules are listed apart.
+    assert_eq!(ok(&project, &["findings", "suppress", "list"])["count"], 0);
+    let gone = ok(&project, &["findings", "filter", "remove", &id.to_string(), "--unrate"]);
+    assert_eq!(gone["unrated"], 1, "{gone}");
+    assert_eq!(of("/b").unwrap()["risk"].as_str(), Some(scanner.as_str()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn a_completed_scan_job_leaves_its_observations() {
     let port = serve(Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
     let (dir, project) = setup("observe");

@@ -823,6 +823,43 @@ fn ca_install_system_refuses_a_tool_call_before_it_touches_anything() {
     assert!(out.contains("refused through MCP"), "{out}");
 }
 
+#[test]
+fn an_agent_lists_alert_filters_but_neither_adds_nor_removes_one() {
+    let p = tmp_project("alert-filters");
+    let mut m = Mcp::start(&p, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let list = m.request("tools/list", json!({}));
+    let tools = list["result"]["tools"].as_array().unwrap();
+    for gone in ["findings_filter_add", "findings_filter_remove"] {
+        assert!(tools.iter().all(|t| t["name"] != gone), "{gone}");
+    }
+    let (err, e) = m.call("findings_filter_list", json!({}));
+    assert!(!err && e["data"]["count"] == 0, "{e}");
+    let r = m.request(
+        "tools/call",
+        json!({"name": "findings_filter_add", "arguments": {"alert": "10037", "risk": "info", "reason": "x"}}),
+    );
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    // A person's filter, which a tool call's command can't remove; nor can it add one.
+    let run = |mcp: bool, args: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_brainproxy"));
+        if mcp {
+            c.env("BRAINPROXY_MCP_CALL", "1");
+        }
+        let o = c.args(["--format", "json", "--project"]).arg(&p).args(args).output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let (ok, out) = run(false, &["findings", "filter", "add", "--alert", "10037", "--risk", "info", "--reason", "x"]);
+    assert!(ok, "{out}");
+    let (ok, out) = run(true, &["findings", "filter", "add", "--alert", "10037", "--risk", "low", "--reason", "y"]);
+    assert!(!ok && out.contains("refused through MCP") && out.contains("--suggest"), "{out}");
+    let (ok, out) = run(true, &["findings", "filter", "remove", "1"]);
+    assert!(!ok && out.contains("refused through MCP"), "{out}");
+    let (ok, out) = run(false, &["findings", "filter", "list"]);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(ok && v["data"]["count"] == 1, "{out}");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn ca_install_system_on_macos_gives_the_keychain_command_instead_of_writing_anything() {

@@ -220,6 +220,10 @@ pub enum FindingsCmd {
     /// wherever a scan finds it, now and later.
     #[command(subcommand)]
     Suppress(SuppressCmd),
+    /// Alert filters: an alert (on a host, under a path, of a parameter, by URL or parameter
+    /// regex) gets the risk and/or confidence you give it wherever a scan finds it, now and later.
+    #[command(subcommand)]
+    Filter(FilterCmd),
     /// A finding's timeline: found, triaged, noted, retested, moved between issues, seen again
     /// after it was fixed, removed; each with who did it and when.
     Timeline { id: i64 },
@@ -481,6 +485,103 @@ pub enum SuppressCmd {
         #[arg(long)]
         reopen: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum FilterCmd {
+    /// Add a filter. The open scanner findings it matches that nobody rated take its rating at
+    /// once, and so does each one a scanner finds later.
+    #[command(after_help = "A matching finding is stored as usual and rated as the person who added the \
+        filter: risk and/or confidence in place of the scanner's (kept beside it, as with `findings rate`), \
+        the reason as its rating reason, rated.filter (rated_by in `findings show`) naming the filter, and a \
+        rated event on its timeline (\"re-rated by filter N: reason\"). Lists, filters, reports and gates use \
+        the rating, and a later sighting keeps it. A finding a suppression rule marks a false positive isn't \
+        rated, an issue rated as a whole (`findings rate --issue`) gives its own rating instead, and when \
+        several filters match, the oldest rates. Findings a person rated and findings added by hand are left \
+        as they are. --alert matches an alert ref or a rule id (10020 or 10020-1), --host the finding's host \
+        exactly (with :PORT, only findings on that port; any host when left out), --path-prefix the start of \
+        its URL's path, --param its parameter exactly; --url-regex and --param-regex find a match anywhere in \
+        its URL (query included) and parameter. To mark findings false positives use `findings suppress`. \
+        Refused through MCP: an agent suggests a rating on findings instead (`findings mark ID --suggest`).")]
+    Add {
+        /// Alert ref or rule id, e.g. 10020 or 10020-1.
+        #[arg(long)]
+        alert: String,
+        /// Only findings on this host, e.g. app.test, or on one port of it, e.g. 127.0.0.1:3000
+        /// (default: any host).
+        #[arg(long)]
+        host: Option<String>,
+        /// Only findings whose URL path starts with this, e.g. /static/.
+        #[arg(long, value_name = "PATH")]
+        path_prefix: Option<String>,
+        /// Only findings whose URL (query included) this regex finds a match in.
+        #[arg(long, value_name = "REGEX")]
+        url_regex: Option<String>,
+        /// Only findings of this parameter, header or cookie.
+        #[arg(long)]
+        param: Option<String>,
+        /// Only findings whose parameter, header or cookie this regex finds a match in.
+        #[arg(long, value_name = "REGEX")]
+        param_regex: Option<String>,
+        /// The risk to give: info, low, medium, high or critical.
+        #[arg(long, value_parser = filter_risk, required_unless_present = "confidence")]
+        risk: Option<String>,
+        /// The confidence to give.
+        #[arg(long, value_enum)]
+        confidence: Option<crate::report_cmd::ConfidenceArg>,
+        /// Why; each finding it rates gets it as its rating reason.
+        #[arg(long)]
+        reason: String,
+    },
+    /// The filters, with how many findings still have each one's rating (holds).
+    List,
+    /// Remove a filter: findings found later are no longer rated by it. Refused through MCP.
+    Remove {
+        id: i64,
+        /// Also give the findings that still have its rating the scanner's back (otherwise
+        /// they keep it).
+        #[arg(long)]
+        unrate: bool,
+    },
+}
+
+/// `findings filter add --risk`: a risk level. A false positive isn't a rating.
+fn filter_risk(s: &str) -> std::result::Result<String, String> {
+    match s {
+        "info" | "low" | "medium" | "high" | "critical" => Ok(s.to_string()),
+        "false_positive" | "false-positive" => {
+            Err("a filter re-rates; to mark findings false positives use findings suppress".into())
+        }
+        _ => Err("one of info, low, medium, high, critical".into()),
+    }
+}
+
+/// One alert filter as `findings filter list` prints it.
+fn filter_line(f: &serde_json::Value) -> String {
+    let text = |k: &str| f[k].as_str().map(crate::output::escape_lines);
+    let mut place = match (text("host"), f["port"].as_u64()) {
+        (Some(h), Some(p)) => format!("{h}:{p}"),
+        (Some(h), None) => h,
+        (None, _) => "any host".into(),
+    };
+    place.push_str(&text("path_prefix").unwrap_or_default());
+    for (k, label) in [("url_regex", "url ~"), ("param", "param"), ("param_regex", "param ~")] {
+        if let Some(v) = text(k) {
+            place.push_str(&format!(" {label} {v}"));
+        }
+    }
+    let rating = format!(
+        "{}/{}",
+        text("risk").unwrap_or_else(|| "as found".into()),
+        text("confidence").unwrap_or_else(|| "as found".into())
+    );
+    format!(
+        "{:>4}  {:<10} {place}  -> {rating}  holds {}  {}",
+        f["id"],
+        text("alert_ref").unwrap_or_default(),
+        f["holds"],
+        text("reason").unwrap_or_default()
+    )
 }
 
 #[derive(clap::Args)]
@@ -1504,6 +1605,52 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 let reopened = store.suppression_remove(id, reopen)?;
                 out.ok(json!({"id": id, "reopened": reopened}), || {
                     format!("removed suppression rule {id}; {reopened} finding(s) open again")
+                });
+            }
+        },
+        FindingsCmd::Filter(cmd) => match cmd {
+            FilterCmd::Add { alert, host, path_prefix, url_regex, param, param_regex, risk, confidence, reason } => {
+                if crate::mcp::in_tool_call() {
+                    return Err(Error::InvalidInput(
+                        "findings filter add is refused through MCP: a person decides how findings are rated; \
+                         suggest a rating on the findings instead (`findings mark ID --suggest --note ...`)"
+                            .into(),
+                    ));
+                }
+                let filter = brainproxy_core::scan::findings_db::AlertFilter {
+                    alert,
+                    host,
+                    path_prefix: path_prefix.unwrap_or_default(),
+                    url_regex,
+                    param,
+                    param_regex,
+                    risk,
+                    confidence: confidence.map(|c| c.get().as_str().to_string()),
+                    reason,
+                };
+                let (id, rated) = store.filter_add(&filter)?;
+                out.ok(json!({"id": id, "rated": rated}), || {
+                    format!("added alert filter {id}; it re-rated {rated} finding(s)")
+                });
+            }
+            FilterCmd::List => {
+                let filters = store.filters_list()?;
+                out.ok(json!({"count": filters.len(), "filters": filters}), || {
+                    if filters.is_empty() {
+                        return "no alert filters".into();
+                    }
+                    filters.iter().map(filter_line).collect::<Vec<_>>().join("\n")
+                });
+            }
+            FilterCmd::Remove { id, unrate } => {
+                if crate::mcp::in_tool_call() {
+                    return Err(Error::InvalidInput(
+                        "findings filter remove is refused through MCP: a person's filter stays theirs".into(),
+                    ));
+                }
+                let unrated = store.filter_remove(id, unrate)?;
+                out.ok(json!({"id": id, "unrated": unrated}), || {
+                    format!("removed alert filter {id}; {unrated} finding(s) have the scanner's rating again")
                 });
             }
         },

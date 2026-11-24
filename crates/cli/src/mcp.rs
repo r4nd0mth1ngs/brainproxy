@@ -111,6 +111,10 @@ const EXCLUDED: &[&str] = &[
     // takes it away); an agent suggests marks on findings instead. Both refuse a tool call too.
     "findings suppress add",
     "findings suppress remove",
+    // An alert filter rates findings nobody has seen yet, so a person makes it (and takes it
+    // away); an agent suggests a rating on findings instead. Both refuse a tool call too.
+    "findings filter add",
+    "findings filter remove",
     // A person's rating in place of the scanner's; an agent suggests one. It refuses a tool call too.
     "findings rate",
     // Every program on the machine would trust whatever the CA signs: a person decides that, in
@@ -704,6 +708,9 @@ const HINTS: &[(&str, Hints)] = &[
     ("findings suppress add", ADD),
     ("findings suppress list", READ),
     ("findings suppress remove", REPLACE),
+    ("findings filter add", ADD),
+    ("findings filter list", READ),
+    ("findings filter remove", REPLACE),
     ("findings trail", READ),
     // --output writes a new file: through MCP --force is refused, so nothing is overwritten.
     ("findings repro", ADD),
