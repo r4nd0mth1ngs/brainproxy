@@ -557,7 +557,8 @@ fn feed_version_scan(folder: &str, name: &str, value: &str) -> (usize, Vec<Strin
         .unwrap()
         .map(|e| passive_check(&std::fs::read_to_string(e.unwrap().path()).unwrap()))
         .collect();
-    assert_eq!(checks.len(), 8, "two checks per severity band");
+    // nginx has no critical band.
+    assert!(checks.len() >= 6 && checks.len() % 2 == 0, "two checks per severity band");
     let resp = crate::scan::active::Response::recorded(200, vec![(name.to_string(), value.to_string())], Vec::new());
     let mut out = Vec::new();
     for c in &checks {
@@ -619,6 +620,24 @@ fn feed_apache_checks_list_known_vulnerabilities() {
     // A comment that names no distribution keeps medium confidence.
     assert!(scan("Apache/2.4.41 (Unix) OpenSSL/1.1.1").2.iter().all(|c| *c == Confidence::Medium));
     for v in ["Apache/2.4", "Apache", "Apache-Coyote/1.1", "Apache/9.0.0"] {
+        assert_eq!(scan(v).0, 0, "{v}");
+    }
+}
+
+#[test]
+fn feed_nginx_checks_list_known_vulnerabilities() {
+    let scan = |value: &str| feed_version_scan("nginx", "Server", value);
+    // CVE-2021-23017 (resolver off-by-one): 0.6.18 up to 1.20.0, fixed in 1.20.1.
+    let (n, cves, conf) = scan("nginx/1.20.0");
+    assert!(n <= 3 && cves.iter().any(|c| c == "CVE-2021-23017"), "{cves:?}");
+    assert!(conf.iter().all(|c| *c == Confidence::Medium));
+    assert!(!scan("nginx/1.20.1").1.iter().any(|c| c == "CVE-2021-23017"));
+    // A distribution's package: low confidence, the same CVEs.
+    let (n, cves, conf) = scan("nginx/1.20.0 (Ubuntu)");
+    assert!(n > 0 && conf.iter().all(|c| *c == Confidence::Low), "{conf:?}");
+    assert_eq!(cves, scan("nginx/1.20.0").1);
+    // No version, no patch number, another product built on nginx, or a release after them all.
+    for v in ["nginx", "nginx/1.20", "openresty/1.21.4.1", "nginx-ingress/1.0.0", "nginx/9.0.0"] {
         assert_eq!(scan(v).0, 0, "{v}");
     }
 }
