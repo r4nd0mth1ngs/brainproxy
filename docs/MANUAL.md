@@ -3401,7 +3401,9 @@ brainproxy poc clickjacking (--history-id 42 | --url URL) [--opacity 0.5] [--dec
     bytes). A JSON or any other body goes as `text/plain`: in a form, as one field whose name
     and value join at an `=` in the body, so the browser sends the body again byte for byte;
     a JSON object without an `=` gains a member `"_": "="` to hold it (a warning says so), and
-    `fetch` sends the body exactly. Either way the server must accept `text/plain`.
+    `fetch` sends the body exactly. Either way the server must accept `text/plain`, unless
+    `fetch` sends another method than GET or POST: that needs a preflight anyway, so the body
+    goes with its recorded Content-Type.
   - Recorded values are written into the page as they are. A parameter named like an
     anti-CSRF token (the names rule 10202 knows: `csrf_token`, `_token`,
     `authenticity_token`, ...) is kept, with a warning naming it: `--drop-param NAME` leaves

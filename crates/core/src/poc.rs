@@ -484,10 +484,14 @@ pub fn csrf(request: &RawRequest, target: &Target, opts: &CsrfOptions) -> Result
         }
         let what = if encoding == Encoding::Json { "JSON body" } else { "body" };
         let sent_as = if ctype.is_empty() { String::new() } else { format!(" instead of {ctype}") };
-        warnings.push(format!(
+        // fetch with another method needs a preflight anyway, so it sends the recorded type.
+        let plain = opts.technique == Technique::Form || matches!(recorded_method.as_str(), "GET" | "POST");
+        if plain {
+            warnings.push(format!(
             "the {what} goes as Content-Type text/plain{sent_as}: a cross-site page can't send another type without \
              a CORS preflight, so the server must accept text/plain"
-        ));
+            ));
+        }
     }
 
     // Anti-CSRF tokens and secrets: recorded values the page carries.
@@ -1081,6 +1085,13 @@ mod tests {
         assert_eq!(p.method, "DELETE");
         assert!(p.html.contains("mode: \"cors\""));
         assert!(p.warnings.iter().any(|w| w.contains("DELETE from another site needs a CORS preflight")));
+        // A preflight is needed anyway: the body goes with its recorded type.
+        let p = make(
+            "PUT /x HTTP/1.1\nHost: shop.test\nCookie: sid=1\nContent-Type: application/json\n\n{\"a\":1}",
+            &fetch(),
+        );
+        assert!(p.html.contains("\"Content-Type\": \"application/json\""), "{}", p.html);
+        assert!(!p.warnings.iter().any(|w| w.contains("text/plain")), "{:?}", p.warnings);
     }
 
     #[test]
