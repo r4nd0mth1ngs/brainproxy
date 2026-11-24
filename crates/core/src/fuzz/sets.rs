@@ -212,6 +212,29 @@ pub fn parse_oob(arg: &str) -> Result<(u64, OobForm)> {
     Ok((n, form))
 }
 
+/// `script:FILE`: the set its `payloads(ctx)` gives (see [`crate::hooks::Hook::payloads`]), and
+/// the script as it was read. `ctx` has `set` (from 1), and `position` (from 1) and `default`
+/// (its value in the template) when the set is for one position, null otherwise.
+pub fn script_set(
+    file: &str,
+    set: usize,
+    position: Option<usize>,
+    default: Option<&[u8]>,
+) -> Result<(crate::hooks::ScriptRef, Set)> {
+    use crate::hooks::{with_bytes, Hook, HookKind, ScriptRef};
+    let script = ScriptRef::pin(std::path::Path::new(file), None)?;
+    let hook = Hook::load(HookKind::Payloads, &script).map_err(Error::InvalidInput)?;
+    let mut cx = serde_json::json!({ "set": set, "position": position.map(|p| p + 1), "default": null });
+    if let Some(d) = default {
+        cx = with_bytes(cx, "default", "default_base64", d);
+    }
+    let payloads = hook.payloads(&cx)?;
+    if payloads.is_empty() {
+        return Err(Error::InvalidInput(format!("payload script {}: it gave no payloads", script.name())));
+    }
+    Ok((script, Set::List(payloads)))
+}
+
 /// The file a source reads, when it reads one (not stdin): its hash is what a resumed run
 /// checks.
 pub fn source_file(spec: &str) -> Option<&str> {

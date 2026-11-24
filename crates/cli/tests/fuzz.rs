@@ -196,6 +196,31 @@ fn generated_sources_are_sent() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn a_script_makes_a_payload_set_but_not_through_mcp() {
+    let (dir, project) = setup("script");
+    let (port, hits) = serve(Duration::ZERO, |_| "ok".into());
+    let script = dir.join("ids.js");
+    std::fs::write(
+        &script,
+        "function payloads(ctx) { return [1, 2, 3].map(n => ctx.default + '-' + n + '-' + ctx.set); }",
+    )
+    .unwrap();
+    let spec = format!("script:{}", script.display());
+    let url = format!("http://127.0.0.1:{port}/?id=§u§");
+    let (code, v) = run_mcp(&["fuzz", "run", "--url", &url, "-p", &spec], &project);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("isn't offered through MCP"), "{v}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let (code, v) = run(&["fuzz", "run", "--url", &url, "-p", &spec], &project);
+    assert_eq!(code, 0, "{v}");
+    let rows = results(&project, &v["data"]["run"]["id"].to_string());
+    let sent: Vec<&str> = rows.iter().map(|r| r[1].as_str().unwrap()).collect();
+    assert_eq!(sent, [r#"["u-1-1"]"#, r#"["u-2-1"]"#, r#"["u-3-1"]"#]);
+    assert_eq!(v["data"]["run"]["config"]["payload_scripts"][0]["sha256"].as_str().unwrap().len(), 64, "{v}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// What an SSRF does with `?u=URL`: fetches it.
 fn fetch(line: &str) {
     let Some(url) = line.split("u=").nth(1).and_then(|r| r.split(' ').next()) else { return };

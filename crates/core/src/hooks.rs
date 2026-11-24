@@ -5,6 +5,8 @@
 //!   `replace(match, ctx)` gives what to write in place of each match ([`crate::rules`]);
 //! - a fuzz payload processor (`fuzz run --process script:FILE`): its `process(payload, ctx)`
 //!   gives the payload to send ([`crate::fuzz`]);
+//! - a fuzz payload set (`fuzz run -p script:FILE`): its `payloads(ctx)` gives the set's
+//!   payloads ([`crate::fuzz`]);
 //! - a passive check (`scan script add`): its `check(exchange)` gives findings for a recorded
 //!   exchange ([`crate::scan::passive`]);
 //! - a request rule (`rules add --location request --script`): its `request(req, ctx)` sees a
@@ -50,6 +52,9 @@ const INPUT_LIMIT: usize = OUTPUT_LIMIT as usize;
 /// Payloads handed to a processor in one call, and what a set's payloads may come to after it.
 const PROCESS_BATCH: usize = 500;
 const MAX_PROCESSED: usize = 256 << 20;
+/// The payloads a payload script may give, and what they may come to.
+pub const MAX_SCRIPT_PAYLOADS: usize = 1_000_000;
+pub const MAX_SCRIPT_BYTES: usize = 64 << 20;
 /// The findings one exchange may give a check, and the alert types one script may raise in
 /// a process's life (each is kept for good, as a declarative check's is).
 const MAX_FINDINGS: usize = 50;
@@ -66,6 +71,8 @@ pub enum HookKind {
     Check,
     /// `request(req, ctx)`: a request rule, which may block or answer a request.
     Request,
+    /// `payloads(ctx)`: a fuzz payload set.
+    Payloads,
 }
 
 impl HookKind {
@@ -76,6 +83,7 @@ impl HookKind {
             HookKind::Process => "process",
             HookKind::Check => "check",
             HookKind::Request => "request",
+            HookKind::Payloads => "payloads",
         }
     }
 }
@@ -396,6 +404,38 @@ impl Hook {
             }
         }
         Ok(())
+    }
+
+    /// Calls `payloads(ctx)` for a payload set: `cx` with `page` 0, and again with the next page
+    /// for as long as it returns `{ payloads, more: true }`. Each call has the time limit to
+    /// itself; all of them may give at most [`MAX_SCRIPT_PAYLOADS`] payloads and
+    /// [`MAX_SCRIPT_BYTES`].
+    pub fn payloads(&self, cx: &Value) -> Result<Vec<Vec<u8>>> {
+        let bad = |e: &str| Error::InvalidInput(format!("payload script {}: {e}", self.0.name));
+        let (mut out, mut size) = (Vec::new(), 0usize);
+        for page in 0u64.. {
+            let result = self.0.call(cx, &[json!({ "page": page })]).map_err(|e| bad(e.text()))?.pop();
+            let value = result.unwrap_or_else(|| Err("it gave no result".into())).map_err(|e| bad(&e))?;
+            let list = value["payloads"].as_array().ok_or_else(|| bad("its result couldn't be read"))?;
+            for p in list {
+                let payload = bytes_back(p).map_err(|e| bad(&e))?.ok_or_else(|| bad("it gave a null payload"))?;
+                size += payload.len();
+                if out.len() >= MAX_SCRIPT_PAYLOADS || size > MAX_SCRIPT_BYTES {
+                    return Err(bad(&format!(
+                        "it gave over {MAX_SCRIPT_PAYLOADS} payloads or {} MiB",
+                        MAX_SCRIPT_BYTES >> 20
+                    )));
+                }
+                out.push(payload);
+            }
+            if value["more"] != true {
+                break;
+            }
+            if list.is_empty() {
+                return Err(bad("it said there were more payloads, then gave none"));
+            }
+        }
+        Ok(out)
     }
 
     /// Calls `check` on one recorded exchange and reads the findings it gives.
@@ -741,6 +781,37 @@ pub(crate) mod tests {
         let e = h.process(1, &mut payloads).unwrap_err().to_string();
         assert!(e.contains("payload 2 of set 1") && e.contains("no 1"), "{e}");
         assert_eq!(payloads, [b"a".to_vec(), b"bad".to_vec(), b"c".to_vec()]);
+    }
+
+    #[test]
+    fn a_payload_script_gives_a_set_page_by_page() {
+        let h = hook(
+            HookKind::Payloads,
+            "function payloads(ctx) {
+                if (ctx.default === 'plain') return ['a', { base64: '/w==' }, ctx.set + ':' + ctx.position];
+                if (ctx.default === 'paged') return { payloads: ['p' + ctx.page], more: ctx.page < 2 };
+                if (ctx.default === 'null') return ['a', null];
+                if (ctx.default === 'object') return { a: 1 };
+                if (ctx.default === 'endless') return { payloads: [], more: true };
+                if (ctx.default === 'many') return Array.from({ length: 1000001 }, () => '');
+                return 'x';
+            }",
+        );
+        let cx = |default: &str| json!({"set": 2, "position": 3, "default": default});
+        assert_eq!(h.payloads(&cx("plain")).unwrap(), [b"a".to_vec(), vec![0xff], b"2:3".to_vec()]);
+        assert_eq!(h.payloads(&cx("paged")).unwrap(), [b"p0".to_vec(), b"p1".to_vec(), b"p2".to_vec()]);
+        for (default, why) in [
+            ("null", "payload 2 is null"),
+            ("object", "return an array"),
+            ("x", "return an array"),
+            ("endless", "then gave none"),
+        ] {
+            let e = h.payloads(&cx(default)).unwrap_err().to_string();
+            assert!(e.contains(why), "{default}: {e}");
+        }
+        let e = h.payloads(&cx("many")).map(|v| v.len());
+        // A million and one is over the limit, or over what one call may return: either way, none.
+        assert!(e.is_err(), "{e:?}");
     }
 
     #[test]

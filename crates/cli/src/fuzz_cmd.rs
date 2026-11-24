@@ -389,6 +389,8 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     let mut sets = Vec::new();
     // OOB tokens put in payloads (set and payload, from 1), registered once the run has an id.
     let mut oob_tokens: Vec<(usize, usize, String)> = Vec::new();
+    // The scripts that made sets, as they were read: the run's record says what made them.
+    let mut payload_scripts = Vec::new();
     for (i, spec) in payload_specs.iter().enumerate() {
         let set = match spec.split_once(':') {
             Some(("oob", arg)) => {
@@ -410,6 +412,19 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
                     oob_tokens.push((i + 1, k + 1, p.token));
                 }
                 fuzz::Set::List(payloads)
+            }
+            Some(("script", file)) => {
+                // Before the file is so much as read: a script is a person's to name.
+                crate::mcp::check_script("--payloads script:FILE")?;
+                // A set for one position is told that position and its value in the template.
+                let position = match mode {
+                    Mode::Pitchfork | Mode::ClusterBomb => Some(i),
+                    _ => (template.positions() == 1).then_some(0),
+                };
+                let default = position.and_then(|p| template.defaults().get(p)).map(Vec::as_slice);
+                let (script, set) = fuzz::script_set(file, i + 1, position, default)?;
+                payload_scripts.push(script);
+                set
             }
             _ => fuzz::load_payloads(spec, &mut stdin)?,
         };
@@ -475,6 +490,9 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     });
     if !scripts.is_empty() {
         config["process_scripts"] = json!(scripts);
+    }
+    if !payload_scripts.is_empty() {
+        config["payload_scripts"] = json!(payload_scripts);
     }
     if plan.feedback() {
         config["note"] = json!(

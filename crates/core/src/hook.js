@@ -22,6 +22,19 @@
     if (typeof out === "object" && !isArray(out) && typeof out.base64 === "string") return { base64: out.base64 };
     throw new TypeError("it returned " + kindOf(out) + ": return a string, { base64 } or null");
   };
+  // A payload set: an array of payloads, or { payloads, more: true } for a page of them, after
+  // which the function is called again with the next ctx.page.
+  const payloadSet = (out) => {
+    if (out !== null && typeof out === "object" && typeof out.then === "function") throw new TypeError("it returned a promise: return the value itself");
+    const paged = out !== null && typeof out === "object" && !isArray(out) && isArray(out.payloads);
+    const list = paged ? out.payloads : out;
+    if (!isArray(list)) throw new TypeError("it returned " + kindOf(out) + ": return an array of strings or { base64 }");
+    const payloads = list.map((p, i) => {
+      if (p === null || p === undefined) throw new TypeError("payload " + (i + 1) + " is " + kindOf(p) + ": return a string or { base64 }");
+      return bytes(p);
+    });
+    return { payloads, more: paged && out.more === true };
+  };
   const findings = (out) => {
     if (out === undefined || out === null) return { findings: [] };
     if (typeof out === "object" && typeof out.then === "function") throw new TypeError("it returned a promise: return the value itself");
@@ -69,6 +82,8 @@
             return stringify(bytes(fn(item.text, freeze({ ...cx, ...item }))));
           case "request":
             return stringify(verdict(fn(item, cx)));
+          case "payloads":
+            return stringify(payloadSet(fn(freeze({ ...cx, ...item }))));
           default:
             return stringify(findings(fn(item)));
         }

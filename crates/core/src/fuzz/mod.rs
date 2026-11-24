@@ -7,4 +7,4 @@ pub mod sets;
 
 pub use engine::{run, EngineConfig, FuzzResult, Outcome, StoreMode};
 pub use plan::{names_script, process, Chain, Mode, Plan, Template, DEFAULT_MARKER, PROCESSORS};
-pub use sets::{load_payloads, parse_oob, source_file, Gen, OobForm, Set};
+pub use sets::{load_payloads, parse_oob, script_set, source_file, Gen, OobForm, Set};
