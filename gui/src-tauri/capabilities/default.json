@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The main window: the cli, cli_cancel, temp_* and project_delete commands (allowed by default as app commands), file dialogs, opening assertivesolutions.io and brainproxy release links in the browser, and opening or showing a downloaded brainproxy installer.",
+  "description": "The main window: the cli, cli_cancel, temp_* and project_delete commands (allowed by default as app commands), file dialogs, opening assertivesolutions.io and brainproxy release links in the browser, opening or showing a downloaded brainproxy installer, and opening a proof-of-concept page the app wrote to the temporary folder.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -14,7 +14,7 @@
     },
     {
       "identifier": "opener:allow-open-path",
-      "allow": [{ "path": "$DOWNLOAD/brainproxy-gui-*" }]
+      "allow": [{ "path": "$DOWNLOAD/brainproxy-gui-*" }, { "path": "$TEMP/brainproxy-poc-*.html" }]
     },
     "opener:allow-reveal-item-in-dir"
   ]

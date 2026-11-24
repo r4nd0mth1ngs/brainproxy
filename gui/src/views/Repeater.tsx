@@ -10,6 +10,8 @@ import { useActions, useKeyLabel, withKey } from "../ui/useActions.ts";
 import { define } from "../ui/actions.ts";
 import { beginCall, closeQuestion, endCall, failureText, forgetTab, replayCalls, stopCall, tabSlot, useTabSlot } from "./replayCalls";
 import { activeLabels, curlOptions, optionsProblem, requestToSend, sendArgs, sendsAsTyped, sentWithNote } from "./replayOptions";
+import { PocDialog } from "./PocDialog";
+import type { PocKind, PocSource } from "./poc.ts";
 import {
   firstOpenable,
   openable,
@@ -208,9 +210,14 @@ const IN_ORDER: Record<Connections, { id: string; title: string; group: string; 
   single: { id: "replay.inOrderSingle", title: "Send the group in order over one connection", group: "Replay", where: "repeater", keywords: "sequence keep-alive smuggling group tabs" },
   separate: { id: "replay.inOrderSeparate", title: "Send the group in order over separate connections", group: "Replay", where: "repeater", keywords: "sequence group tabs" },
 };
+// Proof-of-concept pages of the tab's request (views/PocDialog.tsx): nothing is sent.
+const CSRF_POC = { id: "replay.csrfPoc", title: "CSRF proof of concept of this request…", group: "Replay", where: "repeater", keywords: "poc page form" } as const;
+const CLICKJACKING_POC = { id: "replay.clickjackingPoc", title: "Clickjacking proof of concept of this request's URL…", group: "Replay", where: "repeater", keywords: "poc page frame" } as const;
 define([
   { ...SEND, hidden: true },
   { ...STOP, hidden: true },
+  { ...CSRF_POC, hidden: true },
+  { ...CLICKJACKING_POC, hidden: true },
   ...CONNECTIONS.map((c) => ({ ...IN_ORDER[c], hidden: true })),
 ]);
 
@@ -351,6 +358,11 @@ function RepeaterTabView({ tab, grouped }: { tab: RepeaterTab; grouped: number[]
     if (problem) return app.toast(problem, "error");
     copyAsCurl(requestToSend(raw, { binary: tab.binary, autoEncode, options }).text, withScheme(guessTarget(raw, target)), tab.binary, app.toast, curlOptions(options));
   };
+
+  // The request as Send would send it, for a proof-of-concept page; fixed while the dialog is open.
+  const [poc, setPoc] = useState<{ kind: PocKind; source: PocSource } | null>(null);
+  const openPoc = (kind: PocKind) =>
+    setPoc({ kind, source: { raw: requestToSend(raw, { binary: tab.binary, autoEncode, options }).text, target: withScheme(guessTarget(raw, target)), binary: tab.binary } });
 
   // The active tab is primary; checked HTTP tabs follow it in tab order.
   const groupTabs = [tab, ...app.repeater.filter((t) => t.key !== tab.key && !t.ws && grouped.includes(t.key))];
@@ -516,6 +528,8 @@ function RepeaterTabView({ tab, grouped }: { tab: RepeaterTab; grouped: number[]
       disabled: inOrderDisabled,
       run: () => sendInOrder(over),
     })),
+    { ...CSRF_POC, run: () => openPoc("csrf") },
+    { ...CLICKJACKING_POC, run: () => openPoc("clickjacking") },
     {
       ...STOP,
       title: racing ? "Stop the race" : sequencing ? "Stop the group sent in order" : STOP.title,
@@ -631,6 +645,9 @@ function RepeaterTabView({ tab, grouped }: { tab: RepeaterTab; grouped: number[]
         <button className="btn" onClick={copyCurl} title="Copy this request as a curl command (POSIX shell)">
           Copy as cURL
         </button>
+        <button className="btn" onClick={() => openPoc("csrf")} title="A page that sends this request from a visitor's browser (CSRF proof of concept); nothing is sent">
+          CSRF PoC…
+        </button>
         {tab.finding != null && (
           <button
             className="btn"
@@ -706,6 +723,7 @@ function RepeaterTabView({ tab, grouped }: { tab: RepeaterTab; grouped: number[]
           response
         )}
       </Split>
+      {poc && <PocDialog kind={poc.kind} source={poc.source} close={() => setPoc(null)} />}
     </div>
   );
 }

@@ -1089,6 +1089,40 @@ select {
 .curl-dialog .curl-warnings ul {
   padding-left: 20px;
 }
+/* Proof-of-concept pages (views/PocDialog.tsx). */
+.poc-dialog {
+  width: min(820px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+.poc-dialog .poc-settings {
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 0 0 12px;
+}
+.poc-dialog .poc-settings input[type="number"] {
+  width: 6em;
+}
+.poc-dialog p.poc-summary {
+  margin: 0 0 8px;
+  color: var(--text);
+}
+.poc-dialog p.poc-error {
+  margin: 0 0 12px;
+  color: var(--high);
+  white-space: pre-wrap;
+}
+.poc-dialog .poc-warnings {
+  margin: 0 0 12px;
+  color: var(--medium);
+}
+.poc-dialog .poc-warnings ul {
+  margin: 0;
+  padding-left: 20px;
+}
+.poc-dialog textarea {
+  margin-bottom: 12px;
+}
 /* Settings › TLS / CA › Install in system trust store (views/SystemTrust.tsx). */
 .trust-dialog {
   width: min(640px, 100%);

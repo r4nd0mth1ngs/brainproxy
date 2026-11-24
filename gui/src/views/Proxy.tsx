@@ -53,6 +53,8 @@ import { ruleEditNote, scriptStop } from "./matchReplace.ts";
 import { WebSockets } from "./WebSockets";
 import { FORWARD, filterChange, filterChanged, INTERCEPT_FILTER_HELP, interceptChanger, interceptEnableArgs, savedQueries, savedQueryFor, type InterceptSettings } from "./intercept";
 import { TrafficExport } from "./TrafficExport.tsx";
+import { PocDialog } from "./PocDialog";
+import type { PocKind, PocSource } from "./poc.ts";
 import { dueIds, mergeRechecked, recheckCalls, SLOW_EVERY_MS, stillPending, withPending, type Pending } from "./trafficPending.ts";
 
 export function ProxyView() {
@@ -252,6 +254,8 @@ function History({ active }: { active: boolean }) {
   // The saved filter last chosen or saved, so two with the same state stay apart.
   const [picked, setPicked] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
+  // The proof-of-concept page dialog, for a recorded request.
+  const [poc, setPoc] = useState<{ kind: PocKind; source: PocSource } | null>(null);
   const lastId = useRef(0);
   const { menu, open, close } = useMenu();
   // Opened to show one source's requests: that source alone, and none of them hidden by another filter.
@@ -467,6 +471,8 @@ function History({ active }: { active: boolean }) {
       { id: "proxy.traffic.replay", title: "Send the selected request to Replay", run: (r: HistoryItem) => handoff(r.id, (h) => app.sendToRepeater({ ...h, title: pathOf(r.url).slice(0, 24) })) },
       { id: "proxy.traffic.fuzzer", title: "Send the selected request to Fuzzer", run: (r: HistoryItem) => handoff(r.id, app.sendToFuzzer) },
       { id: "proxy.traffic.finding", title: "Create a finding from the selected request…", run: (r: HistoryItem) => app.newFinding({ url: r.url, method: r.method, history: [r.id] }) },
+      { id: "proxy.traffic.csrfPoc", title: "CSRF proof of concept of the selected request…", keywords: "poc page form", run: (r: HistoryItem) => setPoc({ kind: "csrf", source: { historyId: r.id } }) },
+      { id: "proxy.traffic.clickjackingPoc", title: "Clickjacking proof of concept of the selected request…", keywords: "poc page frame", run: (r: HistoryItem) => setPoc({ kind: "clickjacking", source: { historyId: r.id } }) },
     ].map((a) => ({ ...a, group: "Proxy", where: "proxy", hidden: !active, disabled: noRow, run: () => row && a.run(row) })),
     {
       id: "proxy.traffic.scan",
@@ -493,6 +499,9 @@ function History({ active }: { active: boolean }) {
       "-",
       { label: "Scan this request…", action: () => scan(pick), disabled: !!noScan, hint: noScan ?? undefined },
       { label: "Test access control…", action: () => withMutation(pick).then((p) => app.sendToAccess([p])), disabled: refused, hint: refused ? REFUSED_HINT : undefined },
+      "-",
+      { label: "CSRF proof of concept…", action: () => setPoc({ kind: "csrf", source: { historyId: r.id } }) },
+      { label: "Clickjacking proof of concept…", action: () => setPoc({ kind: "clickjacking", source: { historyId: r.id } }) },
       "-",
       { label: "Copy URL", action: () => navigator.clipboard.writeText(r.url) },
       { label: "Copy as cURL", action: () => handoff(r.id, (h) => copyAsCurl(h.raw, h.target, h.binary, app.toast)) },
@@ -711,6 +720,7 @@ function History({ active }: { active: boolean }) {
         </Split>
       </Split>
       <Menu menu={menu} close={close} />
+      {poc && <PocDialog kind={poc.kind} source={poc.source} close={() => setPoc(null)} />}
     </div>
   );
 }
