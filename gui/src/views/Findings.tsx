@@ -44,16 +44,16 @@ import {
 import {
   acceptCommand,
   afterMark,
+  dismissArgs,
   dismissedKey,
+  moveDismissed,
   draftOf,
   dropDraft,
   NEXT_FINDING,
-  parseDismissed,
   pendingSuggestions,
   PREVIOUS_FINDING,
   stepFinding,
   TRIAGE_KEYS,
-  withDismissed,
   withDraft,
 } from "./findingsTriage.ts";
 import { heldNote, loadAll, type ListPage, type Loaded } from "./findingsPages.ts";
@@ -276,20 +276,39 @@ export function FindingsView({ active }: { active: boolean }) {
   };
 
   // An agent's suggestions: the person accepts one (as their own mark, only while the finding
-  // is still in the state on screen) or dismisses it. Dismissals are this window's to remember.
-  const dismissKey = dismissedKey(app.project);
-  const [dismissed, setDismissed] = useState<ReadonlySet<number>>(() => readDismissed(dismissKey));
-  useEffect(() => setDismissed(readDismissed(dismissKey)), [dismissKey]);
-  const suggestions = useMemo(() => pendingSuggestions(events, dismissed), [events, dismissed]);
-  const dismiss = (s: FindingEvent) => {
-    const { set, text } = withDismissed(dismissed, s.id);
-    setDismissed(set);
+  // is still in the state on screen) or dismisses it (`findings dismiss`, kept in the project).
+  const suggestions = useMemo(() => pendingSuggestions(events), [events]);
+  const dismiss = async (s: FindingEvent) => {
+    if (!finding) return;
+    const id = finding.id;
     try {
-      localStorage.setItem(dismissKey, text);
-    } catch {
-      /* storage unavailable: dismissed until the app restarts */
+      await run(dismissArgs(id, s.id));
+    } catch (e: any) {
+      app.toast(e.message, "error");
     }
+    if (openId.current === id) reloadEvents(id);
   };
+  // Suggestions an older build dismissed in this window's storage move to the project once.
+  useEffect(() => {
+    const key = dismissedKey(app.project);
+    let stored: string | null = null;
+    try {
+      stored = localStorage.getItem(key);
+    } catch {
+      return;
+    }
+    if (stored == null) return;
+    const project = app.project;
+    moveDismissed((args) => run(args, { project }), stored).then((done) => {
+      if (!done) return;
+      try {
+        localStorage.removeItem(key);
+      } catch {
+        /* storage unavailable: nothing to remove either */
+      }
+      if (openId.current != null) reloadEvents(openId.current);
+    });
+  }, [app.project]);
   const accept = async (s: FindingEvent) => {
     if (!finding) return;
     const id = finding.id;
@@ -1398,15 +1417,6 @@ export function FindingsView({ active }: { active: boolean }) {
       {showFilters && <AlertFilters names={names} close={() => setShowFilters(false)} changed={suppressionChanged} />}
     </div>
   );
-}
-
-/** The suggestions dismissed in a project, as this window's storage has them. */
-function readDismissed(key: string): Set<number> {
-  try {
-    return parseDismissed(localStorage.getItem(key));
-  } catch {
-    return new Set();
-  }
 }
 
 /** Whether two values read from the CLI are the same, so an unchanged poll doesn't render again. */

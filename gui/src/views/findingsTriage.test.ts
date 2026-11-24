@@ -8,7 +8,9 @@ import { eventText } from "./findingsFilter.ts";
 import {
   acceptCommand,
   afterMark,
-  DISMISSED_MAX,
+  dismissArgs,
+  moveDismissed,
+  PENDING_SQL,
   draftOf,
   dropDraft,
   NEXT_FINDING,
@@ -17,7 +19,6 @@ import {
   PREVIOUS_FINDING,
   stepFinding,
   TRIAGE_KEYS,
-  withDismissed,
   withDraft,
 } from "./findingsTriage.ts";
 
@@ -81,9 +82,11 @@ test("an agent's suggestion waits until the state or note changes after it, or i
   const s1 = ev(2, "suggested", { old: "open", new: "false_positive", text: "a CDN header" });
   const s2 = ev(4, "suggested", { old: "confirmed", text: "retest after the deploy" });
   const events = [ev(1, "created"), s1, ev(3, "state", { old: "open", new: "confirmed" }), s2, ev(5, "retest")];
-  assert.deepEqual(pendingSuggestions(events, new Set()).map((e) => e.id), [4]);
-  assert.deepEqual(pendingSuggestions(events, new Set([4])), []);
-  assert.deepEqual(pendingSuggestions([s1], new Set()).map((e) => e.id), [2]);
+  assert.deepEqual(pendingSuggestions(events).map((e) => e.id), [4]);
+  assert.deepEqual(pendingSuggestions([...events, ev(6, "dismissed", { old: "4" })]), []);
+  assert.deepEqual(pendingSuggestions([...events, ev(6, "dismissed", { old: "2" })]).map((e) => e.id), [4], "another one's dismissal");
+  assert.deepEqual(pendingSuggestions([s1]).map((e) => e.id), [2]);
+  assert.deepEqual(dismissArgs(9, 4), ["findings", "dismiss", "9", "--event", "4"]);
   assert.equal(eventText(s1), 'Suggested: mark it false positive, with the note "a CDN header" (it was open)');
   assert.equal(eventText(s2), 'Suggested: note "retest after the deploy" (it was confirmed)');
 });
@@ -95,16 +98,32 @@ test("accepting applies the suggestion only while the finding is in the state on
   assert.equal(acceptCommand(9, ev(3, "suggested"), "open"), null);
 });
 
-test("dismissed suggestions are remembered, newest kept, and a damaged store reads as none", () => {
+test("suggestions an older build dismissed in this window move to the project once", async () => {
   assert.deepEqual([...parseDismissed(null)], []);
   assert.deepEqual([...parseDismissed("not json")], []);
   assert.deepEqual([...parseDismissed('{"a":1}')], []);
   assert.deepEqual([...parseDismissed('[3, "x", 1.5, 7]')], [3, 7]);
-  const { set, text } = withDismissed(new Set([3, 7]), 3);
-  assert.deepEqual([...set], [7, 3]);
-  assert.deepEqual([...parseDismissed(text)], [7, 3]);
-  const full = new Set(Array.from({ length: DISMISSED_MAX }, (_, i) => i));
-  const after = withDismissed(full, 99999).set;
-  assert.equal(after.size, DISMISSED_MAX);
-  assert.ok(after.has(99999) && !after.has(0));
+  const calls: string[][] = [];
+  // Of the stored 3, 7 and 8, the query says 3 (finding 1) and 8 (finding 2) still wait.
+  const cli = async <T,>(args: string[]): Promise<T> => {
+    calls.push(args);
+    return (args[0] === "query" ? { rows: [[1, 3], [2, 8]] } : { dismissed: true }) as T;
+  };
+  assert.equal(await moveDismissed(cli, "[3, 7, 8]"), true);
+  assert.deepEqual(calls, [
+    ["query", PENDING_SQL, "-p", "[3,7,8]", "--limit", "3"],
+    ["findings", "dismiss", "1", "--event", "3"],
+    ["findings", "dismiss", "2", "--event", "8"],
+  ]);
+  // Nothing stored: nothing to run.
+  calls.length = 0;
+  assert.equal(await moveDismissed(cli, null), true);
+  assert.equal(await moveDismissed(cli, "garbage"), true);
+  assert.deepEqual(calls, []);
+  // A failure keeps the stored ids for the next time.
+  const failing = async <T,>(args: string[]): Promise<T> => {
+    if (args[0] === "findings") throw new Error("database is locked");
+    return { rows: [[1, 3]] } as T;
+  };
+  assert.equal(await moveDismissed(failing, "[3]"), false);
 });
