@@ -1312,7 +1312,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 201 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 204 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -3177,6 +3177,34 @@ Findings are records with a history, not just rows:
   `--issue` rates every scanner finding of the issue, and the findings it gets later arrive
   rated too (`rating` in `findings issues`); `--clear --issue` ends that. Findings added by hand
   keep the risk they were given (`findings edit --risk`). Refused through MCP: an agent
+  suggests a rating with `findings mark ID --suggest --note ...`.
+- **Alert filters** (`findings filter add --alert A [--host H] [--path-prefix /api/]
+  [--url-regex R] [--param P] [--param-regex R] [--risk R] [--confidence C] --reason TEXT`,
+  `findings filter list`, `findings filter remove ID [--unrate]`): your rating of an alert
+  wherever a scan finds it, now and later, such as every missing header on `/static/` down to
+  info, or one rule's findings on the admin host up to high. `--alert` is an alert ref or rule
+  id; `--host` a name, or `NAME:PORT` for that port only, and any host when left out;
+  `--path-prefix` the start of the URL's path; `--param` the parameter, header or cookie
+  exactly; `--url-regex` and `--param-regex` find a match anywhere in the finding's URL (query
+  included) or parameter. Give `--risk` (info to critical) and/or `--confidence`; the one left
+  out stays the scanner's. A matching finding is rated as with `findings rate`, as the person
+  who added the filter: the scanner's rating is kept beside it, the reason is its rating
+  reason, `rated.filter` in `findings list --all` (`rated_by` in `findings show`, and
+  `rated.filter` on each instance of `report json`) names the filter, and a `rated` event says
+  `re-rated by filter N: reason`. A later sighting keeps the rating. `add` re-rates the open
+  scanner findings nobody rated (`{"id","rated"}`, `rated` counting them); findings someone
+  rated, findings added by hand and triaged findings are left alone. When several things
+  could rate a new finding: a suppression rule wins (it is a false positive, and not rated),
+  then the rating of its issue as a whole (`findings rate --issue`), then the oldest matching
+  filter. `list` gives each filter (`id`, `time`, `alert_ref`, `host`, null for any, `port`,
+  `path_prefix`, `url_regex`, `param`, `param_regex`, `risk`, `confidence`, `reason`,
+  `origin`, `by`) with `holds`, how many findings still have its rating. A person who rates
+  one of them takes it from the filter. `remove` stops it rating new findings; `--unrate`
+  also gives those it still holds the scanner's rating back (`unrated` counts them), and
+  without it they keep it. `--risk false_positive` is refused: use `findings suppress`.
+  Filters share the `suppressions` table with suppression rules (`action` is `rate`;
+  `findings suppress list` shows only suppression rules). Through MCP `add` and `remove` are
+  refused: a filter rates findings nobody has seen yet, so a person makes it; an agent
   suggests a rating with `findings mark ID --suggest --note ...`.
 - **Listing:** `findings list` returns at most `--limit` rows (200; alert types, or findings
   with `--all`), from `--offset` on. `total` counts every row that matches, `count` the rows

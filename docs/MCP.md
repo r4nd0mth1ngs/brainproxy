@@ -101,7 +101,10 @@ person's (the command refuses a tool call too); and `findings issue review` and
 for its own draft; and `findings suppress add` and `findings suppress remove`, since a
 suppression rule decides about findings nobody has seen yet (an agent reads the rules with
 `findings_suppress_list`, and suggests marks on findings instead; both commands refuse a tool
-call too); and `findings rate`, since a risk or confidence in place of the scanner's is a
+call too); and `findings filter add` and `findings filter remove`, since an alert filter rates
+findings nobody has seen yet (an agent reads the filters with `findings_filter_list`, and
+suggests a rating with `findings_mark` and `suggest`; both commands refuse a tool call too); and
+`findings rate`, since a risk or confidence in place of the scanner's is a
 person's call (an agent suggests one with `findings_mark` and `suggest`; the command refuses a
 tool call too); and `ca install-system`, since every program that uses the system trust store
 would then trust whatever the CA signs, a person's decision for their machine (the command
