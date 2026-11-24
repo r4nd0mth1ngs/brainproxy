@@ -420,6 +420,16 @@ impl Cx {
         self.shared.client.learn_alt_svc(&self.base.target, response);
     }
 
+    /// Whether a request may go over HTTP/2 or HTTP/3 (`--http2`, `--http3`, or a base request
+    /// line saying so), where the head is sent as pseudo-headers: a second Host or an
+    /// absolute request target can't be said there.
+    pub fn sends_over_h2(&self) -> bool {
+        let opts = self.shared.client.options();
+        let line = self.base.request.split(|&b| b == b'\n').next().unwrap_or_default();
+        let version = line.trim_ascii_end().rsplit(|&b| b == b' ').next().unwrap_or_default();
+        opts.http2 || opts.http3 || version.starts_with(b"HTTP/2") || version.starts_with(b"HTTP/3")
+    }
+
     /// [`Cx::send`] over TCP (HTTP/1.1, or HTTP/2 as the scan's options or the request line
     /// say) even when the scan sends over HTTP/3. A request line saying HTTP/3 says HTTP/1.1.
     pub async fn send_tcp(&self, request: Vec<u8>) -> Result<Response> {
