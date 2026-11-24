@@ -32,6 +32,7 @@ import { RecordLogin } from "./RecordLogin.tsx";
 import { MatchReplace } from "./MatchReplace.tsx";
 import { TOTP_ENV, passkeyLine, type PasskeyInfo } from "./recordLogin.ts";
 import { AppUpdateSettings } from "./AppUpdate";
+import { FeedTools } from "./FeedTools.tsx";
 import {
   EMPTY_CERT,
   EMPTY_UPSTREAM,
@@ -1314,6 +1315,7 @@ function RulesAndUpdates() {
         />
         <ConfirmButton label="Reset to embedded" disabled={!!busy} question="Delete the downloaded copies?" onConfirm={() => job("Data reset", ["scan", "data", "reset"])} />
       </div>
+      <FeedTools />
       <AppUpdateSettings />
     </div>
   );
