@@ -543,6 +543,10 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
     if !payload_scripts.is_empty() {
         config["payload_scripts"] = json!(payload_scripts);
     }
+    // Through MCP a file: source names the file it resolved to: a resume reads that one.
+    if payload_specs != args.payloads {
+        config["payload_sources"] = json!(payload_specs);
+    }
     if plan.feedback() {
         config["note"] = json!(
             "an extract: set sends what --extract captured from each response in the next request, so requests go \
@@ -823,7 +827,11 @@ fn resume(project: &Path, home: &Path, run: i64, out: &Out) -> Result<(), Error>
     let strings = |key: &str| -> Vec<String> {
         config[key].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect()
     };
-    let payloads = strings("payloads");
+    // The files the run read, as they resolved when it started (through MCP, in the project's folder).
+    let payloads = match strings("payload_sources") {
+        sources if sources.is_empty() => strings("payloads"),
+        sources => sources,
+    };
     if let Some(why) = not_resumable(&payloads) {
         return Err(Error::Conflict(format!("fuzz run {run} can't be resumed: {why}")));
     }
@@ -856,9 +864,12 @@ fn resume(project: &Path, home: &Path, run: i64, out: &Out) -> Result<(), Error>
     for key in ["stop_on_match", "no_encode"] {
         flag(&key.replace('_', "-"), &config[key]);
     }
-    for (key, name) in [("payloads", "payloads"), ("process", "process"), ("grep", "grep")] {
+    for spec in &payloads {
+        flag("payloads", &json!(spec));
+    }
+    for key in ["process", "grep"] {
         for v in config[key].as_array().into_iter().flatten() {
-            flag(name, v);
+            flag(key, v);
         }
     }
     let statuses: Vec<String> = config["match_status"].as_array().into_iter().flatten().map(text).collect();
