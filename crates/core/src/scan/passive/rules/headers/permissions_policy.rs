@@ -72,8 +72,9 @@ impl PassiveRule for PermissionsPolicy {
     }
 
     fn scan(&self, msg: &Message, out: &mut Vec<Finding>) {
-        // ZAP raises redirects only at the LOW threshold.
-        if (!msg.is_html() && !is_javascript(msg)) || is_redirect(msg.status) {
+        // ZAP raises redirects only at the LOW threshold. An empty body (ZAP judges it too) has no
+        // feature to restrict.
+        if (!msg.is_html() && !is_javascript(msg)) || is_redirect(msg.status) || msg.resp_body.is_empty() {
             return;
         }
         if header_values(msg, DEPRECATED_HEADER).next().is_some() {
@@ -108,6 +109,7 @@ mod tests {
     fn set_redirects_and_other_types_pass() {
         assert!(msg("https://a.test/").html("<p>").header(HEADER, "camera=()").scan(&PermissionsPolicy).is_empty());
         assert!(msg("https://a.test/").html("<p>").status(302).scan(&PermissionsPolicy).is_empty());
+        assert!(msg("https://a.test/").html("").scan(&PermissionsPolicy).is_empty(), "an empty body");
         assert!(msg("https://a.test/x.json")
             .header("Content-Type", "application/json")
             .body("{}")

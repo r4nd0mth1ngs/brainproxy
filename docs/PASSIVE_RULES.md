@@ -165,6 +165,8 @@ Behaviour follows ZAP's default (MEDIUM) alert threshold. The main differences:
   which Viewstate (10032) reports; ZAP decodes it here as well (10094-1, 10094-2).
 - **Dangerous JS Functions (10110)** reads ZAP's `js-function-list.txt`, refreshed with the
   other ZAP rule data (`scan data update`); ZAP's custom payloads aren't supported.
+- **Permissions Policy (10063) and Site Isolation (90004)** pass over a response with an
+  empty body, which ZAP judges too: it has no features to restrict and no data to isolate.
 - **Content Cacheability (10049)** reports one informational finding per response, as ZAP
   does; turn it off (`scan disable 10049`) where that is too much.
 - **Findings are de-duplicated:** the same alert, method, URL (without its query) and

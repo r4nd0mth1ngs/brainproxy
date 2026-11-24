@@ -109,8 +109,9 @@ impl PassiveRule for SiteIsolation {
     }
 
     fn scan(&self, msg: &Message, out: &mut Vec<Finding>) {
-        // A success only: an error page isn't a resource to protect.
-        if !msg.is_success() {
+        // A success only: an error page isn't a resource to protect, and nor is an empty body
+        // (which ZAP judges too).
+        if !msg.is_success() || msg.resp_body.is_empty() {
             return;
         }
         // A resource shared through CORS is meant to be read cross-origin.
@@ -167,7 +168,8 @@ mod tests {
     }
 
     #[test]
-    fn cors_and_errors_are_left_alone() {
+    fn cors_errors_and_empty_bodies_are_left_alone() {
+        assert!(msg("https://a.test/").html("").scan(&SiteIsolation).is_empty());
         let f = msg("https://a.test/api")
             .header("Content-Type", "application/json")
             .header("Access-Control-Allow-Origin", "*")
