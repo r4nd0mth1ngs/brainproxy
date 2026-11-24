@@ -1,6 +1,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  closedSince,
+  CONN_PAGE,
+  newerArgs,
+  newestArgs,
+  NO_CONNS,
+  olderArgs,
+  openArgs,
+  recheckArgs,
+  RECHECK_MAX,
+  withNewer,
+  withNewest,
+  withOlder,
+  withUpdated,
+  type WsConnection,
   base64Bytes,
   connectionMessages,
   HANDOFF_MAX,
@@ -162,4 +176,82 @@ test("a connection goes to Replay with its first text and binary messages, in or
 test("only strings and single hex or base64 fields are saved messages", () => {
   for (const m of ["a", { hex: "00" }, { base64: "" }]) assert.ok(isWsOut(m), JSON.stringify(m));
   for (const m of [1, null, [], {}, { hex: 1 }, { hex: "00", base64: "AA==" }, { utf16: "x" }]) assert.ok(!isWsOut(m), JSON.stringify(m));
+});
+
+// ---------------- The connection list ----------------
+
+const conn = (id: number, patch: Partial<WsConnection> = {}): WsConnection => ({
+  id,
+  time: "2026-01-01T00:00:00Z",
+  source: "proxy",
+  history_id: id,
+  url: `ws://a.test/c${id}`,
+  host: "a.test",
+  extensions: null,
+  protocol: null,
+  state: "closed",
+  closed_time: null,
+  close_code: 1000,
+  close_reason: null,
+  messages: 1,
+  error: null,
+  ...patch,
+});
+const conns = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => conn(from + i));
+
+test("the list starts with the newest page and pages back past it with --before", () => {
+  assert.deepEqual(newestArgs(), ["ws", "list", "--newest", "--limit", String(CONN_PAGE)]);
+  assert.equal(olderArgs(NO_CONNS), null, "nothing loaded yet");
+  // A full newest page: older ones may exist.
+  let l = withNewest(conns(5001, 10000));
+  assert.ok(l.more);
+  assert.deepEqual(olderArgs(l), ["ws", "list", "--newest", "--before=5001", "--limit", String(CONN_PAGE)]);
+  l = withOlder(l, conns(1, 5000));
+  assert.equal(l.items.length, 10000);
+  assert.deepEqual([l.items[0].id, l.items.at(-1)!.id], [1, 10000]);
+  // Still a full page: one more call says there is nothing before it.
+  assert.ok(l.more);
+  l = withOlder(l, []);
+  assert.ok(!l.more);
+  assert.equal(olderArgs(l), null);
+  // A short first page has nothing older.
+  assert.equal(olderArgs(withNewest(conns(1, 3))), null);
+});
+
+test("new connections are added after the newest, each once", () => {
+  let l = withNewest(conns(1, 3));
+  assert.deepEqual(newerArgs(l), ["ws", "list", "--after=3", "--limit", String(CONN_PAGE)]);
+  l = withNewer(l, [conn(3), conn(4), conn(5)]);
+  assert.deepEqual(
+    l.items.map((c) => c.id),
+    [1, 2, 3, 4, 5],
+  );
+  assert.equal(withNewer(l, [conn(5)]), l, "nothing new: the same list");
+  assert.deepEqual(newerArgs(NO_CONNS), ["ws", "list", "--after=0", "--limit", String(CONN_PAGE)]);
+});
+
+test("open connections are refreshed, and ones that closed are read again", () => {
+  let l = withNewest([conn(1), conn(2, { state: "open", messages: 1 }), conn(3), conn(4, { state: "open" }), conn(5, { state: "open" })]);
+  assert.deepEqual(openArgs(l), ["ws", "list", "--state=open", "--after=1", "--limit", String(CONN_PAGE)]);
+  // 2 has more messages, 4 closed, 5 is still open.
+  const open = [conn(2, { state: "open", messages: 9 }), conn(5, { state: "open" })];
+  assert.deepEqual(closedSince(l, open), [4]);
+  l = withUpdated(l, open);
+  assert.equal(l.items[1].messages, 9);
+  assert.deepEqual(recheckArgs(4), ["ws", "list", "--after=3", "--before=5", "--limit", "1"]);
+  l = withUpdated(l, [conn(4, { close_code: 1001 })]);
+  assert.deepEqual([l.items[3].state, l.items[3].close_code], ["closed", 1001]);
+  assert.equal(withUpdated(l, [conn(4, { close_code: 1001 })]), l, "unchanged: the same list");
+  assert.equal(openArgs(withNewest(conns(1, 2))), null, "none open: nothing to ask");
+  // A full answer says nothing about ids past its last one.
+  const many = withNewest(Array.from({ length: CONN_PAGE + 2 }, (_, i) => conn(i + 1, { state: "open" })));
+  const full = Array.from({ length: CONN_PAGE }, (_, i) => conn(i + 1, { state: "open" })).filter((c) => c.id !== 7);
+  full.push(conn(CONN_PAGE + 1, { state: "open" }));
+  assert.deepEqual(closedSince(many, full), [7]);
+  // At most RECHECK_MAX are read again per poll, the oldest first.
+  const lots = withNewest(Array.from({ length: 50 }, (_, i) => conn(i + 1, { state: "open" })));
+  assert.deepEqual(
+    closedSince(lots, []),
+    Array.from({ length: RECHECK_MAX }, (_, i) => i + 1),
+  );
 });

@@ -24,6 +24,8 @@ interface Props<T> {
   rowClass?: (row: T) => string | undefined;
   initialSort?: { key: string; desc: boolean };
   empty?: ReactNode;
+  /** Called when the last row is scrolled into view (to load more). */
+  onEndReached?: () => void;
 }
 
 const ROW = 24;
@@ -59,6 +61,13 @@ export function DataTable<T>(p: Props<T>) {
   const first = Math.max(0, Math.floor(scroll / ROW) - 10);
   const last = Math.min(sorted.length, Math.ceil((scroll + height) / ROW) + 10);
   const index = p.selected == null ? -1 : sorted.findIndex((r) => p.rowKey(r) === p.selected);
+
+  const atEnd = sorted.length > 0 && last >= sorted.length;
+  const onEnd = useRef(p.onEndReached);
+  onEnd.current = p.onEndReached;
+  useEffect(() => {
+    if (atEnd) onEnd.current?.();
+  }, [atEnd, sorted.length]);
 
   // The selection last scrolled into view. Only a new selection (by keyboard, click or a view
   // picking one) scrolls: rows added around it (a poll, newest first) move its index, and

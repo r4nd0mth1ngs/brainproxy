@@ -318,3 +318,89 @@ export function wsOrigin(url: string): string {
 
 export const BLANK_HANDSHAKE =
   "GET / HTTP/1.1\nHost: \nUpgrade: websocket\nConnection: Upgrade\nSec-WebSocket-Version: 13\nSec-WebSocket-Key: (replaced when sent)\n\n";
+
+// ---------------- Proxy › WebSockets: the connection list ----------------
+
+/** Connections per `ws list` call. */
+export const CONN_PAGE = 5000;
+/** Connections that closed since the last poll and are read again one by one, at most, per poll. */
+export const RECHECK_MAX = 20;
+
+/**
+ * The connections loaded, by id ascending: the newest page first, newer ones as polls find them,
+ * older pages as the list is scrolled to its end (`ws list --before`).
+ */
+export interface ConnList {
+  items: WsConnection[];
+  /** Connections older than the first loaded one may exist. */
+  more: boolean;
+  /** The newest page has been loaded. */
+  loaded: boolean;
+}
+
+export const NO_CONNS: ConnList = { items: [], more: false, loaded: false };
+
+const listArgs = (...more: string[]) => ["ws", "list", ...more, "--limit", String(CONN_PAGE)];
+const lastId = (l: ConnList) => l.items.at(-1)?.id ?? 0;
+
+/** The newest page, oldest first. */
+export const newestArgs = () => listArgs("--newest");
+/** Connections opened since the newest loaded one. */
+export const newerArgs = (l: ConnList) => listArgs(`--after=${lastId(l)}`);
+/** The page before the oldest loaded connection; null when there is none to ask for. */
+export const olderArgs = (l: ConnList): string[] | null => (l.loaded && l.more && l.items.length ? listArgs("--newest", `--before=${l.items[0].id}`) : null);
+/**
+ * The connections still open, from the oldest loaded one shown open: their message counts move,
+ * and one missing from the answer has closed. Null when none is shown open.
+ */
+export function openArgs(l: ConnList): string[] | null {
+  const first = l.items.find((c) => c.state === "open");
+  return first ? listArgs("--state=open", `--after=${first.id - 1}`) : null;
+}
+/** One connection read again (to learn how it closed). */
+export const recheckArgs = (id: number) => ["ws", "list", `--after=${id - 1}`, `--before=${id + 1}`, "--limit", "1"];
+
+/** The list with `page` (`newestArgs`) as its first page. */
+export const withNewest = (page: WsConnection[]): ConnList => ({ items: [...page], more: page.length >= CONN_PAGE, loaded: true });
+
+/** The list with connections newer than its newest added (`newerArgs`); a repeat is kept once. */
+export function withNewer(l: ConnList, page: WsConnection[]): ConnList {
+  const last = lastId(l);
+  const add = page.filter((c) => c.id > last);
+  return add.length ? { ...l, items: [...l.items, ...add] } : l;
+}
+
+/** The list with an older page (`olderArgs`) put before it. */
+export function withOlder(l: ConnList, page: WsConnection[]): ConnList {
+  const first = l.items[0]?.id ?? Infinity;
+  const add = page.filter((c) => c.id < first);
+  return { ...l, items: [...add, ...l.items], more: page.length >= CONN_PAGE };
+}
+
+/** The list with these connections' new state put in place (by id); others are left alone. */
+export function withUpdated(l: ConnList, fresh: WsConnection[]): ConnList {
+  if (!fresh.length) return l;
+  const by = new Map(fresh.map((c) => [c.id, c]));
+  let changed = false;
+  const items = l.items.map((c) => {
+    const f = by.get(c.id);
+    if (!f || JSON.stringify(f) === JSON.stringify(c)) return c;
+    changed = true;
+    return f;
+  });
+  return changed ? { ...l, items } : l;
+}
+
+/**
+ * The ids an `openArgs` answer says closed: shown open but not in it, to read again with
+ * `recheckArgs` (the oldest RECHECK_MAX of them). A full answer covers ids up to its last one
+ * only: ones past it are left for a later poll.
+ */
+export function closedSince(l: ConnList, open: WsConnection[]): number[] {
+  const still = new Set(open.map((c) => c.id));
+  const upTo = open.length >= CONN_PAGE ? open[open.length - 1].id : Infinity;
+  return l.items
+    .filter((c) => c.state === "open" && c.id <= upTo && !still.has(c.id))
+    .map((c) => c.id)
+    .slice(0, RECHECK_MAX);
+}

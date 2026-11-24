@@ -14,7 +14,20 @@ import { optionsProblem } from "./replayOptions";
 import { OptionsRow, OptionsToggle, useSendOptions } from "./SendOptions";
 import {
   arrow,
+  closedSince,
   connectionMessages,
+  newerArgs,
+  newestArgs,
+  NO_CONNS,
+  olderArgs,
+  openArgs,
+  recheckArgs,
+  withNewer,
+  withNewest,
+  withOlder,
+  withUpdated,
+  CONN_PAGE,
+  type ConnList,
   HANDOFF_MAX,
   joinMessages,
   messagesSummary,
@@ -73,9 +86,54 @@ async function replayHandoff(c: WsConnection, messages: WsOut[]): Promise<Omit<R
   return { raw: h.raw, target: wsOrigin(c.url), ws: messages, title: `WS ${pathOf(c.url.replace(/^ws/, "http")).slice(0, 20)}` };
 }
 
+type Conns = { items: WsConnection[] };
+
 export function WebSockets({ active }: { active: boolean }) {
   const app = useApp();
-  const [conns] = usePoll<{ items: WsConnection[] }>(() => run(["ws", "list", "--newest", "--limit", "5000"]), 2000, active);
+  // The newest page, then what each poll adds and changes; older pages as the list is scrolled
+  // to its end. Every change goes through `apply`, so the poll and a page load don't race.
+  const [conns, setConns] = useState<ConnList>(NO_CONNS);
+  const connsRef = useRef(conns);
+  const apply = (f: (l: ConnList) => ConnList) => {
+    connsRef.current = f(connsRef.current);
+    setConns(connsRef.current);
+  };
+  usePoll(
+    async () => {
+      if (!connsRef.current.loaded) {
+        const d = await run<Conns>(newestArgs());
+        return apply(() => withNewest(d.items));
+      }
+      for (;;) {
+        const d = await run<Conns>(newerArgs(connsRef.current));
+        apply((l) => withNewer(l, d.items));
+        if (d.items.length < CONN_PAGE) break;
+      }
+      const open = openArgs(connsRef.current);
+      if (!open) return;
+      const d = await run<Conns>(open);
+      const closed = closedSince(connsRef.current, d.items);
+      apply((l) => withUpdated(l, d.items));
+      for (const id of closed) {
+        const r = await run<Conns>(recheckArgs(id));
+        apply((l) => withUpdated(l, r.items));
+      }
+    },
+    2000,
+    active,
+  );
+  const loadingOlder = useRef(false);
+  const loadOlder = () => {
+    const args = olderArgs(connsRef.current);
+    if (!args || loadingOlder.current) return;
+    loadingOlder.current = true;
+    run<Conns>(args)
+      .then((d) => apply((l) => withOlder(l, d.items)))
+      .catch((e) => app.toast(e.message, "error"))
+      .finally(() => {
+        loadingOlder.current = false;
+      });
+  };
   const [selected, setSelected] = useState<number | null>(null);
   const [messages, setMessages] = useState<WsMessage[]>([]);
   const [current, setCurrent] = useState<number | null>(null);
@@ -85,7 +143,7 @@ export function WebSockets({ active }: { active: boolean }) {
   const selectedRef = useRef<number | null>(null);
   selectedRef.current = selected;
   const { menu, open, close } = useMenu();
-  const conn = conns?.items.find((c) => c.id === selected) ?? null;
+  const conn = conns.items.find((c) => c.id === selected) ?? null;
 
   useEffect(() => {
     setMessages([]);
@@ -166,14 +224,20 @@ export function WebSockets({ active }: { active: boolean }) {
       },
     ]);
 
-  const items = conns?.items ?? [];
+  const items = conns.items;
   return (
     <div className="col fill">
       <div className="toolbar">
         <span className="muted">
-          {items.length} connection{items.length === 1 ? "" : "s"}
+          {items.length.toLocaleString("en-US")} connection{items.length === 1 ? "" : "s"}
+          {conns.more ? " (older ones load at the end of the list)" : ""}
           {conn ? ` · #${conn.id} ${conn.url}${conn.extensions ? ` · ${conn.extensions}` : ""}` : ""}
         </span>
+        {conns.more && (
+          <button className="btn small" onClick={loadOlder}>
+            Load older
+          </button>
+        )}
         <span className="grow" />
         <span className="muted">Hold messages with Intercept (WebSocket boxes).</span>
       </div>
@@ -185,6 +249,7 @@ export function WebSockets({ active }: { active: boolean }) {
           selected={selected}
           onSelect={(r) => setSelected(r.id)}
           onContextMenu={connMenu}
+          onEndReached={loadOlder}
           initialSort={{ key: "id", desc: true }}
           empty="No WebSocket connections yet. They appear here when a browser using the proxy opens one."
         />
