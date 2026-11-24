@@ -22,6 +22,15 @@ pub enum FuzzCmd {
         everywhere), pitchfork (1 set per position, in step), cluster-bomb (1 set per position, every combination).\n\
         Payload sources (-p, one per set, in position order): list:a,b,c | file:PATH | file:- | range:1-100[:step] | \
         wordlist:NAME (built-in: sqli, xss, path-traversal, content-discovery, ...; see `wordlists list`).\n\
+        Generated: null:N (empty) | dates:FROM..TO[:STEP][:FORMAT] (e.g. dates:2024-01-01..2024-12-31:1d:%Y%m%d) | \
+        brute:CHARSET:MIN-MAX (e.g. brute:a-z0-9:1-4; at most 10,000,000, made as sent) | case:WORD | \
+        subst:WORD[:MAP] (default a=4@,e=3,i=1!,o=0,s=5$) | bitflip[:VALUE] (default: the position's value) | \
+        usernames:list:John Smith,Ann Lee | usernames:file:PATH.\n\
+        copy:N is position N's value in the same request (pitchfork, cluster-bomb). extract[:FIRST] is recursive \
+        grep: each request gets what --extract captured from the previous response (needs --extract; one request at \
+        a time; ends with outcome extract-ended when nothing is captured; extract sets alone need --max-requests).\n\
+        oob:N[:host|url] makes N OOB payloads tied to the run (needs `oob start`). script:FILE takes the payloads \
+        that file's payloads(ctx) returns (ctx.set, ctx.position, ctx.default, ctx.page); not offered through MCP.\n\
         Processing (--process, applied left to right): url, url-all, base64, base64url, hex, html, gzip, zlib, \
         deflate, md5, sha1, sha256, sha512, upper, lower, prefix:TEXT, suffix:TEXT, script:FILE. Prefix with N= to apply to set N only (e.g. 2=base64).\n\
         script:FILE passes each payload through that JavaScript file's process(payload, ctx) (ctx.set, ctx.index, and \
@@ -29,7 +38,8 @@ pub enum FuzzCmd {
         keep it. This runs code from that file, with no file or network access; a payload it fails on stops the run \
         before it starts. Not offered through MCP.\n\
         Results: the summary lists the baseline response shape, outliers (rare status+word-count shapes), and \
-        matches. All results are in the fuzz_results table.")]
+        matches. All results are in the fuzz_results table. `fuzz pause` and `fuzz resume` hold a run and let it \
+        go on; `fuzz resume` also relaunches a stopped or failed run, sending what it has no results for.")]
     Run(Box<RunArgs>),
     /// Progress and triage summary of a run (baseline, outliers, matches, errors).
     Status {

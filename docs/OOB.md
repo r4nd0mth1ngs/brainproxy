@@ -14,6 +14,7 @@ brainproxy oob status | stop
 brainproxy oob payload [--note TEXT] [--count N]      # payloads for manual testing
 brainproxy oob poll [--token T] [--since ID] [--wait SECS] [--limit N]
 brainproxy scan active ... [--oob-wait SECS] [--no-oob]
+brainproxy fuzz run ... -p oob:N[:host|url]           # N tokens as a fuzz payload set
 ```
 
 - **Listener** (`crates/core/src/oob/server.rs`) runs in one background process per
@@ -48,7 +49,7 @@ brainproxy scan active ... [--oob-wait SECS] [--no-oob]
   request. The listener extracts the first `bp[a-z2-7]{18}` it sees in the lowercased
   bytes (Host, path, DNS name, SNI, LDAP DN), preferring one that is registered.
 - **Storage** (schema v8, `check_json` added in v9): `oob_payloads` (one row per token:
-  source `scan`/`manual`, rule id, alert ref, param, attack, origin, the attack
+  source `scan`/`manual`/`fuzz`, rule id, alert ref, param, attack, origin, the attack
   request/response, note, history_id once a finding was recorded, and for declarative
   checks `check_json`: the alert and the interactsh matchers an interaction must pass) and `oob_interactions` (protocol, remote
   address, token, summary line, raw bytes, `processed`). Both are visible to `query`.
@@ -60,6 +61,13 @@ brainproxy scan active ... [--oob-wait SECS] [--no-oob]
   scan payload into a finding (evidence: the interaction summary; other info: ZAP's
   "Received ... Request: ..." text) backed by the attack exchange recorded in history.
   Late callbacks are raised by any later `oob poll` (or the next scan).
+- **Fuzz payloads**: `fuzz run -p oob:N` (`:host` for the payload's host, its URL by default)
+  makes N fresh tokens for the listener this project runs (refused when none does), for the
+  target as `oob payload --target` would. The process that sends them registers each with
+  source `fuzz`, the target's origin, and the note `fuzz run R, set S payload K`, so `oob poll`
+  says which run and payload called back (the request is the fuzz result with that payload).
+  No finding is raised: a fuzz run doesn't know what a callback means. A run with an `oob:` set
+  isn't relaunched by `fuzz resume`. Through MCP the source is allowed.
 - **Security boundary**: the listener never opens outbound connections and the DNS server
   only answers with our own address. Rules' attack requests still go through `Cx::send*`,
   i.e. the guarded `Client`. The OOB host is never contacted by brainproxy itself.

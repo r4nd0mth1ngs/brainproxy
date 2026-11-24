@@ -143,7 +143,7 @@ set, and a person changes anything.
   `title`) from a table keyed by command path in `mcp.rs` (`HINTS`). Read-only and local:
   `query`, `schema`, `capabilities`, `history_*` reads, `findings_list`/`show`, `job_wait`,
   `ws_list`/`show`/`messages`, `sse_list`/`show`/`events`/`event`, ... Open world and destructive (requests can change state on the target): `send`,
-  `fuzz_run`, `scan_active`, `crawl`, `import_*`, `auth_login`, `intercept_forward`, `ws_send`,
+  `fuzz_run`, `fuzz_resume` (a stopped run relaunched sends again), `scan_active`, `crawl`, `import_*`, `auth_login`, `intercept_forward`, `ws_send`,
   `findings_retest`, `findings_verify`.
   Destructive locally: `engagement_start` (write-once), `*_stop`, `proxy_restart` (its `wait` is at
   most 60 s, well inside the call timeout; a restart killed by the timeout or a cancel still
@@ -175,7 +175,9 @@ Some arguments need a person, so a command run for a tool call (the server sets
 - Anything that names a hook script to run (MANUAL.md, "Scripts"): `rules_add`, `rules_edit` and
   `rules_test` with `script`, `rules_import` of a rule that has one, `rules_enable` of one that is
   disabled, `rules_edit` of a script rule's workings (its comment alone can change),
-  `fuzz_run` with a `script:FILE` step in `process` (refused before the file is looked at), and
+  `fuzz_run` with a `script:FILE` step in `process` or a `script:FILE` source in `payloads`
+  (refused before the file is looked at), `fuzz_resume` of a stopped run whose `process` has a
+  script step, and
   `scan_enable` of a script check (`script:NAME`) that is off. `scan script add`, `scan script
   test` and `scan script remove` are not tools at all. A script is code, so a person reads it
   and names it. What a person set still applies to an agent's requests, and `rules_list`,
@@ -260,7 +262,7 @@ Some arguments need a person, so a command run for a tool call (the server sets
   the resolved file is what is read), for `import_api`, `import_har`, `import_openapi`,
   `import_postman`, `import_graphql`'s `schema`, `scan_active`'s `api`, or any `environment`,
   whose text could reach the agent through the preview or an error; and for `send`'s and
-  `fuzz_run`'s `file`, `fuzz_run`'s `file:PATH` `payloads`, `ws_send`'s `file`, `poc_csrf`'s `file`,
+  `fuzz_run`'s `file`, `fuzz_run`'s `file:PATH` and `usernames:file:PATH` `payloads`, `ws_send`'s `file`, `poc_csrf`'s `file`,
   `auth_macro_add`'s `steps` files (also `ORIGIN=FILE`), `auth_add`'s `login_request`,
   `intercept_forward`'s `file`, `findings_compare`'s `baseline` and `current`, and a template
   file for `checks_validate`, `checks_list` or `scan_active`'s `checks`, whose bytes are sent to

@@ -717,6 +717,13 @@ attack type, and pick payloads:
   - **List:** type your own payloads.
   - **Numbers:** a range.
   - **File:** a wordlist on disk.
+  - **Generator:** payloads made for you (see [Payload sources](#payload-sources) for each):
+    brute force over a character set, dates, null (empty) payloads, case and character
+    substitution of a word, bit flips, usernames from full names, a copy of another position,
+    *Extract* (recursive grep: what the Extract regex captured from the previous response),
+    and *OOB tokens*, offered while the OOB listener runs. Copy is offered in Pitchfork and
+    Cluster bomb, Extract in every mode but Cluster bomb. A run with an Extract set sends one
+    request at a time.
   - **Processing:** each set can be encoded, compressed (gzip, zlib, deflate), hashed, or
     prefixed, or passed through a script of yours (`script:` and the file's full path as a
     step; see [Scripts](#scripts)).
@@ -727,8 +734,53 @@ attack type, and pick payloads:
   (`fuzz run --http2`, `--http3`; see [HTTP/3](#http3---http3)).
 - **Results:** show live, with the baseline response and *outliers* (unusual status or size)
   highlighted.
+- **Pause, resume, stop:** the results header and the Runs list pause a running attack
+  (requests in flight finish, no new ones start) and resume it. *Resume from here* relaunches a
+  stopped or failed run in the background and sends only the requests it has no results for.
 - **Discover content:** sets up `GET /§path§` with the content-discovery list to find
   files and folders such as `.git`, `.env`, backups, admin panels, and debug consoles.
+
+#### Payload sources
+`fuzz run -p SOURCE`, one per payload set in position order:
+
+| Source | Payloads |
+| --- | --- |
+| `list:a,b,c` | The items; `\,` for a comma in one |
+| `file:PATH`, `file:-` | One per line of the file, or of stdin |
+| `range:FROM-TO[:STEP]` | Numbers, zero padding kept (`001-100`); at most 10,000,000 |
+| `wordlist:NAME` | A built-in list (`wordlists list`) |
+| `null:N` | N empty payloads: the request sent N times as it is |
+| `dates:FROM..TO[:STEP][:FORMAT]` | Dates `YYYY-MM-DD` from FROM to TO (backwards when TO is earlier); STEP `Nd`, `Nw`, `Nm` or `Ny` (1d by default; a month on from the 31st is the month's last day); FORMAT with `%Y %y %m %d %e %j %b %B %a %A %%` (`%Y-%m-%d` by default), e.g. `dates:2024-01-01..2024-12-31:1d:%Y%m%d` |
+| `brute:CHARSET:MIN-MAX` | Every string over CHARSET from length MIN to MAX, shortest first: `brute:a-z0-9:1-4`. Ranges like `a-z`; `\` escapes a character; a `-` first or last is itself. At most 10,000,000, made as they are sent |
+| `case:WORD` | Every upper and lower case combination of WORD's letters (at most 20), WORD first |
+| `subst:WORD[:MAP]` | Every way of substituting characters, WORD first. The default map is `a=4@,e=3,i=1!,o=0,s=5$`; at most 1,000,000 |
+| `bitflip[:VALUE]` | One payload per bit of VALUE with that bit flipped; without VALUE, the position's value (a single position, or pitchfork and cluster-bomb) |
+| `usernames:list:NAMES`, `usernames:file:PATH` | From full names (`John Smith`): jsmith, john.smith, john_smith, johns, smithj, j.smith, john, smith, johnsmith, smith.john; a one-word name is itself |
+| `copy:N` | Position N's value in the same request (pitchfork or cluster-bomb); it adds no payloads, and processing passes it by |
+| `extract[:FIRST]` | Recursive grep: each request gets what `--extract` captured from the previous response, the first gets FIRST (the position's value by default). Needs `--extract`; not in cluster-bomb, nor sniper with more than one position |
+| `oob:N[:host\|url]` | N fresh OOB payloads (their URL, or `:host`), each registered with source `fuzz` and the note `fuzz run R, set S payload K`; needs `oob start` |
+| `script:FILE` | What FILE's `payloads(ctx)` returns (see [Scripts](#scripts)); not through MCP |
+
+A run with an `extract:` set sends one request at a time (its `config` records `"concurrency": 1`
+and a note saying why). It ends with outcome `extract-ended` when a response gives `--extract`
+nothing to capture (or a request fails), and a run of extract sets alone needs
+`--max-requests`. Every request goes through the same checks as any fuzz request, so an
+extracted value that makes a Host header is refused through MCP as it goes out.
+
+Built-in `--process` steps apply to a brute force, bit flip or null set as each payload is made;
+a script step is handed the whole set, so it takes one of at most 1,000,000.
+
+#### Pausing and resuming
+- `fuzz pause RUN` holds a running run (state `paused`): requests in flight finish and no new
+  ones start. `fuzz resume RUN` lets it go on; `fuzz stop RUN` stops it, paused or not.
+- `fuzz resume RUN` on a `stopped` or `failed` run relaunches it in the background from its
+  stored settings and template, sending only the indexes it has no results for, so the run ends
+  with each index once. It prints `{"run", "state", "resumed_from", "remaining", "log"}`.
+- A run can't be relaunched when a set came from stdin, is `oob:` (each token belongs to the
+  request that carried it) or `script:` (a script needn't make the same set twice), or when a
+  payload file's sha256 differs from the one its `config` recorded as `payload_sha256` (its
+  indexes would be other payloads). Runs started before brainproxy recorded what a resume needs
+  can't be relaunched either. A run whose `--process` script changed is refused when it restarts.
 
 ### Scans
 - **Guided API scan:** in the guided scan, *Testing an API?* tests an API from its definition: an
@@ -1312,7 +1364,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 204 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 206 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -1355,6 +1407,11 @@ brainproxy scan active https://app.acme.test/api/ --crawl --policy api --backgro
 brainproxy job wait 1
 
 brainproxy fuzz run --url 'https://app.acme.test/search?q=§x§' -p wordlist:sqli --grep 'SQL syntax'
+brainproxy fuzz run --url 'https://app.acme.test/reset?code=§0000§' -p brute:0-9:4 --background
+brainproxy fuzz run --url 'https://app.acme.test/step?t=§start§' -p extract --extract 'next=(\w+)' \
+    --max-requests 50                         # recursive grep: each response's token goes in the next request
+brainproxy fuzz pause 3; brainproxy fuzz resume 3   # hold a run, then let it go on
+brainproxy fuzz resume 4                       # a stopped run sends what it hadn't yet
 brainproxy wordlists list
 
 brainproxy ws list                                        # WebSocket connections seen by the proxy
@@ -1707,9 +1764,9 @@ brainproxy rules presets add remove-cookie-httponly
 
 ### Scripts
 
-Where text isn't enough, four places take a JavaScript file of yours: a match-and-replace
+Where text isn't enough, five places take a JavaScript file of yours: a match-and-replace
 rule whose replacement is computed, a request rule that may block a request or answer it
-itself, a fuzz payload processor, and a passive check. A script is handed data and returns
+itself, a fuzz payload processor, a fuzz payload set, and a passive check. A script is handed data and returns
 data. It can't send anything, open a file or read the environment, and whatever it is handed
 is read-only.
 
@@ -1867,6 +1924,15 @@ the payload to send: a string, `{ base64 }`, or `null` to keep it. Steps run lef
 returns; `2=script:sign.js` processes only set 2; a comma in the path is written `\,`. The
 run's `config` in `fuzz_runs` records the file and its sha256 as `process_scripts`.
 
+**A fuzz payload set** (`fuzz run -p script:FILE`): the file defines `payloads(ctx)`, called
+before the run starts. `ctx.set` is the set's number; `ctx.position` (from 1) and `ctx.default`
+(that position's value in the template, with `ctx.default_base64` when it isn't text) are given
+when the set is for one position, and are null otherwise. It returns an array of payloads, each
+a string or `{ base64 }`. For more than one call's time limit or output allows, it returns
+`{ payloads: [...], more: true }` and is called again with `ctx.page` one higher, until it
+returns an array or `more` isn't true. A set may have at most 1,000,000 payloads and 64 MiB.
+The run's `config` records the file and its sha256 as `payload_scripts`.
+
 **A passive check** (`scan script add NAME FILE`): the file defines `check(exchange)`, called
 for each exchange the passive scanner reads, after the built-in rules.
 
@@ -1950,7 +2016,7 @@ How a script is kept and run:
   (the rule, why, when, which engine) and the app shows it on the rule's row, until the rule
   is switched off or on, or removed.
 - **A person's.** Through MCP no script is named: `rules add --script` (a request rule's too), `rules test --script`, an
-  import or `rules enable` of a script rule, `fuzz run --process script:`, `scan enable` of a
+  import or `rules enable` of a script rule, `fuzz run --process script:` or `-p script:`, `scan enable` of a
   script check, and `scan script add`, `test` and `remove` are refused or not offered. An
   agent's requests still go through the script rules a person set, as they go through a
   signer's script, and it can list them, try a saved rule that is switched on with `rules test
@@ -3750,7 +3816,7 @@ it can clear the flag that way; the change is still logged. A request whose Host
 host the scope doesn't list is refused without `host_header_test` (see
 [Concepts](#concepts)). `browser open` isn't offered (the
 project's browser profile keeps the person's sign-ins), nor is naming a script to run (a rule's
-`--script`, `fuzz run --process script:`, `scan script add`; see [Scripts](#scripts)), and
+`--script`, `fuzz run --process script:` or `-p script:`, `scan script add`; see [Scripts](#scripts)), and
 other options that need a person are refused too; docs/MCP.md lists them. A local file a tool
 call names (a request for `send`, `fuzz run` or `ws send`, a `file:` payload list, a macro step,
 a login request, an intercept edit, a document to import, a report to compare, a template) is
