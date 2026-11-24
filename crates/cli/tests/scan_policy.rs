@@ -9,23 +9,55 @@ use std::process::{Command, Stdio};
 use brainproxy_core::store::Store;
 use serde_json::{json, Value};
 
-/// Serves a `.env` file (active rule 40034, medium confidence) and a plain page otherwise.
+/// Serves a `.env` file (active rule 40034, medium confidence), takes uploads at `/upload` and
+/// serves them back as HTML under `/uploads/` (active rule 40041), and a plain page otherwise.
 fn serve() -> u16 {
+    let files = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<String, String>::new()));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let mut s = stream.unwrap();
+            let files = files.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 let mut req = Vec::new();
-                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                loop {
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let len = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string())
+                            })
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if body.len() >= len {
+                            break;
+                        }
+                    }
                     match s.read(&mut buf) {
                         Ok(0) | Err(_) => return,
                         Ok(k) => req.extend_from_slice(&buf[..k]),
                     }
                 }
-                let resp = if req.starts_with(b"GET /.env ") {
+                let text = String::from_utf8_lossy(&req).into_owned();
+                let page = |ct: &str, body: &str| {
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                };
+                let resp = if text.starts_with("POST /upload ") {
+                    let file = text.split("filename=\"").nth(1).unwrap_or_default();
+                    let name = file.split('"').next().unwrap_or_default().to_string();
+                    let content =
+                        file.split("\r\n\r\n").nth(1).and_then(|c| c.split("\r\n--").next()).unwrap_or_default();
+                    files.lock().unwrap().insert(name.clone(), content.to_string());
+                    page("text/html", &format!("Saved: <a href=\"/uploads/{name}\">file</a>"))
+                } else if let Some(name) = text.strip_prefix("GET /uploads/").and_then(|r| r.split(' ').next()) {
+                    match files.lock().unwrap().get(name) {
+                        Some(content) => page("text/html", content),
+                        None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                    }
+                } else if req.starts_with(b"GET /.env ") {
                     let body = "DB_PASSWORD=hunter2\n";
                     format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
                 } else {
@@ -105,12 +137,13 @@ fn policies_are_saved_shown_listed_and_removed() {
         ],
     );
     assert_eq!((saved["strength"].as_str(), saved["threshold"].as_str()), (Some("high"), Some("medium")), "{saved}");
-    assert_eq!(saved["rules_disabled"], 2);
+    // Its two and the opt-in rules, which it doesn't turn on.
+    assert_eq!(saved["rules_disabled"], 4);
     assert_eq!(saved["rules"]["40018"], json!({"strength": "insane", "threshold": "high"}));
 
     let shown = ok(&p, &["scan", "policy", "show", "api"]);
     let table = shown["rule_table"].as_array().unwrap();
-    assert_eq!(table.len(), 59);
+    assert_eq!(table.len(), 63);
     let rule = |id: u64| table.iter().find(|r| r["id"] == id).unwrap().clone();
     assert_eq!(
         rule(40018),
@@ -121,7 +154,7 @@ fn policies_are_saved_shown_listed_and_removed() {
 
     // From another, changing only what's given; from JSON on stdin.
     let copy = ok(&p, &["scan", "policy", "save", "api2", "--from", "api", "--enable", "40012", "--reset", "40018"]);
-    assert_eq!((copy["rules_disabled"].as_u64(), copy["rules"].get("40018")), (Some(1), None), "{copy}");
+    assert_eq!((copy["rules_disabled"].as_u64(), copy["rules"].get("40018")), (Some(3), None), "{copy}");
     let (code, v) = run_with(
         &p,
         &["scan", "policy", "save", "only-env", "--json", "-"],
@@ -238,4 +271,52 @@ fn compare_reads_what_a_policy_scan_ran() {
     let d = ok(&p, &["findings", "compare", "--scan", &unknown.to_string()]);
     assert_eq!(d["baseline"]["scope"]["ported_rules"], false, "{d}");
     assert!(d["warnings"][0].as_str().unwrap().contains("policy"), "{d}");
+}
+
+/// An opt-in rule runs only when asked for: a policy that doesn't turn it on leaves it out (and
+/// doesn't list it as skipped); a policy that enables it runs it.
+#[test]
+fn a_policy_turns_an_opt_in_rule_on() {
+    let port = serve();
+    let p = project("opt-in");
+    let rules = ok(&p, &["scan", "rules", "--active"]);
+    let mut opt_in: Vec<u64> = rules["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["opt_in"] == true)
+        .map(|r| r["id"].as_u64().unwrap())
+        .collect();
+    opt_in.sort_unstable();
+    assert_eq!(opt_in, [40023, 40041]);
+
+    let body = "--b\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"cat.png\"\r\nContent-Type: image/png\r\n\r\nPNG\r\n--b--\r\n";
+    let req = format!(
+        "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\n\r\nSaved";
+    let target = brainproxy_core::http::Target::from_url(&format!("http://127.0.0.1:{port}/")).unwrap();
+    let capture = brainproxy_core::capture::Capture::new("proxy", &target, req.as_bytes(), Some(resp), Some(1), None);
+    let id = Store::open(&p).unwrap().record(&capture).unwrap().to_string();
+
+    // A policy that leaves it unlisted keeps it off, and it isn't listed as skipped.
+    ok(&p, &["scan", "policy", "save", "env-only", "--others", "off", "--enable", "40034"]);
+    let d = ok(&p, &["scan", "active", "--history-id", &id, "--policy", "env-only", "--no-oob"]);
+    assert_eq!(d["policy"]["rules"], json!([40034]), "{d}");
+    assert!(d.get("skipped").is_none(), "{d}");
+    ok(&p, &["scan", "policy", "save", "everything"]);
+    let shown = ok(&p, &["scan", "policy", "show", "everything"]);
+    let row = |v: &Value, id: u64| v["rule_table"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap().clone();
+    assert_eq!(row(&shown, 40041)["enabled"], false);
+
+    // Turned on by name in a policy, it runs.
+    ok(&p, &["scan", "policy", "save", "upload", "--others", "off", "--enable", "40041"]);
+    let d = ok(&p, &["scan", "active", "--history-id", &id, "--policy", "upload", "--no-oob"]);
+    assert_eq!(d["policy"]["rules"], json!([40041]), "{d}");
+    assert_eq!((d["raised"]["40041-1"].as_u64(), d["raised"]["40041-2"].as_u64()), (Some(1), Some(1)), "{d}");
+    // With every other rule on as well, the policy still names it.
+    ok(&p, &["scan", "policy", "save", "all-and-upload", "--enable", "40041"]);
+    let shown = ok(&p, &["scan", "policy", "show", "all-and-upload"]);
+    assert_eq!(row(&shown, 40041)["enabled"], true);
 }

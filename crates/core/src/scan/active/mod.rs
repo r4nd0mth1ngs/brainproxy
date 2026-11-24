@@ -89,6 +89,18 @@ pub trait ActiveRule: Send + Sync {
     fn tests_host_header(&self) -> bool {
         false
     }
+    /// Whether the rule is off unless asked for: it runs only when named (`--rules`) or turned
+    /// on in a scan policy, never with the default selection. For rules whose requests leave
+    /// something behind (an uploaded file) or can harm an account (failed logins).
+    fn opt_in(&self) -> bool {
+        false
+    }
+    /// Whether the rule sends the `--auth` profile's login request itself (see
+    /// [`crate::auth::AuthProfile::has_login_request`]). Without such a profile it is left out
+    /// and listed in [`ActiveSummary::skipped`].
+    fn needs_login(&self) -> bool {
+        false
+    }
     /// Start order, lowest first: units that may run long start early, so the
     /// scan doesn't end waiting on one of them.
     fn order(&self) -> u8 {
@@ -441,7 +453,7 @@ impl Cx {
     /// say) even when the scan sends over HTTP/3. A request line saying HTTP/3 says HTTP/1.1.
     pub async fn send_tcp(&self, request: Vec<u8>) -> Result<Response> {
         let target = self.base.target.clone();
-        self.send_via(&target, request, true, &Keep::default()).await
+        self.send_via(&target, request, true, Some(&Keep::default())).await
     }
 
     /// Sends a raw request to another target (e.g. the same host over http).
@@ -449,7 +461,7 @@ impl Cx {
     /// A 429, or a 503 with Retry-After, pauses every request to that origin for
     /// the time asked (5 s without one, at most 60 s); the request is then sent once more.
     pub async fn send_to(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
-        self.send_via(target, request, false, &Keep::default()).await
+        self.send_via(target, request, false, Some(&Keep::default())).await
     }
 
     /// [`Cx::send`], with the logged-in session (`--auth`) leaving what `keep` names as the
@@ -458,11 +470,24 @@ impl Cx {
     /// is kept as always.
     pub async fn send_keeping(&self, request: Vec<u8>, keep: &Keep) -> Result<Response> {
         let target = self.base.target.clone();
-        self.send_via(&target, request, false, keep).await
+        self.send_via(&target, request, false, Some(keep)).await
     }
 
-    /// [`Cx::send_to`]; with `tcp`, over TCP only (see [`Cx::send_tcp`]).
-    async fn send_via(&self, target: &Target, request: Vec<u8>, tcp: bool, keep: &Keep) -> Result<Response> {
+    /// Sends a request to `target` (still in scope) without the logged-in session: no cookies,
+    /// headers or re-login from `--auth`. For a rule that plays a visitor who isn't logged in,
+    /// or sends the login request itself.
+    pub async fn send_anonymous_to(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
+        self.send_via(target, request, false, None).await
+    }
+
+    /// The `--auth` session, for a rule that reads its profile ([`ActiveRule::needs_login`]).
+    pub fn auth(&self) -> Option<&AuthSession> {
+        self.shared.auth.as_deref()
+    }
+
+    /// [`Cx::send_to`]; with `tcp`, over TCP only (see [`Cx::send_tcp`]); with no `keep`,
+    /// without the session.
+    async fn send_via(&self, target: &Target, request: Vec<u8>, tcp: bool, keep: Option<&Keep>) -> Result<Response> {
         let origin = target.origin();
         let mut retried = false;
         loop {
@@ -483,7 +508,13 @@ impl Cx {
         }
     }
 
-    async fn send_to_once(&self, target: &Target, request: Vec<u8>, tcp: bool, keep: &Keep) -> Result<Response> {
+    async fn send_to_once(
+        &self,
+        target: &Target,
+        request: Vec<u8>,
+        tcp: bool,
+        keep: Option<&Keep>,
+    ) -> Result<Response> {
         self.rate_turn().await?;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
         // Match-and-replace rules that list scans see the request as the scan rule made it; the
@@ -497,7 +528,7 @@ impl Cx {
         // A request rule's script that blocked or answered it: nothing is sent, so no session
         // is applied either (a re-login would send).
         let stopped = ruled.as_ref().is_some_and(|r| r.stopped.is_some());
-        let Some(auth) = self.shared.auth.as_ref().filter(|_| !stopped) else {
+        let (Some(auth), Some(keep)) = (self.shared.auth.as_ref().filter(|_| !stopped), keep) else {
             return self.client_send(request.clone(), target, &given, ruled.as_ref(), tcp).await;
         };
         // The attacked cookie or parameter keeps its payload.
@@ -512,6 +543,9 @@ impl Cx {
         header.extend(keep.headers.iter().map(String::as_str));
         let prepared = auth.prepare_keeping(self.tool, target, request, &cookie, &param, &header).await;
         let mut resp = self.client_send(prepared.request.clone(), target, &given, ruled.as_ref(), tcp).await?;
+        if keep.unobserved {
+            return Ok(resp);
+        }
         if auth.after_response(&prepared, resp.received()).await {
             let again = auth.prepare_keeping(self.tool, target, request, &cookie, &param, &header).await;
             resp = self.client_send(again.request, target, &given, ruled.as_ref(), tcp).await?;
@@ -1028,7 +1062,9 @@ pub struct ActiveSummary {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub refused_hosts: Vec<String>,
     /// Rules selected but not run, and why (a Host-header test through MCP without
-    /// `--host-header-test`; see [`ActiveRule::tests_host_header`]).
+    /// `--host-header-test`, see [`ActiveRule::tests_host_header`]; a rule that logs in without
+    /// a usable `--auth`, see [`ActiveRule::needs_login`]). An opt-in rule left out of a scan
+    /// that didn't ask for it isn't listed: it wasn't selected.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedRule>,
     /// What there is to say about HTTP/3 asked for (`--http3`): why it wasn't used for an
@@ -1065,14 +1101,19 @@ impl Drop for Finished<'_> {
     }
 }
 
-/// The ported rules a scan runs for `rules` (None: all) less `exclude`: the rules the selected
+/// The ported rules a scan runs for `rules` (None: all but the opt-in ones, see
+/// [`ActiveRule::opt_in`]) less `exclude`: the rules the selected
 /// ones depend on are pulled in unless excluded, and a rule missing one (excluded, or itself
 /// dropped for that reason) is dropped.
 pub fn select_rules(rules: Option<&[u32]>, exclude: &[u32]) -> Vec<&'static dyn ActiveRule> {
     let mut selected: Vec<&'static dyn ActiveRule> = all_rules()
         .iter()
         .map(|r| r.as_ref())
-        .filter(|r| rules.is_none_or(|ids| ids.contains(&r.id())) && !exclude.contains(&r.id()))
+        .filter(|r| match rules {
+            Some(ids) => ids.contains(&r.id()),
+            None => !r.opt_in(),
+        })
+        .filter(|r| !exclude.contains(&r.id()))
         .collect();
     loop {
         let ids: HashSet<u32> = selected.iter().map(|r| r.id()).collect();
@@ -1140,6 +1181,21 @@ pub async fn run(
             keep
         });
     }
+    // A rule that sends the login itself needs a profile whose login it can build.
+    let login = cfg.auth.as_ref().map(|a| a.profile.has_login_request());
+    rules.retain(|&r| {
+        let reason = match login {
+            _ if is_check(r) || !r.needs_login() => return true,
+            None => "it needs --auth with a login",
+            Some(false) => {
+                "it needs --auth with a login request it can send itself: a login URL and a username, not a \
+                 browser, OAuth or one-time-code login"
+            }
+            Some(true) => return true,
+        };
+        skipped.push(SkippedRule { rule: r.id(), reason: reason.into() });
+        false
+    });
     if rules.is_empty() && skipped.is_empty() {
         return Err(Error::InvalidInput("no active rules or checks selected".into()));
     }
@@ -1649,6 +1705,18 @@ mod tests {
         assert_eq!(selected_rule_ids(Some(&[40014, 40034]), &[40017]), [40034]);
         let all = selected_rule_ids(None, &[40016]);
         assert!(!all.contains(&40017) && !all.contains(&40014) && all.contains(&40012), "{all:?}");
-        assert_eq!(all.len(), all_rules().len() - 3);
+        let opt_in = all_rules().iter().filter(|r| r.opt_in()).count();
+        assert_eq!(all.len(), all_rules().len() - 3 - opt_in);
+    }
+
+    /// Opt-in rules run only when named: nothing named leaves them out, naming them keeps them.
+    #[test]
+    fn opt_in_rules_run_only_when_named() {
+        let all = selected_rule_ids(None, &[]);
+        assert!(!all.contains(&40041) && !all.contains(&40023), "{all:?}");
+        assert!(all.contains(&40013) && all.contains(&90027));
+        assert_eq!(selected_rule_ids(Some(&[40041, 40023]), &[]), [40023, 40041]);
+        let opt_in: Vec<u32> = all_rules().iter().filter(|r| r.opt_in()).map(|r| r.id()).collect();
+        assert_eq!(opt_in.len(), 2, "{opt_in:?}");
     }
 }

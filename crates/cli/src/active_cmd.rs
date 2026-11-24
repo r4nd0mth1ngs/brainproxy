@@ -116,7 +116,9 @@ pub struct ActiveArgs {
     /// --policy's]. With --policy it applies to every rule, those with a threshold of their own too.
     #[arg(long, value_enum)]
     threshold: Option<crate::policy_cmd::ThresholdArg>,
-    /// Only these rule ids (comma-separated); with --policy, these and not the policy's.
+    /// Only these rule ids (comma-separated); with --policy, these and not the policy's. Naming
+    /// an opt-in rule (`scan rules --active`, `opt_in`) here is what turns it on: without --rules
+    /// or a policy that enables it, it doesn't run.
     #[arg(long, value_delimiter = ',')]
     rules: Vec<u32>,
     /// Skip these rule ids (comma-separated); with --policy, as well as those it turns off.

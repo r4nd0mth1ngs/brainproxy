@@ -676,7 +676,7 @@ fn xml_leaf_text(s: &str, start: usize) -> Option<(String, Range<usize>)> {
     s[end..].starts_with("</").then(|| (inner[..close].to_string(), lt..end))
 }
 
-fn xml_encode(s: &str) -> String {
+pub(crate) fn xml_encode(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
 }
 

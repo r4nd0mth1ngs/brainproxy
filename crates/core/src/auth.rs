@@ -175,6 +175,18 @@ impl AuthProfile {
         self.login_url.is_some() || self.oauth.is_some() || self.browser.is_some()
     }
 
+    /// Whether the login is one request, with a username, that a scan rule can build and send
+    /// itself ([`AuthSession::login_request`]): not a browser, OAuth or one-time-code login, and
+    /// no steps after it.
+    pub fn has_login_request(&self) -> bool {
+        self.login_url.is_some()
+            && self.username.is_some()
+            && self.oauth.is_none()
+            && self.browser.is_none()
+            && self.login_steps.is_empty()
+            && !self.login_uses_totp()
+    }
+
     /// The origins the login sends its password and one-time code to: the login request's and
     /// its follow-up steps', and those of the pages a browser login types them on.
     pub(crate) fn login_origins(&self) -> Vec<String> {
@@ -1100,6 +1112,10 @@ pub struct Keep {
     pub cookies: Vec<String>,
     pub params: Vec<String>,
     pub headers: Vec<String>,
+    /// The response teaches the session nothing (no cookies learned) and never has it log in
+    /// again: for a request that leaves a session cookie out on purpose, whose answer may set
+    /// a fresh one or look logged out. Only [`crate::scan::active::Cx::send_keeping`] reads it.
+    pub unobserved: bool,
 }
 
 /// A live session shared by every request of a command run.
@@ -1370,6 +1386,73 @@ impl AuthSession {
 
     /// Whether a response shows the session was lost: 401, a logged-out pattern,
     /// or a redirect to the login page.
+    /// The login request as the profile builds it, for a scan rule that sends it itself
+    /// (session fixation, username enumeration), with the session's cookies left off. With
+    /// `username` None it is the profile's; with `password` None the password goes in as its
+    /// placeholder, which the vault fills in as the request goes out to the login's origin.
+    /// `csrf` is the token `{{csrf}}` stands for. None when the profile has no such login
+    /// ([`AuthProfile::has_login_request`]).
+    pub fn login_request(
+        &self,
+        username: Option<&str>,
+        password: Option<&str>,
+        csrf: &str,
+    ) -> Result<Option<(Target, Vec<u8>)>> {
+        let p = &self.profile;
+        let (Some(login_url), Some(own)) = (&p.login_url, &p.username) else { return Ok(None) };
+        if !p.has_login_request() {
+            return Ok(None);
+        }
+        let username = username.unwrap_or(own);
+        if password.is_none() {
+            let real = p.password.as_ref().map(Secret::resolve).transpose()?.unwrap_or_default();
+            if let Some(g) = &self.client.options().guard {
+                g.vault.put_password(p, &real);
+            }
+        }
+        let pass = |enc: Enc| password.map_or_else(|| placeholder(&p.name, enc.password_kind()), |pw| encode(pw, enc));
+        let target = Target::from_url(login_url)?;
+        let req = match &p.login_request {
+            Some(tpl) => RawRequest::from_bytes(fill_template_with(tpl, username, &pass, csrf).into_bytes())
+                .normalize_line_endings()
+                .update_content_length(),
+            None => {
+                let body = p.login_body.clone().unwrap_or_default();
+                let json = body.trim_start().starts_with('{');
+                let mut headers = p.login_headers.clone();
+                if !body.is_empty() && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+                    let ct = if json { "application/json" } else { "application/x-www-form-urlencoded" };
+                    headers.push(("Content-Type".into(), ct.into()));
+                }
+                let enc = if json { Enc::Json } else { Enc::Form };
+                let body = substitute(&body, username, &pass(enc), csrf, enc);
+                RawRequest::build(&p.login_method, login_url, &headers, body.as_bytes())?.0
+            }
+        };
+        Ok(Some((target, req.into_bytes())))
+    }
+
+    /// The page the login's CSRF token is read from, and the regex (group 1) that finds it.
+    pub fn login_csrf(&self) -> Option<(&str, &Regex)> {
+        Some((self.profile.csrf_url.as_deref()?, self.re.csrf.as_ref()?))
+    }
+
+    /// The CSRF token in `text`, as the login reads it.
+    pub fn csrf_token(&self, text: &str) -> Option<String> {
+        token_in(self.re.csrf.as_ref()?, text)
+    }
+
+    /// Whether `response` looks logged in by the profile's patterns: the logged-in one when it
+    /// has one, else not the logged-out one. None when it has neither.
+    pub fn looks_logged_in(&self, response: &[u8]) -> Option<bool> {
+        let text = || response_text(response);
+        match (&self.re.logged_in, &self.re.logged_out) {
+            (Some(re), _) => Some(re.is_match(&text())),
+            (None, Some(re)) => Some(!re.is_match(&text())),
+            (None, None) => None,
+        }
+    }
+
     pub fn is_logged_out(&self, response: &[u8]) -> bool {
         if !self.profile.has_login() && !self.handling.active() {
             return false;
@@ -1895,6 +1978,12 @@ pub(crate) fn static_cookies(p: &AuthProfile) -> Vec<(String, String)> {
 /// Content-Type (sniffed as JSON when there is none), header values as they are (a
 /// CSRF header carries the token itself), and the request line URL-encoded.
 fn fill_template(tpl: &str, user: &str, profile: &str, csrf: &str) -> String {
+    with_code(&fill_template_with(tpl, user, &|enc: Enc| placeholder(profile, enc.password_kind()), csrf), profile)
+}
+
+/// [`fill_template`] with the password as `pass` gives it for each encoding, and `{{totp}}`
+/// left as it is.
+fn fill_template_with(tpl: &str, user: &str, pass: &dyn Fn(Enc) -> String, csrf: &str) -> String {
     let (head, sep, body) = match (tpl.find("\r\n\r\n"), tpl.find("\n\n")) {
         (Some(a), b) if b.is_none_or(|b| a < b) => (&tpl[..a], "\r\n\r\n", &tpl[a + 4..]),
         (_, Some(b)) => (&tpl[..b], "\n\n", &tpl[b + 2..]),
@@ -1914,9 +2003,7 @@ fn fill_template(tpl: &str, user: &str, profile: &str, csrf: &str) -> String {
         None if body.trim_start().starts_with('{') => Enc::Json,
         None => Enc::Raw,
     };
-    let fill = |text: &str, enc: Enc| {
-        with_code(&substitute(text, user, &placeholder(profile, enc.password_kind()), csrf, enc), profile)
-    };
+    let fill = |text: &str, enc: Enc| substitute(text, user, &pass(enc), csrf, enc);
     let mut out = fill(line, Enc::Form);
     if let Some(h) = headers {
         out.push('\n');

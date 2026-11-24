@@ -9,6 +9,10 @@
 //! attacks a rule sends: the rules keep ZAP's checks at its default MEDIUM threshold. A rule is
 //! turned off with `enabled: false`, ZAP's OFF threshold.
 //!
+//! An opt-in rule ([`crate::scan::active::ActiveRule::opt_in`]) runs under a policy only when the
+//! policy turns it on by name (`enabled: true`): a policy that leaves it unlisted, or on by
+//! default for every rule, keeps it off.
+//!
 //! Policies are kept in the project's settings (`setting.scan_policies`), all in one value: a
 //! map from name to policy.
 
@@ -127,7 +131,7 @@ impl Policy {
     pub fn effective(&self, rule: u32) -> Effective {
         let s = self.rules.get(&rule);
         Effective {
-            enabled: s.and_then(|s| s.enabled).unwrap_or(self.enabled),
+            enabled: s.and_then(|s| s.enabled).unwrap_or(self.enabled && !is_opt_in(rule)),
             strength: s.and_then(|s| s.strength).unwrap_or(self.strength),
             threshold: s.and_then(|s| s.threshold).unwrap_or(self.threshold),
         }
@@ -147,6 +151,11 @@ impl Policy {
         ids
     }
 
+    /// The opt-in rules it turns on (by id, in id order).
+    pub fn opt_ins(&self) -> Vec<u32> {
+        self.enabled_rules().into_iter().filter(|&id| is_opt_in(id)).collect()
+    }
+
     /// Its threshold, and the rules whose strength or threshold differ from its own.
     pub fn tuning(&self) -> Tuning {
         let rules = self
@@ -157,6 +166,11 @@ impl Policy {
             .collect();
         Tuning { threshold: self.threshold, rules }
     }
+}
+
+/// Whether active rule `id` is opt-in.
+pub fn is_opt_in(id: u32) -> bool {
+    all_rules().iter().any(|r| r.id() == id && r.opt_in())
 }
 
 /// A rule's own strength or threshold in a scan.
@@ -287,8 +301,8 @@ mod tests {
             p.effective(40014),
             Effective { enabled: true, strength: Strength::High, threshold: Threshold::Medium }
         );
-        assert_eq!(p.disabled(), [40012]);
-        assert_eq!(p.enabled_rules().len(), all_rules().len() - 1);
+        assert_eq!(p.disabled(), [40012, 40023, 40041], "opt-in rules are off unless turned on");
+        assert_eq!(p.enabled_rules().len(), all_rules().iter().filter(|r| !r.opt_in()).count() - 1);
         let t = p.tuning();
         assert_eq!(t.rules[&40018], RuleTuning { strength: Some(Strength::Insane), threshold: None });
         assert!(!t.rules.contains_key(&40012));
@@ -305,6 +319,20 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(only.enabled_rules(), [40018]);
+    }
+
+    /// An opt-in rule runs under a policy only when the policy names it on.
+    #[test]
+    fn an_opt_in_rule_is_off_unless_the_policy_turns_it_on() {
+        let p = Policy::default();
+        assert!(!p.effective(40041).enabled && !p.effective(40023).enabled);
+        assert!(p.opt_ins().is_empty());
+        let mut on = Policy::default();
+        on.rules.insert(40041, RuleSetting { enabled: Some(true), ..Default::default() });
+        on.rules.insert(40023, RuleSetting { strength: Some(Strength::Low), ..Default::default() });
+        assert!(on.effective(40041).enabled && !on.effective(40023).enabled);
+        assert_eq!(on.opt_ins(), [40041]);
+        assert!(!on.disabled().contains(&40041) && on.disabled().contains(&40023));
     }
 
     #[test]

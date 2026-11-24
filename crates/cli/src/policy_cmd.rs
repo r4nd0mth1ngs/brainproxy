@@ -52,14 +52,15 @@ pub struct PolicyFlags {
     #[arg(long, value_enum)]
     threshold: Option<ThresholdArg>,
     /// Whether the rules the policy doesn't turn on or off run [default: on]; off runs only
-    /// those --enable names.
+    /// those --enable names. Opt-in rules (`scan rules --active`, `opt_in`) run only when
+    /// --enable names them.
     #[arg(long, value_parser = ["on", "off"])]
     others: Option<String>,
     /// Whether scans with the policy attack parameter, JSON key, cookie and header names too
     /// (`scan active --inject-names`); `auto` [default] does at strength high and insane.
     #[arg(long, value_enum)]
     inject_names: Option<NamesArg>,
-    /// Turn these rule ids on (comma-separated).
+    /// Turn these rule ids on (comma-separated); the only way a policy runs an opt-in rule.
     #[arg(long, value_delimiter = ',', value_name = "IDS")]
     enable: Vec<u32>,
     /// Turn these rule ids off (comma-separated).
@@ -357,11 +358,12 @@ pub fn apply(
     }
     tuning.rules.retain(|_, t| t.strength.is_some() || t.threshold.is_some());
     // The rules it turns off by name are excluded; with others off, the ones it turns on are the
-    // rules (so the rules they depend on still run, as with --rules).
+    // rules (so the rules they depend on still run, as with --rules). An opt-in rule it turns on
+    // is named the same way, as the default selection leaves it out.
     let turned_off: Vec<u32> = p.rules.iter().filter(|(_, s)| s.enabled == Some(false)).map(|(&id, _)| id).collect();
     let (sel, mut exclude) = match flag_rules {
         Some(r) => (Some(r), vec![]),
-        None if p.enabled => (None, turned_off),
+        None if p.enabled && p.opt_ins().is_empty() => (None, turned_off),
         None => (Some(p.enabled_rules()), turned_off),
     };
     for id in exclude_rules {
@@ -458,7 +460,20 @@ mod tests {
         let shown = apply(Some(("p", &p)), None, None, None, &[], &[]).shown.unwrap();
         assert_eq!(shown["rules"], json!([40034]));
         let all = apply(Some(("all", &Policy::default())), None, None, None, &[], &[]).shown.unwrap();
-        assert_eq!(all["rules"].as_array().unwrap().len(), active::all_rules().len());
+        let default = active::all_rules().iter().filter(|r| !r.opt_in()).count();
+        assert_eq!(all["rules"].as_array().unwrap().len(), default, "opt-in rules stay off");
+    }
+
+    /// A policy that turns an opt-in rule on runs it with the rest.
+    #[test]
+    fn a_policy_turns_an_opt_in_rule_on_by_name() {
+        let p = Policy {
+            rules: [(40041, RuleSetting { enabled: Some(true), ..Default::default() })].into(),
+            ..Default::default()
+        };
+        let a = apply(Some(("upload", &p)), None, None, None, &[], &[]);
+        let rules = a.rules.unwrap();
+        assert!(rules.contains(&40041) && rules.contains(&40012) && !rules.contains(&40023), "{rules:?}");
     }
 
     #[test]

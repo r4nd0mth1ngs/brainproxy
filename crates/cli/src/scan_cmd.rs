@@ -1046,7 +1046,7 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
                 })
                 .map(|r| {
                     let max_risk = r.alerts().iter().map(|a| a.risk).max().map(|r| r.as_str());
-                    json!({"id": r.id(), "name": r.name(), "scope": r.scope(), "max_risk": max_risk,
+                    json!({"id": r.id(), "name": r.name(), "scope": r.scope(), "max_risk": max_risk, "opt_in": r.opt_in(),
                         "alerts": r.alerts().iter().map(|a| json!({"alert_ref": a.alert_ref, "name": a.name, "risk": a.risk.as_str()})).collect::<Vec<_>>()})
                 })
                 .collect();
@@ -1055,11 +1055,16 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
                     .iter()
                     .map(|r| {
                         format!(
-                            "{:>6}  {:<6} {:<7} {}",
+                            "{:>6}  {:<6} {:<7} {}{}",
                             r["id"],
                             r["scope"].as_str().unwrap_or(""),
                             r["max_risk"].as_str().unwrap_or(""),
-                            r["name"].as_str().unwrap_or("")
+                            r["name"].as_str().unwrap_or(""),
+                            if r["opt_in"] == true {
+                                " (opt-in: runs only when named or enabled in a policy)"
+                            } else {
+                                ""
+                            }
                         )
                     })
                     .collect::<Vec<_>>()

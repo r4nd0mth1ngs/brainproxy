@@ -15,6 +15,7 @@ mod jwt;
 mod jwt_e2e;
 pub(super) mod params;
 pub(crate) mod probes;
+mod session;
 
 use crate::scan::active::ActiveRule;
 
@@ -29,6 +30,7 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
     rules.extend(injection::all());
     rules.extend(params::all());
     rules.extend(probes::all());
+    rules.extend(session::all());
     rules
 }
 
@@ -60,7 +62,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(rules.len(), 59, "expected all active rules");
+        assert_eq!(rules.len(), 63, "expected all active rules");
         // No active rule id collides with a passive rule id.
         let passive: HashSet<u32> = crate::scan::passive::all_rules().iter().map(|r| r.id()).collect();
         for id in &ids {
