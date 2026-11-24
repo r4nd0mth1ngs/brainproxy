@@ -17,6 +17,8 @@ pub(super) mod params;
 pub(crate) mod probes;
 mod session;
 mod soap_action_spoofing;
+#[cfg(test)]
+pub(crate) mod test_app;
 
 use crate::scan::active::ActiveRule;
 
@@ -64,7 +66,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(rules.len(), 64, "expected all active rules");
+        assert_eq!(rules.len(), 71, "expected all active rules");
         // No active rule id collides with a passive rule id.
         let passive: HashSet<u32> = crate::scan::passive::all_rules().iter().map(|r| r.id()).collect();
         for id in &ids {

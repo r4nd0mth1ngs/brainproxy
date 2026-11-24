@@ -449,6 +449,15 @@ impl Cx {
         opts.http2 || opts.http3 || version.starts_with(b"HTTP/2") || version.starts_with(b"HTTP/3")
     }
 
+    /// Whether the scan may send a request with `method`: GET, HEAD, OPTIONS and POST always,
+    /// others only when `--include-methods` names them (or says ALL). For a rule whose test
+    /// could change what the server holds (PUT, PATCH, WebDAV's MKCOL or MOVE).
+    pub fn method_opted_in(&self, method: &str) -> bool {
+        use crate::apiimport::api::DEFAULT_METHODS;
+        DEFAULT_METHODS.iter().any(|m| m.eq_ignore_ascii_case(method))
+            || self.shared.check_methods.iter().any(|m| m.eq_ignore_ascii_case(method) || m.eq_ignore_ascii_case("ALL"))
+    }
+
     /// [`Cx::send`] over TCP (HTTP/1.1, or HTTP/2 as the scan's options or the request line
     /// say) even when the scan sends over HTTP/3. A request line saying HTTP/3 says HTTP/1.1.
     pub async fn send_tcp(&self, request: Vec<u8>) -> Result<Response> {

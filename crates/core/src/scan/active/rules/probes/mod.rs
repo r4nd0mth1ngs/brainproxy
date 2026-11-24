@@ -2,27 +2,35 @@
 //! add-ons (Apache License 2.0). These send extra requests to fixed paths or forge
 //! headers rather than fuzzing the base request's parameters.
 
+mod backup_files;
 mod cloud_metadata;
 mod common;
 mod cors;
 mod directory_browsing;
 mod elmah;
 mod entity_expansion;
+mod forbidden_bypass;
 mod get_for_post;
+mod git_disclosure;
+mod git_metadata;
 mod heartbleed;
 pub(crate) mod hidden_files;
 mod htaccess;
 mod http3_differs;
 mod http_only_site;
+mod httpoxy;
 mod https_as_http;
+mod insecure_methods;
 mod php2shell;
 mod rce_cve_2012_1823;
 mod react2shell;
+mod relative_path_confusion;
 mod shellshock;
 mod source_disclosure_cve_2012_1823;
 mod source_disclosure_webinf;
 mod spring4shell;
 mod spring_actuator;
+mod svn_disclosure;
 mod trace_axd;
 mod user_agent;
 
@@ -52,5 +60,12 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(spring_actuator::SpringActuator),
         Box::new(trace_axd::TraceAxd),
         Box::new(user_agent::UserAgent),
+        Box::new(git_disclosure::GitDisclosure),
+        Box::new(svn_disclosure::SvnDisclosure),
+        Box::new(backup_files::BackupFiles),
+        Box::new(insecure_methods::InsecureMethods),
+        Box::new(relative_path_confusion::RelativePathConfusion),
+        Box::new(forbidden_bypass::ForbiddenBypass),
+        Box::new(httpoxy::Httpoxy),
     ]
 }
