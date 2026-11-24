@@ -67,7 +67,8 @@ const ANTI_CSRF_TOKENS: [&str; 15] = [
     "_csrfToken",
 ];
 
-fn is_anti_csrf_token(name: &str) -> bool {
+/// Also what `poc csrf` warns about in the request it writes a page for.
+pub(crate) fn is_anti_csrf_token(name: &str) -> bool {
     ANTI_CSRF_TOKENS.iter().any(|t| t.eq_ignore_ascii_case(name))
 }
 

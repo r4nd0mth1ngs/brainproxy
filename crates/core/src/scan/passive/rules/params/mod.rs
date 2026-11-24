@@ -6,7 +6,7 @@ mod cookie_loosely_scoped;
 mod cookie_poisoning;
 mod cookie_same_site;
 mod cookie_secure_flag;
-mod csrf_countermeasures;
+pub(crate) mod csrf_countermeasures;
 mod html_attributes;
 mod info_disclosure_referrer;
 mod info_disclosure_url;

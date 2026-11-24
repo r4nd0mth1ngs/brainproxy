@@ -1,7 +1,7 @@
 //! HTTP header rules, ported from ZAP's pscanrules add-on (Apache License 2.0).
 
 mod alt_svc_h3;
-mod anti_clickjacking;
+pub(crate) mod anti_clickjacking;
 mod big_redirects;
 mod cache_control;
 pub(crate) mod common;

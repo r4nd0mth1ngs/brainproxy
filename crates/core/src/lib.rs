@@ -25,6 +25,7 @@ pub mod http;
 pub mod jobs;
 pub mod oauth;
 pub mod oob;
+pub mod poc;
 pub mod provenance;
 pub mod proxy;
 pub mod race;

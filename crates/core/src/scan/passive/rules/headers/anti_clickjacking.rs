@@ -71,6 +71,13 @@ static MALFORMED: AlertDef = AlertDef {
 
 static ALERTS: [&AlertDef; 4] = [&MISSING, &MULTIPLE, &META, &MALFORMED];
 
+/// ZAP: an X-Frame-Options value is valid when it says DENY or SAMEORIGIN anywhere in it. Also
+/// what `poc clickjacking` takes as a value browsers refuse a cross-site frame for.
+pub(crate) fn xfo_blocks(value: &str) -> bool {
+    let lv = value.to_lowercase();
+    lv.contains("deny") || lv.contains("sameorigin")
+}
+
 pub struct AntiClickjacking;
 
 impl PassiveRule for AntiClickjacking {
@@ -111,8 +118,7 @@ impl PassiveRule for AntiClickjacking {
             }
         } else {
             for v in &xfo {
-                let lv = v.to_lowercase();
-                if !lv.contains("deny") && !lv.contains("sameorigin") {
+                if !xfo_blocks(v) {
                     out.push(MALFORMED.raise(HEADER, *v));
                 }
             }
