@@ -1,5 +1,5 @@
 // Proxy › Intercept and Settings › Intercept options: the intercept settings, the `intercept
-// enable` call that sets them, and the filter that picks which messages are held, a query in
+// enable` and `intercept set` calls that set them, and the filter that picks which messages are held, a query in
 // the Traffic filter language (`intercept enable --filter`) that can start from a saved filter.
 
 import type { ActionDef } from "../ui/actions.ts";
@@ -30,11 +30,25 @@ export interface InterceptSettings {
 /** `intercept enable` arguments for these settings. Enable replaces every setting, so the
  * filters are passed back each time or they would be cleared. */
 export function interceptEnableArgs(s: InterceptSettings): string[] {
+  return interceptArgs("enable", s);
+}
+
+/**
+ * Settings › Intercept options' save: `intercept set`, which changes what is held but leaves
+ * intercept on or off as it is. (Saving with `enable` and then `disable` would hold real
+ * traffic in between.) With no direction ticked, requests are held, as the CLI does.
+ */
+export function interceptSaveArgs(draft: InterceptSettings): string[] {
+  const held = draft.requests || !(draft.responses || draft.ws_to_server || draft.ws_to_client);
+  return interceptArgs("set", withFilter({ ...draft, requests: held }, draft.filter ?? ""));
+}
+
+function interceptArgs(verb: "enable" | "set", s: InterceptSettings): string[] {
   // `--flag=value`: a value starting with `-` (a query such as `-x`) isn't read as a flag.
   const opt = (flag: string, v?: string) => (v ? [`${flag}=${v}`] : []);
   return [
     "intercept",
-    "enable",
+    verb,
     ...(s.requests ? ["--requests"] : []),
     ...(s.responses ? ["--responses"] : []),
     ...(s.ws_to_server ? ["--ws-to-server"] : []),

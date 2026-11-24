@@ -7,7 +7,7 @@ import { run } from "../api";
 import { AUTO_PROXY, autoProxy, useApp } from "../store";
 import { Split } from "../ui/Split";
 import { InterceptFilter } from "./Proxy";
-import { interceptEnableArgs, withFilter, type InterceptSettings } from "./intercept";
+import { interceptSaveArgs, withFilter, type InterceptSettings } from "./intercept";
 import { confirm } from "../ui/Confirm";
 import { usePoll } from "../ui/usePoll";
 import { useRunner } from "../ui/useRunner";
@@ -1028,12 +1028,9 @@ function Intercept() {
     load();
   }, []);
 
-  // `intercept enable` is the only way to set filters and it turns intercept on, so when
-  // it was off we disable it again right away; `disable` keeps the settings.
   const applyDraft = async () => {
     if (!draft || !current) return;
-    const ok = await exec(interceptEnableArgs(withFilter({ ...draft, requests: draft.requests || !draft.responses }, draft.filter ?? "")));
-    if (ok && !current.enabled) await exec(["intercept", "disable"]);
+    const ok = await exec(interceptSaveArgs(draft));
     if (ok) app.toast("Intercept options saved");
     load();
   };

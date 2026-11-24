@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mayRunWhileTyping } from "../ui/actions.ts";
-import { FORWARD, filterChange, filterChanged, interceptChanger, interceptEnableArgs, savedQueries, savedQueryFor, withFilter, type InterceptSettings } from "./intercept.ts";
+import { FORWARD, filterChange, filterChanged, interceptChanger, interceptEnableArgs, interceptSaveArgs, savedQueries, savedQueryFor, withFilter, type InterceptSettings } from "./intercept.ts";
 import { DEFAULT_FILTER } from "./trafficFilter.ts";
 
 const base: InterceptSettings = { enabled: true, requests: true, responses: false, timeout_secs: 120, timeout_action: "forward" };
@@ -24,6 +24,18 @@ test("enable passes the filter back with every other setting", () => {
   // None, or only spaces: no --filter, which clears it.
   assert.ok(!interceptEnableArgs(base).some((a) => a.startsWith("--filter")));
   assert.ok(!interceptEnableArgs({ ...base, filter: "  " }).some((a) => a.startsWith("--filter")));
+});
+
+test("Settings saves with set, which never turns intercept on", () => {
+  const off = { ...base, enabled: false, requests: false, responses: false, path: "^/api", filter: " method=POST " };
+  const args = interceptSaveArgs(off);
+  assert.deepEqual(args.slice(0, 2), ["intercept", "set"]);
+  assert.ok(!args.includes("enable"));
+  assert.ok(args.includes("--requests"), "nothing ticked holds requests, as the CLI does");
+  assert.ok(args.includes("--path=^/api") && args.includes("--filter=method=POST"), args.join(" "));
+  const ws = interceptSaveArgs({ ...off, ws_to_client: true });
+  assert.ok(!ws.includes("--requests") && ws.includes("--ws-to-client"), ws.join(" "));
+  assert.ok(!interceptSaveArgs({ ...off, filter: "  " }).some((a) => a.startsWith("--filter")));
 });
 
 test("the filter is trimmed, and empty is none", () => {
