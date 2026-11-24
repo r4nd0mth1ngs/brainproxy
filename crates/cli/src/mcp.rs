@@ -117,6 +117,8 @@ const EXCLUDED: &[&str] = &[
     "findings filter remove",
     // A person's rating in place of the scanner's; an agent suggests one. It refuses a tool call too.
     "findings rate",
+    // Whether an agent's suggestion is wanted is the person's call. It refuses a tool call too.
+    "findings dismiss",
     // Every program on the machine would trust whatever the CA signs: a person decides that, in
     // the app or a terminal. It refuses a tool call too.
     "ca install-system",
@@ -709,6 +711,7 @@ const HINTS: &[(&str, Hints)] = &[
     ("findings issue cvss", SET),
     ("findings issue narrative", SET),
     ("findings rate", SET),
+    ("findings dismiss", SET),
     ("findings suppress add", ADD),
     ("findings suppress list", READ),
     ("findings suppress remove", REPLACE),

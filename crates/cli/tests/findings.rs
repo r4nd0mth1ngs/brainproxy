@@ -79,6 +79,59 @@ fn kinds(project: &Path, id: i64) -> Vec<String> {
 }
 
 #[test]
+fn a_dismissed_suggestion_is_kept_in_the_project() {
+    let (_dir, project) = setup("dismiss");
+    let f =
+        ok(&project, &["findings", "add", "--title", "Debug page", "--risk", "low", "--url", "http://127.0.0.1/debug"]);
+    let id = f["id"].as_i64().unwrap().to_string();
+    // An agent's suggestion, as `findings mark --suggest` through MCP leaves it.
+    let out = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .env("BRAINPROXY_MCP_CALL", "1")
+        .args(["--format", "json", "--project"])
+        .arg(&project)
+        .args(["findings", "mark", &id, "--suggest", "--state", "false_positive", "--note", "a decoy"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    let events = ok(&project, &["findings", "timeline", &id])["events"].clone();
+    let suggested =
+        events.as_array().unwrap().iter().find(|e| e["kind"] == "suggested").unwrap()["id"].as_i64().unwrap();
+    let created = events[0]["id"].as_i64().unwrap().to_string();
+
+    // Refused through MCP: the person decides.
+    let out = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .env("BRAINPROXY_MCP_CALL", "1")
+        .args(["--format", "json", "--project"])
+        .arg(&project)
+        .args(["findings", "dismiss", &id, "--event", &suggested.to_string()])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!out.status.success() && v["error"]["message"].as_str().unwrap().contains("refused through MCP"), "{v}");
+    assert!(!kinds(&project, f["id"].as_i64().unwrap()).contains(&"dismissed".to_string()));
+
+    let d = ok(&project, &["findings", "dismiss", &id, "--event", &suggested.to_string()]);
+    assert_eq!(d["dismissed"], true, "{d}");
+    let last = ok(&project, &["findings", "timeline", &id])["events"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(
+        (last["kind"].as_str(), last["old"].as_str()),
+        (Some("dismissed"), Some(suggested.to_string().as_str()))
+    );
+    // Nothing else changed, and a second dismissal records nothing.
+    assert_eq!(ok(&project, &["findings", "show", &id])["state"], "open");
+    let again = ok(&project, &["findings", "dismiss", &id, "--event", &suggested.to_string()]);
+    assert_eq!(again["dismissed"], false);
+    assert_eq!(kinds(&project, f["id"].as_i64().unwrap()).iter().filter(|k| *k == "dismissed").count(), 1);
+    // Only a suggestion on that finding can be dismissed.
+    let (code, v) = run(&project, &["findings", "dismiss", &id, "--event", &created]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    let (code, v) = run(&project, &["findings", "dismiss", &id, "--event", "99999"]);
+    assert_eq!(v["error"]["kind"], "not_found", "{code} {v}");
+    let (code, v) = run(&project, &["findings", "dismiss", "99999", "--event", &suggested.to_string()]);
+    assert_eq!(v["error"]["kind"], "not_found", "{code} {v}");
+}
+
+#[test]
 fn issues_retests_and_the_timeline() {
     let leak = Arc::new(AtomicBool::new(true));
     let down = Arc::new(AtomicBool::new(false));

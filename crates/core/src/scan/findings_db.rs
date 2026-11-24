@@ -1865,6 +1865,39 @@ impl Store {
         Ok(())
     }
 
+    /// Dismisses the suggestion `event` (a `suggested` event on finding `id`): a `dismissed` event
+    /// whose `old` is the suggestion's event id, so it no longer waits for a person. False, with
+    /// nothing recorded, when it was dismissed already.
+    pub fn finding_dismiss(&mut self, id: i64, event: i64) -> Result<bool> {
+        let tx = self.write_tx()?;
+        current_state(&tx, id)?;
+        let kind: Option<String> = tx
+            .query_row("SELECT kind FROM finding_events WHERE id = ?1 AND finding_id = ?2", params![event, id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        match kind.as_deref() {
+            None => return Err(Error::NotFound(format!("event {event} on finding {id}"))),
+            Some("suggested") => {}
+            Some(k) => return Err(Error::InvalidInput(format!("event {event} is a {k} event, not a suggestion"))),
+        }
+        let old = event.to_string();
+        let done: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM finding_events WHERE finding_id = ?1 AND kind = 'dismissed' AND old = ?2)",
+            params![id, old],
+            |r| r.get(0),
+        )?;
+        if done {
+            return Ok(false);
+        }
+        crate::scan::issues::record(
+            &tx,
+            &crate::scan::issues::Event { finding: Some(id), kind: "dismissed", old: Some(&old), ..Default::default() },
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Starts a full rescan of `source` findings: their hit counts go to 0, to be counted again,
     /// and nothing else changes, so a finding found again keeps its id, state, note and who
     /// set them. Returns the highest finding id, to tell new findings from the ones found again.

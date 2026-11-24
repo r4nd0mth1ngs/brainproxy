@@ -227,6 +227,19 @@ pub enum FindingsCmd {
     /// A finding's timeline: found, triaged, noted, retested, moved between issues, seen again
     /// after it was fixed, removed; each with who did it and when.
     Timeline { id: i64 },
+    /// Dismiss an agent's suggestion on a finding (`findings mark --suggest`) without taking it up:
+    /// it stops waiting for a decision, here and in the app, and nothing else changes.
+    #[command(after_help = "The dismissal goes on the finding's timeline (kind dismissed, old the \
+        suggestion's event id). Dismissing one already dismissed changes nothing (dismissed false). A suggestion \
+        is also settled when the finding's state or note changes after it. Refused through MCP: whether a \
+        suggestion is wanted is the person's call.")]
+    Dismiss {
+        /// Finding id.
+        id: i64,
+        /// The suggestion's event id (`findings timeline`, kind suggested).
+        #[arg(long, value_name = "EVENT_ID")]
+        event: i64,
+    },
     /// Send a finding's request again and record whether it is still there.
     #[command(after_help = "Passive findings: the latest request is sent again (history source retest) \
         and the finding's own rule reads that response. Not reproduced marks it fixed, and a fixed or \
@@ -1525,6 +1538,22 @@ pub fn findings(project: &Path, cmd: FindingsCmd, out: &Out) -> Result<(), Error
                 out.ok(json!({"id": id, "title": shown}), || format!("issue {id} is now {shown}"));
             }
         },
+        FindingsCmd::Dismiss { id, event } => {
+            if crate::mcp::in_tool_call() {
+                return Err(Error::InvalidInput(
+                    "findings dismiss is refused through MCP: whether a suggestion is wanted is the person's call"
+                        .into(),
+                ));
+            }
+            let dismissed = store.finding_dismiss(id, event)?;
+            out.ok(json!({"id": id, "event": event, "dismissed": dismissed}), || {
+                if dismissed {
+                    format!("suggestion {event} on finding {id} dismissed")
+                } else {
+                    format!("suggestion {event} on finding {id} was already dismissed")
+                }
+            });
+        }
         FindingsCmd::Rate { id, issue, risk, confidence, reason, clear } => {
             if crate::mcp::in_tool_call() {
                 return Err(Error::InvalidInput(
