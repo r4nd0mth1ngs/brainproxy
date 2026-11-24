@@ -3880,7 +3880,7 @@ where the tool reads stdin, anything else comes in the call's `stdin`.
 
 ## Rules, checks, and wordlists
 
-- **ZAP rules.** The passive (53) and active (57) scan rules are ported from OWASP ZAP,
+- **ZAP rules.** The passive (60) and active (68) scan rules are ported from OWASP ZAP,
   whose code is Apache-2.0. Their pattern files (error messages, hidden files, and similar)
   are built in, and *Rules and checks › ZAP rule data* fetches the latest ones.
 - **Outdated software.** *Vulnerable JS Library* (10003, from ZAP's retire add-on) checks
