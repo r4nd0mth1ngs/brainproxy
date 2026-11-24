@@ -2,7 +2,25 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CliError } from "../api.ts";
 import type { RepeaterTab } from "../store.tsx";
-import { MAX_WAIT, NEWER, addedSince, closingSaves, fromSaved, newerFormat, revisions, saver, serial, tabTexts, toSaved, type SavedTabs } from "./replayTabs.ts";
+import {
+  MAX_WAIT,
+  NEWER,
+  closingSaves,
+  fromSaved,
+  mergeChanged,
+  mergeNote,
+  mergeTabs,
+  newerFormat,
+  newTabId,
+  revisions,
+  savedTab,
+  saver,
+  serial,
+  tabTexts,
+  toSaved,
+  withIds,
+  type SavedTabs,
+} from "./replayTabs.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -22,10 +40,13 @@ test("tabs round-trip without keys or responses, text as typed", () => {
   });
   let k = 100;
   const back = fromSaved(JSON.parse(JSON.stringify(saved)), () => k++);
+  // Saved without ids (an older build's set), they are known by their place.
   assert.deepEqual(back.tabs, [
-    { key: 100, title: "1", target: "https://a.test", raw: req, binary: true },
-    { key: 101, title: "WS 2", target: "wss://a.test", raw: "GET /ws HTTP/1.1\n\n", ws: ["a", "«auth:app:header:X»"], wsWait: 0, wsUntil: "done|(" },
+    { key: 100, id: "i0", title: "1", target: "https://a.test", raw: req, binary: true },
+    { key: 101, id: "i1", title: "WS 2", target: "wss://a.test", raw: "GET /ws HTTP/1.1\n\n", ws: ["a", "«auth:app:header:X»"], wsWait: 0, wsUntil: "done|(" },
   ]);
+  // With ids, they keep them.
+  assert.deepEqual(fromSaved(toSaved(withIds(back.tabs, () => "x"), 0), () => k++).tabs.map((t) => t.id), ["i0", "i1"]);
   assert.equal(back.activeKey, 101);
   // No active tab saved when none is open.
   assert.equal(toSaved(tabs, 0).active, undefined);
@@ -77,8 +98,8 @@ test("loading skips what isn't a tab", () => {
   let k = 1;
   const r = fromSaved({ tabs: [null, "x", { title: "no request" }, { request: "GET / HTTP/1.1\n\n", future: 1 }, { kind: "ws", request: "", messages: [1, "m"] }], active: 0 }, () => k++);
   assert.deepEqual(r.tabs, [
-    { key: 1, title: "1", target: "", raw: "GET / HTTP/1.1\n\n" },
-    { key: 2, title: "2", target: "", raw: "", ws: ["m"] },
+    { key: 1, id: "i3", title: "1", target: "", raw: "GET / HTTP/1.1\n\n" },
+    { key: 2, id: "i4", title: "2", target: "", raw: "", ws: ["m"] },
   ]);
   assert.equal(r.activeKey, null);
   assert.deepEqual(fromSaved(undefined, () => k++), { tabs: [], activeKey: null });
@@ -212,7 +233,7 @@ test("loading takes only well-formed values", () => {
   assert.equal(ws.wsWait, undefined);
   assert.ok(!ws.wsUntil, "until that isn't text");
   // An http tab ignores ws-only fields and a binary that isn't true.
-  assert.deepEqual(Object.keys(http).sort(), ["key", "raw", "target", "title"]);
+  assert.deepEqual(Object.keys(http).sort(), ["id", "key", "raw", "target", "title"]);
   // A kind this version doesn't know is skipped, not opened as http (saving it would change it).
   // A title or target that isn't text is left out (numbered by position).
   assert.equal(other.ws, undefined);
@@ -479,25 +500,61 @@ test("waiting on closing saves covers each one and outlasts a failure", async ()
   assert.equal(done, true);
 });
 
-test("tabs saved elsewhere since are told apart from the app's, duplicates counted", () => {
-  const a = { kind: "http", title: "a", target: "", request: "A" };
-  const b = { kind: "http", title: "b", target: "", request: "B" };
-  const known = tabTexts(JSON.stringify({ tabs: [a, a, b] }));
-  let k = 1;
-  // Two a's and a b were known: only the third a and the new WebSocket tab are new, numbered
-  // after the three open.
-  const r = addedSince(known, { rev: 3, tabs: [a, { ...a }, b, a, { kind: "ws", request: "W" }] }, () => k++, 4);
+const tab = (id: string, raw: string, over: Partial<RepeaterTab> = {}): RepeaterTab => ({ key: 0, id, title: id, target: "", raw, ...over });
+const listing = (...tabs: RepeaterTab[]) => ({ rev: 2, v: 3, tabs: tabs.map(savedTab) });
+
+test("tabs are merged by id: changes from elsewhere apply to tabs untouched here", () => {
+  // As last synced: a, b, c, d. Here: a edited, b as it was, c as it was, d closed, n new.
+  const base = tabTexts(listing(tab("a", "A"), tab("b", "B"), tab("c", "C"), tab("d", "D")));
+  const local = [tab("a", "A2", { key: 1 }), tab("b", "B", { key: 2 }), tab("c", "C", { key: 3 }), tab("n", "N", { key: 4 })];
+  // Elsewhere: a and b edited, c removed, d kept, e added (untitled), and the CLI's key order.
+  const remote = { rev: 3, tabs: [{ request: "A3", id: "a", kind: "http", title: "a", target: "" }, savedTab(tab("b", "B3")), savedTab(tab("d", "D")), { id: "e", kind: "ws", title: "", target: "", request: "E", messages: ["hi"] }] };
+  let k = 10;
+  const m = mergeTabs(base, local, remote, () => k++, 5);
   assert.deepEqual(
-    r.added.map((t) => [t.title, t.raw, !!t.ws]),
+    m.tabs.map((t) => [t.id, t.raw, t.key]),
     [
-      ["a", "A", false],
-      ["5", "W", true],
+      ["a", "A2", 1], // changed on both sides: the app's stays
+      ["b", "B3", 2], // changed elsewhere only: taken, same key
+      ["n", "N", 4], // new here
+      ["e", "E", 10], // added elsewhere, at the end
     ],
   );
-  assert.equal(r.now.length, 5);
-  // The CLI writes a wait of 3 as 3.0; read back it is the same tab.
-  assert.deepEqual(tabTexts({ tabs: [JSON.parse('{"kind":"ws","wait":3.0}')] }), tabTexts('{"tabs":[{"kind":"ws","wait":3}]}'));
-  assert.deepEqual(addedSince(known, { tabs: [b] }, () => k++).added, []);
+  assert.equal(m.tabs[3].title, "5", "an untitled tab is numbered after the open ones");
+  assert.deepEqual(m.tabs[3].ws, ["hi"]);
+  assert.deepEqual([m.added, m.updated, m.removed, m.kept.length], [1, 1, 1, 0]);
+  assert.ok(mergeChanged(m));
+  assert.equal(mergeNote(m), "Replay: 1 tab added, 1 tab changed, 1 tab closed elsewhere (an agent, the command line or another window).");
+  // The CLI writes a wait of 3 as 3.0, and keys in its own order; read back it is the same tab.
+  assert.deepEqual(tabTexts({ tabs: [JSON.parse('{"wait":3.0,"kind":"ws","id":"w"}')] }), tabTexts('{"tabs":[{"id":"w","kind":"ws","wait":3}]}'));
+});
+
+test("a tab removed elsewhere is kept here when it was changed here", () => {
+  const base = tabTexts(listing(tab("a", "A"), tab("b", "B")));
+  const m = mergeTabs(base, [tab("a", "A edited", { key: 1 }), tab("b", "B", { key: 2 })], listing(), () => 9);
+  assert.deepEqual(m.tabs.map((t) => t.id), ["a"]);
+  assert.deepEqual([m.removed, m.kept.map((t) => t.id)], [1, ["a"]]);
+  assert.match(mergeNote(m), /1 tab closed elsewhere.*Kept "a" here, closed elsewhere, because you changed it\./);
+  // Nothing from elsewhere: nothing changes, and there is nothing to say.
+  const same = mergeTabs(tabTexts(listing(tab("a", "A"))), [tab("a", "A", { key: 1 })], listing(tab("a", "A")), () => 9);
+  assert.ok(!mergeChanged(same) && same.kept.length === 0 && mergeNote(same) === "");
+  // A tab closed here stays closed, even if it changed elsewhere.
+  const closed = mergeTabs(tabTexts(listing(tab("a", "A"))), [], listing(tab("a", "A changed")), () => 9);
+  assert.deepEqual(closed.tabs, []);
+});
+
+test("every open tab has an id of its own", () => {
+  let n = 0;
+  const make = () => `id${n++}`;
+  const tabs = [tab("x", "1"), { key: 2, title: "new", target: "", raw: "" }, tab("x", "copy")];
+  const out = withIds(tabs, make);
+  assert.deepEqual(out.map((t) => t.id), ["x", "id0", "id1"]);
+  assert.equal(withIds(out, make), out, "nothing to add: the same array");
+  assert.match(newTabId(), /^[A-Za-z0-9-]{1,64}$/, "what the CLI takes");
+  // Saved first, as the CLI writes it; a listing without ids (an older build's) reads them by place.
+  assert.deepEqual(Object.keys(savedTab(tab("x", "1"))).slice(0, 2), ["id", "kind"]);
+  let k = 1;
+  assert.deepEqual(fromSaved({ tabs: [{ request: "a" }, { request: "b" }] }, () => k++).tabs.map((t) => t.id), ["i0", "i1"]);
 });
 
 test("one call at a time, in order, past a failure", async () => {
@@ -539,16 +596,19 @@ function fakeCli(start: SavedTabs = { tabs: [] }) {
 
 function app(f: ReturnType<typeof fakeCli>, open: string[]) {
   let k = 1;
-  const tabs: RepeaterTab[] = open.map((raw) => ({ key: k++, title: raw, target: "", raw }));
+  // As the store keeps them: every tab with an id.
+  const tabs: RepeaterTab[] = open.map((raw) => ({ key: k++, id: `app-${raw}`, title: raw, target: "", raw }));
   const added: string[][] = [];
   const revs = revisions({
     cli: f.cli,
     body: () => JSON.stringify(toSaved(tabs, 0)),
-    add: (ts) => {
-      tabs.push(...ts);
-      added.push(ts.map((t) => t.raw));
+    tabs: () => tabs,
+    apply: (m) => {
+      const before = new Set(tabs.map((t) => t.key));
+      tabs.splice(0, tabs.length, ...withIds(m.tabs));
+      const fresh = tabs.filter((t) => !before.has(t.key));
+      if (fresh.length) added.push(fresh.map((t) => t.raw));
     },
-    count: () => tabs.length,
     nextKey: () => k++,
   });
   return { tabs, added, revs, body: () => JSON.stringify(toSaved(tabs, 0)) };
@@ -600,16 +660,39 @@ test("coming back to the window shows an agent's tabs without a save", async () 
   assert.deepEqual(f.db.set.tabs.map((t) => t.request), ["ws", "x", "late"]);
 });
 
+test("a removal or change made elsewhere sticks: the app doesn't save its own copy back", async () => {
+  const f = fakeCli({ tabs: [{ id: "a", kind: "http", title: "a", target: "", request: "A" }, { id: "b", kind: "http", title: "b", target: "", request: "B" }] });
+  let k = 1;
+  const loaded = fromSaved(await f.cli(["replay", "tabs", "list"]), () => k++);
+  const tabs = loaded.tabs;
+  const revs = revisions({
+    cli: f.cli,
+    body: () => JSON.stringify(toSaved(tabs, 0)),
+    tabs: () => tabs,
+    apply: (m) => tabs.splice(0, tabs.length, ...m.tabs),
+    nextKey: () => k++,
+  });
+  revs.loaded(await f.cli(["replay", "tabs", "list"]));
+  // Another window closes b and edits a.
+  f.db.set = { ...f.db.set, rev: f.db.set.rev + 1, tabs: [{ id: "a", kind: "http", title: "a", target: "", request: "A2" }] };
+  await revs.check();
+  assert.deepEqual(tabs.map((t) => [t.id, t.raw]), [["a", "A2"]]);
+  // The next save writes the merged set, not the app's old one.
+  await revs.save(JSON.stringify(toSaved(tabs, 0)));
+  assert.deepEqual(f.db.set.tabs.map((t) => [t.id, t.request]), [["a", "A2"]]);
+});
+
 test("a set saved by a newer version isn't saved over", async () => {
-  assert.equal(newerFormat({ v: 3, tabs: [] }), true);
-  // 2 is a set holding binary WebSocket messages: this build's own.
+  assert.equal(newerFormat({ v: 4, tabs: [] }), true);
+  // 2 is a set holding binary WebSocket messages, 3 one with tab ids: this build's own.
+  assert.equal(newerFormat({ v: 3, tabs: [] }), false);
   assert.equal(newerFormat({ v: 2, tabs: [] }), false);
   assert.equal(newerFormat({ v: 1, tabs: [] }), false);
   assert.equal(newerFormat({ tabs: [] }), false);
   const f = fakeCli();
   const a = app(f, ["mine"]);
   a.revs.loaded(await f.cli(["replay", "tabs", "list"]));
-  f.db.set = { v: 3, rev: 5, tabs: [] };
+  f.db.set = { v: 4, rev: 5, tabs: [] };
   await assert.rejects(a.revs.save(a.body()), (e: Error) => e.message === NEWER);
   assert.equal(f.db.set.rev, 5);
   // Other errors are passed on as they are.

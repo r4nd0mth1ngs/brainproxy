@@ -1,8 +1,9 @@
 // Replay tabs kept in the project file (`replay tabs list/save`), so they come back when it is
 // opened again. Only what was typed is saved, never responses; text goes as typed, auth
 // placeholders included. Saves are debounced, one at a time, and a failed one leaves the
-// tabs in the app as they are. Each save checks the set's revision, so tabs saved from
-// elsewhere meanwhile (an agent's) are added to the app's rather than replaced.
+// tabs in the app as they are. Each save checks the set's revision, and the set is read again
+// while Replay is shown, so changes saved elsewhere meanwhile (an agent's, another window's)
+// are merged with the app's by tab id rather than replaced (mergeTabs).
 
 import type { RepeaterTab } from "../store";
 import { marksFromSaved, type Mark } from "./payloadMarks.ts";
@@ -11,6 +12,8 @@ import { isWsOut, type WsOut } from "./ws.ts";
 
 /** One tab as `replay tabs save` takes it. */
 export interface SavedTab {
+  /** Stays the same wherever the tab is open; the CLI makes one when a save leaves it out. */
+  id?: string;
   kind: "http" | "ws";
   title: string;
   target: string;
@@ -46,9 +49,9 @@ export const saveArgs = (rev: number) => [...SAVE_ARGS, "--if-revision", String(
 
 /**
  * The newest format this build reads and writes; a newer set has fields this one would drop.
- * 2 added binary WebSocket messages (the CLI writes 2 only for a set holding one).
+ * 2 added binary WebSocket messages, 3 tab ids (the CLI writes the lowest a set needs).
  */
-const FORMAT = 2;
+const FORMAT = 3;
 /** Longest WebSocket Listen, in seconds (`ws send --wait` refuses more). */
 export const MAX_WAIT = 86400;
 
@@ -60,30 +63,59 @@ export function newerFormat(data: unknown): boolean {
   return typeof v === "number" && v > FORMAT;
 }
 
+/** A new tab id, in what the CLI takes (letters, digits, -). */
+export const newTabId = (): string => globalThis.crypto.randomUUID();
+
+/**
+ * The tabs, each with an id of its own: one without (just opened) or with another's (a copy of
+ * a tab) gets a new one. The same array when nothing changes.
+ */
+export function withIds(tabs: RepeaterTab[], make: () => string = newTabId): RepeaterTab[] {
+  const seen = new Set<string>();
+  let changed = false;
+  const out = tabs.map((t) => {
+    if (t.id && !seen.has(t.id)) {
+      seen.add(t.id);
+      return t;
+    }
+    changed = true;
+    const id = make();
+    seen.add(id);
+    return { ...t, id };
+  });
+  return changed ? out : tabs;
+}
+
+/** One open tab as saved: no key, no response. */
+export function savedTab(t: RepeaterTab): SavedTab {
+  const id = t.id ? { id: t.id } : {};
+  const base = { title: t.title, target: t.target, request: t.raw };
+  // In the order the CLI writes a tab, so a listing's tab reads the same as the app's.
+  const opts = (o: SavedOptions | undefined) => (o ? { options: o } : {});
+  if (t.ws)
+    return {
+      ...id,
+      kind: "ws",
+      ...base,
+      messages: t.ws,
+      ...(t.wsWait != null ? { wait: t.wsWait } : {}),
+      ...(t.wsUntil ? { until: t.wsUntil } : {}),
+      ...opts(savedOptions(t.options, "ws")),
+    };
+  return {
+    ...id,
+    kind: "http",
+    ...base,
+    ...(t.binary ? { binary: true } : {}),
+    ...opts(savedOptions(t.options, "http")),
+    ...(t.marks?.length ? { marks: t.marks } : {}),
+    ...(t.finding != null ? { finding: t.finding } : {}),
+  };
+}
+
 /** The open tabs as saved: no keys, no responses. */
 export function toSaved(tabs: RepeaterTab[], activeKey: number): SavedTabs {
-  const saved = tabs.map((t): SavedTab => {
-    const base = { title: t.title, target: t.target, request: t.raw };
-    // Last, in the order the CLI writes a tab, so a listing's tab reads the same as the app's.
-    const opts = (o: SavedOptions | undefined) => (o ? { options: o } : {});
-    if (t.ws)
-      return {
-        kind: "ws",
-        ...base,
-        messages: t.ws,
-        ...(t.wsWait != null ? { wait: t.wsWait } : {}),
-        ...(t.wsUntil ? { until: t.wsUntil } : {}),
-        ...opts(savedOptions(t.options, "ws")),
-      };
-    return {
-      kind: "http",
-      ...base,
-      ...(t.binary ? { binary: true } : {}),
-      ...opts(savedOptions(t.options, "http")),
-      ...(t.marks?.length ? { marks: t.marks } : {}),
-      ...(t.finding != null ? { finding: t.finding } : {}),
-    };
-  });
+  const saved = tabs.map(savedTab);
   const active = tabs.findIndex((t) => t.key === activeKey);
   return active >= 0 ? { tabs: saved, active } : { tabs: saved };
 }
@@ -107,6 +139,8 @@ export function fromSaved(data: unknown, nextKey: () => number, firstNumber = 1)
     if (t.kind !== undefined && t.kind !== "http" && t.kind !== "ws") return;
     const key = nextKey();
     const tab: RepeaterTab = { key, title: str(t.title) || String(tabs.length + firstNumber), target: str(t.target), raw: str(t.request) };
+    // A set saved before ids is listed with ids by place; the same here for one that has none.
+    tab.id = typeof t.id === "string" && t.id ? t.id : `i${i}`;
     if (t.kind === "ws") {
       tab.ws = Array.isArray(t.messages) ? t.messages.filter(isWsOut) : [];
       if (typeof t.wait === "number" && t.wait >= 0 && t.wait <= MAX_WAIT) tab.wsWait = t.wait;
@@ -125,28 +159,104 @@ export function fromSaved(data: unknown, nextKey: () => number, firstNumber = 1)
   return { tabs, activeKey };
 }
 
-/** Each saved tab as text, to tell the tabs of one set from another's (`body` is a save's stdin or a listing). */
-export function tabTexts(body: string | unknown): string[] {
-  const d = (typeof body === "string" ? JSON.parse(body) : body) as { tabs?: unknown } | null;
-  return Array.isArray(d?.tabs) ? d.tabs.map((t) => JSON.stringify(t)) : [];
+/** `v` as JSON with every object's keys sorted, so the CLI's order and the app's compare equal. */
+function canonical(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o)
+      .filter((k) => o[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonical(o[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(v);
+}
+
+const listed = (data: unknown): unknown[] => {
+  const tabs = (data as { tabs?: unknown } | null)?.tabs;
+  return Array.isArray(tabs) ? tabs : [];
+};
+const idOf = (item: unknown, i: number): string => {
+  const id = (item as { id?: unknown } | null)?.id;
+  return typeof id === "string" && id ? id : `i${i}`;
+};
+
+/** Each saved tab as text, by id (`body` is a save's stdin or a listing): the set as last synced. */
+export function tabTexts(body: string | unknown): Map<string, string> {
+  const d = typeof body === "string" ? JSON.parse(body) : body;
+  return new Map(listed(d).map((t, i) => [idOf(t, i), canonical(t)]));
+}
+
+/** What a merge did: the tabs to show, and what came from elsewhere. */
+export interface Merged {
+  tabs: RepeaterTab[];
+  added: number;
+  removed: number;
+  updated: number;
+  /** Removed elsewhere, but changed here since: kept, and saved again. */
+  kept: RepeaterTab[];
 }
 
 /**
- * The tabs of `data` (a listing) that weren't in the set last read or saved (`known`, from
- * [tabTexts]): saved from elsewhere since, by an agent or the command line. `now` is what
- * the project holds, the next `known`. Tabs the app closed stay closed, since they are in `known`.
+ * A three-way merge of Replay's tabs by id: `base` is the set as last read or saved (tabTexts),
+ * `local` the open tabs, `data` the set the project holds now (a listing).
+ * - A tab added elsewhere is added at the end (untitled ones numbered from `firstNumber`).
+ * - A tab changed elsewhere takes the change if it is unchanged here; changed on both sides,
+ *   the app's stays (and is saved over the other).
+ * - A tab removed elsewhere goes if it is unchanged here; changed here, it is kept (`kept`).
+ * - A tab the app closed stays closed, and one it opened stays.
+ * Keys and the order of the open tabs are kept.
  */
-export function addedSince(known: string[], data: unknown, nextKey: () => number, firstNumber = 1): { added: RepeaterTab[]; now: string[] } {
-  const left = new Map<string, number>();
-  for (const k of known) left.set(k, (left.get(k) ?? 0) + 1);
-  const now = tabTexts(data);
-  const list = Array.isArray((data as { tabs?: unknown } | null)?.tabs) ? (data as { tabs: unknown[] }).tabs : [];
-  const fresh = list.filter((_, i) => {
-    const n = left.get(now[i]) ?? 0;
-    if (n > 0) left.set(now[i], n - 1);
-    return n === 0;
-  });
-  return { added: fromSaved({ tabs: fresh }, nextKey, firstNumber).tabs, now };
+export function mergeTabs(base: Map<string, string>, local: RepeaterTab[], data: unknown, nextKey: () => number, firstNumber = 1): Merged {
+  const remote = new Map(listed(data).map((item, i) => [idOf(item, i), item]));
+  const texts = tabTexts(data);
+  const out: RepeaterTab[] = [];
+  const kept: RepeaterTab[] = [];
+  let removed = 0;
+  let updated = 0;
+  for (const t of local) {
+    const was = t.id == null ? undefined : base.get(t.id);
+    const now = t.id == null ? undefined : texts.get(t.id);
+    if (was === undefined) {
+      out.push(t);
+      continue;
+    }
+    const mine = canonical(savedTab(t));
+    if (now === undefined) {
+      if (mine === was) removed++;
+      else {
+        out.push(t);
+        kept.push(t);
+      }
+    } else if (now !== was && mine === was) {
+      const fresh = fromSaved({ tabs: [remote.get(t.id!)] }, () => t.key, out.length + 1).tabs[0];
+      if (fresh) {
+        out.push(fresh);
+        updated++;
+      } else out.push(t);
+    } else out.push(t);
+  }
+  const open = new Set(local.map((t) => t.id));
+  const fresh = [...remote].filter(([id]) => !open.has(id) && !base.has(id)).map(([, item]) => item);
+  const added = fromSaved({ tabs: fresh }, nextKey, firstNumber).tabs;
+  // fromSaved numbers the ids of those without by their place among `fresh`: the listing's own.
+  added.forEach((t, i) => (t.id = idOf(fresh[i], listed(data).indexOf(fresh[i]))));
+  out.push(...added);
+  return { tabs: out, added: added.length, removed, updated, kept };
+}
+
+/** Whether a merge changed anything the app shows. */
+export const mergeChanged = (m: Merged) => m.added + m.removed + m.updated > 0;
+
+/** What a merge tells the person, or "" when nothing came from elsewhere. */
+export function mergeNote(m: Merged): string {
+  const n = (k: number, what: string) => (k ? [`${k} ${k === 1 ? "tab" : "tabs"} ${what}`] : []);
+  const parts = [...n(m.added, "added"), ...n(m.updated, "changed"), ...n(m.removed, "closed")];
+  const kept = m.kept.map((t) => `"${t.title}"`).join(", ");
+  const lines = parts.length ? [`Replay: ${parts.join(", ")} elsewhere (an agent, the command line or another window).`] : [];
+  if (kept) lines.push(`Kept ${kept} here, closed elsewhere, because you changed ${m.kept.length === 1 ? "it" : "them"}.`);
+  return lines.join(" ");
 }
 
 /** Runs the calls given one at a time, in order, whether the one before worked or not. */
@@ -161,28 +271,29 @@ export function serial() {
 
 /**
  * The app's side of the saved set's revision: each save says which revision it replaces, so
- * one saved elsewhere meanwhile (an agent preparing tabs) is a conflict, not lost. Then the
- * tabs saved there are added to the app's (`add`) and the whole lot is saved. `cli` runs a
- * command with optional stdin and returns its data; `body` is the app's set now (after
- * `add`); `count` how many tabs are open, to number untitled ones.
+ * one saved elsewhere meanwhile (an agent preparing tabs, another window) is a conflict, not
+ * lost. Then the set saved there is merged with the app's (`mergeTabs`, given to `apply`) and
+ * the result is saved. `cli` runs a command with optional stdin and returns its data; `body` is
+ * the app's set now (after `apply`); `tabs` the open tabs.
  */
 export function revisions(o: {
   cli: (args: string[], stdin?: string) => Promise<any>;
   body: () => string;
-  add: (tabs: RepeaterTab[]) => void;
-  count: () => number;
+  tabs: () => RepeaterTab[];
+  apply: (m: Merged) => void;
   nextKey: () => number;
 }) {
   let rev = 0;
-  let known: string[] = [];
+  let known = new Map<string, string>();
   // A check and a save never interleave: each reads the revision the other sets.
   const one = serial();
   const take = (data: unknown) => {
     if (newerFormat(data)) throw new Error(NEWER);
-    const r = addedSince(known, data, o.nextKey, o.count() + 1);
+    const open = o.tabs();
+    const m = mergeTabs(known, open, data, o.nextKey, open.length + 1);
     rev = (data as SavedTabs).rev ?? 0;
-    known = r.now;
-    if (r.added.length) o.add(r.added);
+    known = tabTexts(data);
+    if (mergeChanged(m) || m.kept.length) o.apply(m);
   };
   return {
     /** The set read when the project opened. */
@@ -190,11 +301,11 @@ export function revisions(o: {
       rev = (data as SavedTabs | null)?.rev ?? 0;
       known = tabTexts(data);
     },
-    /** Saves `body`, or takes in tabs saved elsewhere since and saves them with the app's. Returns what it wrote. */
+    /** Saves `body`, or merges in what was saved elsewhere since and saves the result. Returns what it wrote. */
     save: (body: string) => {
       const seen = rev;
       return one(async () => {
-        // A check queued before took in tabs meanwhile: `body` was made without them.
+        // A check queued before merged changes in meanwhile: `body` was made without them.
         if (rev !== seen) body = o.body();
         let r: { rev: number };
         try {
@@ -210,7 +321,7 @@ export function revisions(o: {
         return body;
       });
     },
-    /** Takes in tabs saved elsewhere since (the window came back to the front); reads them only if the revision moved. */
+    /** Merges in what was saved elsewhere since (polled while Replay is shown); reads the set only if the revision moved. */
     check: () =>
       one(async () => {
         const s = await o.cli(SUMMARY_ARGS);

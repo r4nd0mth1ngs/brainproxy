@@ -9,7 +9,7 @@ import { proxyControl, type ProxyControl } from "./views/proxyPort";
 import { clearReplayTabs } from "./views/replayCalls";
 import type { ReplayOptions } from "./views/replayOptions";
 import type { WsOut } from "./views/ws";
-import { LIST_ARGS, NEWER, closingSaves, fromSaved, newerFormat, revisions, saver, toSaved } from "./views/replayTabs";
+import { LIST_ARGS, NEWER, closingSaves, fromSaved, mergeNote, newerFormat, revisions, saver, toSaved, withIds } from "./views/replayTabs";
 import type { HistoryPick } from "./views/trafficActions";
 
 export type Tab =
@@ -43,6 +43,8 @@ export interface Handoff {
 
 export interface RepeaterTab extends Handoff {
   key: number;
+  /** Stays the same wherever the tab is open (saved with it), so changes made elsewhere merge by it. */
+  id?: string;
   title: string;
   /** Send options (HTTP/2, as typed, SNI, ...); missing means the CLI's defaults. */
   options?: Partial<ReplayOptions>;
@@ -121,6 +123,8 @@ const Ctx = createContext<State | null>(null);
 
 /** How long Replay's tabs stay unchanged before they are saved to the project. */
 const SAVE_TABS_AFTER_MS = 1000;
+/** How often Replay's tabs are checked for changes made elsewhere, while Replay is shown. */
+const REPLAY_POLL_MS = 2000;
 
 // Replay tabs being saved by projects that just closed; one opened again reads its tabs after.
 const closing = closingSaves();
@@ -188,7 +192,7 @@ export function AppProvider({
   const repeaterRef = useRef<RepeaterTab[]>([]);
   const activeRef = useRef(0);
   const setRepeater = useCallback((f: (tabs: RepeaterTab[]) => RepeaterTab[]) => {
-    repeaterRef.current = f(repeaterRef.current);
+    repeaterRef.current = withIds(f(repeaterRef.current));
     setRepeaterState(repeaterRef.current);
   }, []);
   const setRepeaterActive = useCallback((key: number) => {
@@ -203,8 +207,9 @@ export function AppProvider({
 
   // Replay's tabs live in the project file (`replay tabs list/save`): restored when it opens,
   // saved a moment after they change and when it closes. Nothing is saved until they have been
-  // read, so a failed read never replaces the saved ones. Tabs saved elsewhere meanwhile (an
-  // agent's) are added here, when a save finds them or the window comes back to the front.
+  // read, so a failed read never replaces the saved ones. Changes saved elsewhere meanwhile (an
+  // agent's, another window's) are merged in by tab id when a save finds them, every 2 s while
+  // Replay is shown, and when the window comes back to the front.
   const [tabsLoaded, setTabsLoaded] = useState(false);
   const tabsLoadedRef = useRef(false);
   const toastRef = useRef(toast);
@@ -215,12 +220,13 @@ export function AppProvider({
   revsRef.current ??= revisions({
     cli: (args, stdin) => run(args, stdin == null ? { project } : { stdin, project }),
     body: tabsBody,
-    add: (tabs) => {
-      setRepeater((cur) => [...cur, ...tabs]);
-      const n = tabs.length;
-      toastRef.current(`${n} Replay tab${n === 1 ? " was" : "s were"} added to the project from elsewhere (an agent or the command line)`);
+    tabs: () => repeaterRef.current,
+    apply: (m) => {
+      setRepeater(() => m.tabs);
+      if (activeRef.current && !m.tabs.some((t) => t.key === activeRef.current)) setRepeaterActive(m.tabs.at(-1)?.key ?? 0);
+      const note = mergeNote(m);
+      if (note) toastRef.current(note);
     },
-    count: () => repeaterRef.current.length,
     nextKey: newKey,
   });
   const tabRevs = revsRef.current;
@@ -278,8 +284,16 @@ export function AppProvider({
     if (!tabsLoaded) return;
     const check = () => void tabRevs.check().catch(() => {});
     window.addEventListener("focus", check);
-    return () => window.removeEventListener("focus", check);
-  }, [tabsLoaded, tabRevs]);
+    // While Replay is shown, changes from elsewhere show up within 2 s.
+    // ponytail: the merge compares the tabs as the editors last passed them up (300 ms after
+    // typing stops), so a change from elsewhere to the very tab being typed in within that
+    // moment can win over the last keystrokes; revisit if editors pass text up at once.
+    const poll = tab === "repeater" ? setInterval(() => document.visibilityState === "visible" && check(), REPLAY_POLL_MS) : null;
+    return () => {
+      window.removeEventListener("focus", check);
+      if (poll) clearInterval(poll);
+    };
+  }, [tabsLoaded, tabRevs, tab]);
   // The copy holds what the project holds, and the temporary one is deleted after: with tabs
   // that couldn't be saved it stays open, so they aren't lost.
   const saveAsWithTabs = useCallback(async () => {
