@@ -79,7 +79,7 @@ pub(crate) const SCHEMA_V9: &str = "ALTER TABLE oob_payloads ADD COLUMN check_js
 pub const PAYLOAD_COLUMNS: &[(&str, &str, &str)] = &[
     ("token", "TEXT", "Unique token carried by the payload"),
     ("time", "TEXT", "UTC time the payload was issued"),
-    ("source", "TEXT", "scan (an active rule's attack) or manual (oob payload)"),
+    ("source", "TEXT", "scan (an active rule's attack), manual (oob payload) or fuzz (a fuzz run's oob: payload set)"),
     ("rule_id", "INTEGER", "Active rule that sent it"),
     ("alert_ref", "TEXT", "Alert raised when an interaction arrives"),
     ("param", "TEXT", "Attacked parameter"),
@@ -304,6 +304,15 @@ impl Store {
         self.conn.execute(
             "INSERT INTO oob_payloads (token, source, note, issued_by) VALUES (?1, 'manual', ?2, ?3)",
             params![token, note, crate::provenance::origin()],
+        )?;
+        Ok(())
+    }
+
+    /// A fuzz payload's token: `note` says which run and payload it is, `target` where it went.
+    pub fn oob_add_fuzz_payload(&self, token: &str, note: &str, target: &Target) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO oob_payloads (token, source, note, origin, issued_by) VALUES (?1, 'fuzz', ?2, ?3, ?4)",
+            params![token, note, target.origin(), crate::provenance::origin()],
         )?;
         Ok(())
     }

@@ -195,3 +195,54 @@ fn generated_sources_are_sent() {
     assert!(v["error"]["message"].as_str().unwrap().contains("10000000"), "{v}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// What an SSRF does with `?u=URL`: fetches it.
+fn fetch(line: &str) {
+    let Some(url) = line.split("u=").nth(1).and_then(|r| r.split(' ').next()) else { return };
+    let url = url.replace("%3A", ":").replace("%2F", "/");
+    let Some(rest) = url.strip_prefix("http://") else { return };
+    let (hostport, path) = rest.split_once('/').map_or((rest, String::from("/")), |(h, p)| (h, format!("/{p}")));
+    let Ok(mut s) = std::net::TcpStream::connect(hostport) else { return };
+    let _ = s.write_all(format!("GET {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n").as_bytes());
+    let mut sink = Vec::new();
+    let _ = s.read_to_end(&mut sink);
+}
+
+#[test]
+fn oob_tokens_are_payloads_tied_to_the_run() {
+    let (dir, project) = setup("oob");
+    let (port, _) = serve(Duration::ZERO, |line| {
+        fetch(line);
+        "fetched".into()
+    });
+    let url = format!("http://127.0.0.1:{port}/?u=§x§");
+    let (code, v) = run(&["fuzz", "run", "--url", &url, "-p", "oob:3"], &project);
+    assert_eq!(code, 4, "no listener: {v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("oob start"), "{v}");
+    let (code, v) = run(&["oob", "start", "--listen", "127.0.0.1:0"], &project);
+    assert_eq!(code, 0, "{v}");
+
+    // Through MCP too: the tokens are the project's own.
+    let (code, v) = run_mcp(&["fuzz", "run", "--url", &url, "-p", "oob:3"], &project);
+    assert_eq!(code, 0, "{v}");
+    let run_id = v["data"]["run"]["id"].to_string();
+    assert_eq!(v["data"]["run"]["done"], 3, "{v}");
+    let (code, v) = run(&["oob", "poll", "--wait", "5"], &project);
+    assert_eq!(code, 0, "{v}");
+    let hits = v["data"]["interactions"].as_array().unwrap();
+    assert_eq!(hits.len(), 3, "{v}");
+    for h in hits {
+        assert_eq!(h["payload"]["source"], "fuzz", "{h}");
+        let note = h["payload"]["note"].as_str().unwrap();
+        assert!(note.starts_with(&format!("fuzz run {run_id}, set 1 payload")), "{h}");
+    }
+    // Each payload is one of the run's, and each token went out once.
+    let sent: Vec<String> = results(&project, &run_id).iter().map(|r| r[1].as_str().unwrap().to_string()).collect();
+    for h in hits {
+        let token = h["token"].as_str().unwrap();
+        assert_eq!(sent.iter().filter(|p| p.contains(token)).count(), 1, "{token} in {sent:?}");
+    }
+    let (code, v) = run(&["oob", "stop"], &project);
+    assert_eq!(code, 0, "{v}");
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -387,8 +387,33 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
 
     let mut stdin = || crate::read_input(None);
     let mut sets = Vec::new();
-    for spec in &payload_specs {
-        sets.push(fuzz::load_payloads(spec, &mut stdin)?);
+    // OOB tokens put in payloads (set and payload, from 1), registered once the run has an id.
+    let mut oob_tokens: Vec<(usize, usize, String)> = Vec::new();
+    for (i, spec) in payload_specs.iter().enumerate() {
+        let set = match spec.split_once(':') {
+            Some(("oob", arg)) => {
+                let (n, form) = fuzz::parse_oob(arg)?;
+                let state = crate::oob_cmd::running(&Store::open(project)?)?.ok_or_else(|| {
+                    Error::NotFound(
+                        "an oob: payload set needs this project's OOB listener (start one with `brainproxy oob start`)"
+                            .into(),
+                    )
+                })?;
+                let endpoint = state.endpoint.for_target(&target.host, target.port);
+                let mut payloads = Vec::new();
+                for k in 0..n as usize {
+                    let p = endpoint.payload()?;
+                    payloads.push(match form {
+                        fuzz::OobForm::Host => p.host.into_bytes(),
+                        fuzz::OobForm::Url => p.url.into_bytes(),
+                    });
+                    oob_tokens.push((i + 1, k + 1, p.token));
+                }
+                fuzz::Set::List(payloads)
+            }
+            _ => fuzz::load_payloads(spec, &mut stdin)?,
+        };
+        sets.push(set);
     }
     // The scripts the chains name, as they were read: the run's record says what processed it.
     let mut scripts = Vec::new();
@@ -494,6 +519,15 @@ fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), 
         process::forget_work_lock(&store, &name);
         Ok::<_, Error>(())
     };
+    // Registered by the process that sends them (a --background parent's are never sent), with
+    // the run's id, so an interaction says which run and payload called back.
+    for (set, k, token) in &oob_tokens {
+        if let Err(e) = store.oob_add_fuzz_payload(token, &format!("fuzz run {run_id}, set {set} payload {k}"), &target)
+        {
+            finish("failed", Some(&e.to_string()))?;
+            return Err(e);
+        }
+    }
 
     let send = args.req.send_options(guard)?;
     let auth = match crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &send) {
