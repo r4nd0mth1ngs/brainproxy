@@ -235,3 +235,14 @@ async fn an_emailed_link_that_is_opened_raises_reset_poisoning() {
     let fixed = scan(port, "/forgot-fixed", Strength::Medium, HostPolicy::Warn, true).await;
     assert!(fixed.refs.is_empty(), "{:?}", fixed.refs);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn where_foreign_hosts_are_refused_the_rule_is_skipped_and_says_so() {
+    let port = spawn_app();
+    let s = scan(port, "/login", Strength::Medium, HostPolicy::Refuse, false).await;
+    assert!(s.refs.is_empty());
+    assert_eq!((s.summary.requests, s.summary.units), (0, 0));
+    assert_eq!(s.summary.skipped.len(), 1);
+    assert_eq!(s.summary.skipped[0].rule, 100010);
+    assert!(s.summary.skipped[0].reason.contains("--host-header-test"));
+}

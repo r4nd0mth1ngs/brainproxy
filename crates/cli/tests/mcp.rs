@@ -1241,6 +1241,74 @@ fn an_api_scans_baselines_are_checked_with_the_agents_policy() {
     assert!(!err && e["data"]["refused_hosts"] == json!(["e.test"]), "{e}");
 }
 
+/// A login page that builds its form's action from X-Forwarded-Host, for as many requests as come.
+fn serve_forwarded_host() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 8192];
+                let mut len = 0;
+                while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf[len..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => len += n,
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf[..len]).into_owned();
+                let header = |name: &str| {
+                    req.lines().find_map(|l| {
+                        l.split_once(':')
+                            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                            .map(|(_, v)| v.trim().to_string())
+                    })
+                };
+                let host = header("x-forwarded-host").or_else(|| header("host")).unwrap_or_default();
+                let body =
+                    format!("<html><body><form action=\"http://{host}/login\" method=post></form></body></html>");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    port
+}
+
+#[test]
+fn the_host_header_rule_runs_for_an_agent_only_with_host_header_test() {
+    let port = serve_forwarded_host();
+    let project = tmp_project("host-rule");
+    let mut m = Mcp::start(&project, &[]);
+    m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}}));
+    let (err, e) = m.call("engagement_start", json!({"targets": ["127.0.0.1"]}));
+    assert!(!err, "{e}");
+    let url = format!("http://127.0.0.1:{port}/login");
+    // Without the flag the rule is left out, says why, and sends nothing with a made-up host.
+    let (err, e) = m.call("scan_active", json!({"urls": [url], "rules": ["100010"]}));
+    assert!(!err, "{e}");
+    assert_eq!(e["data"]["skipped"][0]["rule"], 100010, "{e}");
+    assert!(e["data"]["skipped"][0]["reason"].as_str().unwrap().contains("--host-header-test"), "{e}");
+    assert_eq!((e["data"]["requests"].as_u64(), e["data"]["new_findings"].as_u64()), (Some(0), Some(0)), "{e}");
+    let sql = "SELECT count(*) FROM history WHERE CAST(request AS TEXT) LIKE '%.invalid%'";
+    let (_, q) = m.call("query", json!({"sql": sql}));
+    assert_eq!(q["data"]["rows"][0][0], 0, "{q}");
+    // Another rule alongside still runs.
+    let (err, e) = m.call("scan_active", json!({"urls": [url], "rules": ["100010", "40012"]}));
+    assert!(!err && e["data"]["skipped"][0]["rule"] == 100010 && e["data"]["rules"] == 1, "{e}");
+    // With it the rule runs and finds the injection.
+    let (err, e) = m.call("scan_active", json!({"urls": [url], "rules": ["100010"], "host_header_test": true}));
+    assert!(!err, "{e}");
+    assert!(e["data"].get("skipped").is_none(), "{e}");
+    assert_eq!(e["data"]["raised"]["100010-1"], 1, "{e}");
+    let (_, q) = m.call("query", json!({"sql": sql}));
+    assert_eq!(q["data"]["rows"][0][0], 7, "{q}");
+}
+
 /// The fields every 2026-07-28 result carries, and the caching hints where they belong.
 fn assert_modern(result: &Value, cacheable: bool) {
     assert_eq!(result["resultType"], "complete", "{result}");

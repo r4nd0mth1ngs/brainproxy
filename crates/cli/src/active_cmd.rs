@@ -171,7 +171,9 @@ pub struct ActiveArgs {
     no_inject_names: bool,
     /// A base request (a URL's, an API item's, a recorded one) deliberately names a host the
     /// scope doesn't list in its Host header, for a Host-header test. Through MCP such a request
-    /// isn't attacked without it. Rules that set a Host of their own need no flag.
+    /// isn't attacked without it, and rule 100010 (Host header injection, which puts a made-up
+    /// host in forwarding headers and the request line) doesn't run: the summary lists it in
+    /// `skipped`. Other rules that set a Host of their own need no flag.
     #[arg(long)]
     host_header_test: bool,
     #[arg(long)]
@@ -789,6 +791,9 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         if let Some(below) = result["below_threshold"].as_object() {
             let n: u64 = below.values().filter_map(|v| v.as_u64()).sum();
             lines.push(format!("  {n} findings below their rule's threshold not raised"));
+        }
+        for r in result["skipped"].as_array().into_iter().flatten() {
+            lines.push(format!("  rule {} skipped: {}", r["rule"], r["reason"].as_str().unwrap_or("")));
         }
         if let Some(n) = result["pruned"].as_u64() {
             lines.push(format!("  {n} attack requests that back no finding deleted from history"));

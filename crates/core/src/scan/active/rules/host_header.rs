@@ -25,6 +25,9 @@
 //! strength high: each request may email a real user. Every request carries a cache buster
 //! ([`canary::bust`]), so a cache in front can only keep the poisoned answer under a URL
 //! nobody else asks for.
+//!
+//! The made-up host isn't in the scope, so through MCP this rule runs only with
+//! `scan active --host-header-test` (see [`ActiveRule::tests_host_header`]).
 
 use crate::http::RawRequest;
 use crate::scan::active::canary;
@@ -224,6 +227,10 @@ impl ActiveRule for HostHeaderInjection {
 
     fn scope(&self) -> RuleScope {
         RuleScope::Page
+    }
+
+    fn tests_host_header(&self) -> bool {
+        true
     }
 
     fn scan<'a>(&'a self, cx: &'a Cx) -> BoxFuture<'a> {

@@ -82,6 +82,13 @@ pub trait ActiveRule: Send + Sync {
     fn depends_on(&self) -> &'static [u32] {
         &[]
     }
+    /// Whether the rule sends Host header values naming a host the scope doesn't list (its
+    /// own made-up host, in a forwarding header or the request line). Such a rule runs only
+    /// where the scan's [`SendOptions::host`] doesn't refuse foreign hosts: through MCP, with
+    /// `--host-header-test`. Otherwise it is left out and listed in [`ActiveSummary::skipped`].
+    fn tests_host_header(&self) -> bool {
+        false
+    }
     /// Start order, lowest first: units that may run long start early, so the
     /// scan doesn't end waiting on one of them.
     fn order(&self) -> u8 {
@@ -1020,6 +1027,10 @@ pub struct ActiveSummary {
     /// (through MCP without `--host-header-test`): those requests weren't attacked.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub refused_hosts: Vec<String>,
+    /// Rules selected but not run, and why (a Host-header test through MCP without
+    /// `--host-header-test`; see [`ActiveRule::tests_host_header`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedRule>,
     /// What there is to say about HTTP/3 asked for (`--http3`): why it wasn't used for an
     /// origin (its requests went over TCP), or an Alt-Svc endpoint the scope refused.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1036,6 +1047,13 @@ pub struct ActiveSummary {
     pub stopped: bool,
     pub timed_out: bool,
     pub elapsed_ms: u64,
+}
+
+/// A rule selected for a scan that didn't run.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SkippedRule {
+    pub rule: u32,
+    pub reason: String,
 }
 
 /// Counts down a rule's units left when dropped.
@@ -1104,7 +1122,25 @@ pub async fn run(
     // Directory Browsing's.
     let checks = cfg.checks.clone();
     let is_check = move |r: &'static dyn ActiveRule| checks.iter().any(|c| std::ptr::addr_eq(*c, r));
-    if rules.is_empty() {
+    // A rule whose test is a foreign Host runs only where foreign Hosts aren't refused: through
+    // MCP, a scan says the test is meant with --host-header-test. It is left out, not refused,
+    // so the rest of the scan runs.
+    let mut skipped = Vec::new();
+    if cfg.send.host == HostPolicy::Refuse {
+        rules.retain(|&r| {
+            let keep = is_check(r) || !r.tests_host_header();
+            if !keep {
+                skipped.push(SkippedRule {
+                    rule: r.id(),
+                    reason: "it sends Host header values the scope doesn't list; through MCP it runs only with \
+                             --host-header-test"
+                        .into(),
+                });
+            }
+            keep
+        });
+    }
+    if rules.is_empty() && skipped.is_empty() {
         return Err(Error::InvalidInput("no active rules or checks selected".into()));
     }
 
@@ -1355,6 +1391,7 @@ pub async fn run(
         check_skipped_methods,
         http3_notes,
         refused_hosts,
+        skipped,
         oob,
         pruned,
         prune_error,
