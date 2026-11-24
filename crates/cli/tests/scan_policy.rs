@@ -262,7 +262,8 @@ fn compare_reads_what_a_policy_scan_ran() {
     let scope = &d["baseline"]["scope"];
     assert_eq!(scope["threshold"], "medium", "{d}");
     assert_eq!(scope["rule_thresholds"], json!({"40018": "high"}));
-    assert_eq!(scope["exclude_rules"], json!([40012]));
+    // The opt-in rules the policy didn't turn on are left out too.
+    assert_eq!(scope["exclude_rules"], json!([40023, 40041, 40012]));
     assert_eq!(scope["ported_rules"], true);
 
     // A result that doesn't say: no ported rule is covered.
