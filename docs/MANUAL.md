@@ -3887,7 +3887,7 @@ where the tool reads stdin, anything else comes in the call's `stdin`.
 - **Outdated software.** *Vulnerable JS Library* (10003, from ZAP's retire add-on) checks
   every script it sees against Retire.js's database of vulnerable jQuery, Angular,
   Bootstrap, lodash, ... versions and lists the CVEs; the database comes with the ZAP rule
-  data, so the same update refreshes it. The brainproxy checks report a PHP or Apache httpd
+  data, so the same update refreshes it. The brainproxy checks report a PHP, Apache httpd or nginx
   version in a response header that has known CVEs (from ZAP's server-side version rule;
   at low confidence when the header says it's a distribution package, whose fixes are
   usually backported). The scans in the desktop app also run the Nuclei

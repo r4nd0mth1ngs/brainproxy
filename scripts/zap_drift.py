@@ -156,10 +156,12 @@ def main():
             report["data_changed"].append(data)
 
     # Rules covered by generated feed checks: regenerate when their class or data changes.
+    # A feed rule may pin its own, newer commit (its data moves on without the ports).
     feed_rules = sync.get("feed_rules", {})
     for cls, rule in sorted(feed_rules.items()):
         paths = [ADDON_JAVA[rule["addon"]].format(cls), *rule.get("data", [])]
-        log = git(repo, "log", "--format=%h %s", f"{pinned}..{head}", "--", *paths).strip().splitlines()
+        since = rule.get("commit", pinned)
+        log = git(repo, "log", "--format=%h %s", f"{since}..{head}", "--", *paths).strip().splitlines()
         if log:
             report["feed_changed"].append({"class": cls, "generator": rule["generator"], "ours": rule["ours"], "commits": log})
 

@@ -36,11 +36,13 @@
     "ServerSideVersionScanRule": {
       "addon": "pscanrules",
       "generator": "scripts/version_feed.py",
+      "commit": "c065a2e6094bf2c1125ad4d0274c7147a7a851e1",
       "data": [
         "addOns/pscanrules/src/main/resources/org/zaproxy/zap/extension/pscanrules/resources/php-known-vulnerabilities.json",
-        "addOns/pscanrules/src/main/resources/org/zaproxy/zap/extension/pscanrules/resources/apache-known-vulnerabilities.json"
+        "addOns/pscanrules/src/main/resources/org/zaproxy/zap/extension/pscanrules/resources/apache-known-vulnerabilities.json",
+        "addOns/pscanrules/src/main/resources/org/zaproxy/zap/extension/pscanrules/resources/nginx-known-vulnerabilities.json"
       ],
-      "ours": "feed/passive/php/ and feed/passive/apache/"
+      "ours": "feed/passive/php/, feed/passive/apache/ and feed/passive/nginx/"
     }
   }
 }

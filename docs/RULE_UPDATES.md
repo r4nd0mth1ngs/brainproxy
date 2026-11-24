@@ -25,7 +25,11 @@ Know exactly when upstream changes something we ported, with no manual tracking.
 - Every ported file starts with `//! Ported from ZAP <Class> (<addon>, Apache License 2.0).`
 - `zap-sync.json` pins the zap-extensions commit the ports are based on, lists the data
   files we copied, records rules skipped on purpose, and lists rules covered by generated
-  feed checks instead of a port (`feed_rules`: the generator and the upstream data it reads).
+  feed checks instead of a port (`feed_rules`: the generator, the upstream data it reads,
+  and optionally a `commit` of its own). ZAP's server-side version rule is one: its PHP,
+  Apache httpd and nginx advisory data becomes the signed feed's `feed/passive/` checks
+  (`scripts/version_feed.py`). Its own pin lets the advisory data move ahead without
+  moving the ports' pin past upstream code changes they haven't taken.
 - `scripts/zap_drift.py` maps the headers to upstream Java paths and reports:
   rules changed since the pinned commit (with upstream commit subjects), rules removed or
   renamed upstream, changed data files, feed checks to regenerate (their rule or data

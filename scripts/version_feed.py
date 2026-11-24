@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Generate the feed's known-vulnerability checks for PHP and Apache httpd from ZAP's data.
+"""Generate the feed's known-vulnerability checks for PHP, Apache httpd and nginx from ZAP's data.
 
 Covers ZAP's ServerSideVersionScanRule (pscanrules, alert 20020, Apache License 2.0)
 as signed feed checks instead of a compiled-in port, so new advisories reach installs
-without a release. The data is ZAP's php- and apache-known-vulnerabilities.json at the
-commit pinned in zap-sync.json (or --from DIR holding both files).
+without a release. The data is ZAP's php-, apache- and nginx-known-vulnerabilities.json
+at the commit zap-sync.json pins for this rule (`feed_rules`, else the ports' `commit`),
+or --from DIR holding the three files.
 
 Per product, two passive checks per severity band, so a response gets at most one
 finding per band rather than one per CVE; each CVE is a named DSL matcher, listed in the
 finding's "Matched:" line. One check is at medium confidence; its twin (`-distribution`)
 is at low confidence and reports versions the header marks as a distribution package
-(`Apache/2.4.41 (Ubuntu)`, `PHP/7.4.3-4ubuntu2.20`), which usually has fixes backported,
+(`Apache/2.4.41 (Ubuntu)`, `nginx/1.18.0 (Ubuntu)`, `PHP/7.4.3-4ubuntu2.20`), which
+usually has fixes backported,
 as ZAP does. CVEs that brainproxy's own rule 100001 (PHP2Shell) already reports are left
 out. Unlike ZAP, versions without a patch number (PHP/8.2) aren't matched: ZAP reports
 those at low risk, and they match nearly every advisory. ZAP looks for the distribution
@@ -62,6 +64,24 @@ PRODUCTS = {
         ],
         "reference": ["https://httpd.apache.org/security/vulnerabilities_24.html", "https://httpd.apache.org/security/"],
     },
+    "nginx": {
+        "data": "nginx-known-vulnerabilities.json",
+        # `nginx/1.25.3` as the Server header has it; `nginx-ingress/1.0` and OpenResty's
+        # own version numbers don't match, as in ZAP.
+        "token": "nginx",
+        "title": "nginx",
+        "what": "nginx itself (not third-party modules)",
+        "advisories": "the nginx project's security advisories",
+        "covered": set(),
+        # ZAP marks the advisories that affect only nginx on Windows as assumed.
+        "assumed": "assumed: only nginx on Windows is affected",
+        "remediation": [
+            "Upgrade nginx to a supported version that includes the fixes for the listed",
+            "vulnerabilities. Also stop the server disclosing its version: set",
+            "server_tokens off.",
+        ],
+        "reference": ["https://nginx.org/en/security_advisories.html"],
+    },
 }
 
 # ZAP's distribution markers: a comment naming one, or a package suffix right after the version.
@@ -79,7 +99,10 @@ def load(name, args):
         return json.loads((pathlib.Path(args.source) / name).read_text())
     sync = json.loads(SYNC.read_text())
     repo = sync["repository"].removeprefix("https://github.com/").removesuffix(".git")
-    url = f"https://raw.githubusercontent.com/{repo}/{sync['commit']}/{RESOURCES}{name}"
+    # The feed may follow upstream data past the ports' pin: moving that pin would pass off
+    # ported rules as in sync with upstream code changes they haven't taken.
+    pin = sync.get("feed_rules", {}).get("ServerSideVersionScanRule", {}).get("commit", sync["commit"])
+    url = f"https://raw.githubusercontent.com/{repo}/{pin}/{RESOURCES}{name}"
     return json.loads(subprocess.run(["curl", "-fsSL", "--max-time", "30", url], check=True, capture_output=True).stdout)
 
 
@@ -228,7 +251,7 @@ def generate(key, args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--from", dest="source", help="a folder holding php- and apache-known-vulnerabilities.json")
+    ap.add_argument("--from", dest="source", help="a folder holding php-, apache- and nginx-known-vulnerabilities.json")
     args = ap.parse_args()
     for key in PRODUCTS:
         generate(key, args)

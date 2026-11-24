@@ -69,7 +69,9 @@ class UnportedRules(unittest.TestCase):
 class ExitCode(unittest.TestCase):
     """main() against a throwaway upstream repository."""
 
-    def run_main(self, files, *flags):
+    def run_main(self, files, *flags, later=(), feed=None):
+        """`later` files land in a second upstream commit; `feed` is the feed rule's entry,
+        whose "commit" may be "first" or "head"."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
             upstream = tmp / "upstream"
@@ -81,10 +83,24 @@ class ExitCode(unittest.TestCase):
             subprocess.run(["git", "init", "-q", "-b", "main", str(upstream)], check=True)
             subprocess.run([*git, "-C", str(upstream), "add", "."], check=True)
             subprocess.run([*git, "-C", str(upstream), "commit", "-qm", "x"], check=True)
-            commit = subprocess.run(["git", "-C", str(upstream), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            rev = lambda: subprocess.run(["git", "-C", str(upstream), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            commit = rev()
+            for f in later:
+                path = upstream / f
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("changed\n")
+            if later:
+                subprocess.run([*git, "-C", str(upstream), "add", "."], check=True)
+                subprocess.run([*git, "-C", str(upstream), "commit", "-qm", "later"], check=True)
             subprocess.run(["git", "clone", "-q", str(upstream), str(tmp / "clone")], check=True)
             sync = tmp / "zap-sync.json"
-            sync.write_text(json.dumps({"repository": str(upstream), "commit": commit}))
+            config = {"repository": str(upstream), "commit": commit}
+            if feed is not None:
+                feed = dict(feed)
+                if "commit" in feed:
+                    feed["commit"] = commit if feed["commit"] == "first" else rev()
+                config["feed_rules"] = {"ServerSideVersionScanRule": feed}
+            sync.write_text(json.dumps(config))
             out = io.StringIO()
             # A ROOT without crates/: nothing is ported.
             with mock.patch.object(zap_drift, "SYNC", sync), mock.patch.object(zap_drift, "ROOT", tmp), mock.patch.object(sys, "argv", ["zap_drift", "--repo", str(tmp / "clone"), *flags]):
@@ -126,6 +142,19 @@ class ExitCode(unittest.TestCase):
         code, out = self.run_main(ALL_ADDONS + [java("pscanrulesBeta", "CacheableScanRule")], "--json")
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["unported"], [{"addon": "pscanrulesBeta", "class": "CacheableScanRule", "status": "beta", "informational": True}])
+
+    def test_a_feed_rule_can_pin_its_own_commit(self):
+        data = "addOns/pscanrules/data/nginx-known-vulnerabilities.json"
+        feed = {"addon": "pscanrules", "generator": "scripts/version_feed.py", "data": [data], "ours": "feed/passive/nginx/"}
+        files = ALL_ADDONS + [java("pscanrules", "ServerSideVersionScanRule")]
+        # Data changed after the ports' pin: the feed is to be regenerated.
+        code, out = self.run_main(files, "--json", later=[data], feed=feed)
+        self.assertEqual(code, 10)
+        self.assertEqual([c["commits"][0].split(" ", 1)[1] for c in json.loads(out)["feed_changed"]], ["later"])
+        # The feed pinned at that change is in sync, though the ports' pin is older.
+        code, out = self.run_main(files, "--json", later=[data], feed={**feed, "commit": "head"})
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["feed_changed"], [])
 
 
 if __name__ == "__main__":
