@@ -12,6 +12,7 @@
 //! after the last unit, `run` waits up to `ActiveConfig::oob_wait` while
 //! correlating interactions the OOB listener received (see `crate::oob`).
 
+pub mod canary;
 pub mod points;
 pub mod policy;
 pub mod rules;

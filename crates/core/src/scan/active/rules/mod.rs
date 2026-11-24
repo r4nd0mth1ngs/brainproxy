@@ -7,7 +7,7 @@ mod injection;
 mod jwt;
 #[cfg(test)]
 mod jwt_e2e;
-mod params;
+pub(super) mod params;
 pub(crate) mod probes;
 
 use crate::scan::active::ActiveRule;
