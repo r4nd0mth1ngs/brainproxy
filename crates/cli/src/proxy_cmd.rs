@@ -19,7 +19,7 @@ use brainproxy_core::rule_presets;
 use brainproxy_core::rules::{Engine, MatchKind, ReplaceKind, RuleAction};
 use brainproxy_core::store::{HistoryFilter, Store};
 use brainproxy_core::{codec, Error};
-use clap::{Subcommand, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
 use crate::output::{body_value, Out};
@@ -663,47 +663,64 @@ fn preset_names() -> clap::builder::PossibleValuesParser {
     )
 }
 
+/// The filter part of `intercept enable` and `intercept set`.
+const INTERCEPT_HELP: &str = "--filter takes the query language of `history list --filter` (see `history list \
+    --help`), asked about what is known when the message is held: a request is matched by itself (after \
+    match-and-replace rules), a response by the request sent and the response, a WebSocket message by its \
+    connection's handshake request. Response fields (status, length, duration, title, type, resp, \
+    resp.body, body, resp.headers, resp.header.NAME) are refused unless only --responses is held; id, \
+    error, note and tag are refused always. A bare word searches the URL (and the title of a response) and \
+    matches the method. --host, --path and --method still apply: a message is held when all that are \
+    given match. They read the request as the client sent it, the filter the request as it goes out. \
+    Enable and set replace every setting, so pass the filter again each time (an empty one is none).";
+
+/// What intercept holds, shared by `enable` and `set` (flattened, so the flag names are the same).
+#[derive(Args)]
+pub struct InterceptOpts {
+    #[arg(long)]
+    pub requests: bool,
+    #[arg(long)]
+    pub responses: bool,
+    /// Hold WebSocket messages from the client (text and binary; control frames pass).
+    #[arg(long)]
+    pub ws_to_server: bool,
+    /// Hold WebSocket messages from the server.
+    #[arg(long)]
+    pub ws_to_client: bool,
+    /// Only hold messages for hosts matching this regex.
+    #[arg(long)]
+    pub host: Option<String>,
+    /// Only hold messages for paths matching this regex (WebSocket: the upgrade request's path).
+    #[arg(long)]
+    pub path: Option<String>,
+    /// Only hold these methods (regex alternation, e.g. "POST|PUT"). Not applied to WebSocket messages.
+    #[arg(long)]
+    pub method: Option<String>,
+    /// Only hold messages whose exchange matches this query in the filter language of `history list
+    /// --filter`, e.g. 'method=POST NOT path:/static'. Combines with --host, --path and --method.
+    #[arg(long, value_name = "QUERY")]
+    pub filter: Option<String>,
+    /// Seconds a held message waits for a decision.
+    #[arg(long, default_value_t = 120)]
+    pub timeout: u64,
+    /// What happens to a message nobody resolved in time.
+    #[arg(long, value_enum, default_value = "forward")]
+    pub timeout_action: TimeoutArg,
+}
+
 #[derive(Subcommand)]
 pub enum InterceptCmd {
     /// Start holding matching messages in the queue. With no direction flag, requests are held.
-    #[command(after_help = "--filter takes the query language of `history list --filter` (see `history list \
-        --help`), asked about what is known when the message is held: a request is matched by itself (after \
-        match-and-replace rules), a response by the request sent and the response, a WebSocket message by its \
-        connection's handshake request. Response fields (status, length, duration, title, type, resp, \
-        resp.body, body, resp.headers, resp.header.NAME) are refused unless only --responses is held; id, \
-        error, note and tag are refused always. A bare word searches the URL (and the title of a response) and \
-        matches the method. --host, --path and --method still apply: a message is held when all that are \
-        given match. They read the request as the client sent it, the filter the request as it goes out. Enable replaces every setting, so pass the filter again each time (an empty one is none).")]
+    #[command(after_help = INTERCEPT_HELP)]
     Enable {
-        #[arg(long)]
-        requests: bool,
-        #[arg(long)]
-        responses: bool,
-        /// Hold WebSocket messages from the client (text and binary; control frames pass).
-        #[arg(long)]
-        ws_to_server: bool,
-        /// Hold WebSocket messages from the server.
-        #[arg(long)]
-        ws_to_client: bool,
-        /// Only hold messages for hosts matching this regex.
-        #[arg(long)]
-        host: Option<String>,
-        /// Only hold messages for paths matching this regex (WebSocket: the upgrade request's path).
-        #[arg(long)]
-        path: Option<String>,
-        /// Only hold these methods (regex alternation, e.g. "POST|PUT"). Not applied to WebSocket messages.
-        #[arg(long)]
-        method: Option<String>,
-        /// Only hold messages whose exchange matches this query in the filter language of `history list
-        /// --filter`, e.g. 'method=POST NOT path:/static'. Combines with --host, --path and --method.
-        #[arg(long, value_name = "QUERY")]
-        filter: Option<String>,
-        /// Seconds a held message waits for a decision.
-        #[arg(long, default_value_t = 120)]
-        timeout: u64,
-        /// What happens to a message nobody resolved in time.
-        #[arg(long, value_enum, default_value = "forward")]
-        timeout_action: TimeoutArg,
+        #[command(flatten)]
+        opts: InterceptOpts,
+    },
+    /// Change what intercept holds, as `enable` does, but leave intercept on or off as it is.
+    #[command(after_help = INTERCEPT_HELP)]
+    Set {
+        #[command(flatten)]
+        opts: InterceptOpts,
     },
     /// Stop holding new messages. Messages already held still wait for a decision.
     Disable,
@@ -3250,41 +3267,59 @@ fn rule_host(guard: &std::sync::Arc<brainproxy_core::guard::Guard>, names: &[Str
     })
 }
 
+/// The settings `opts` describe, checked, with intercept on or off as `enabled` says.
+fn intercept_settings(opts: InterceptOpts, enabled: bool) -> Result<InterceptSettings, Error> {
+    let InterceptOpts {
+        requests,
+        responses,
+        ws_to_server,
+        ws_to_client,
+        host,
+        path,
+        method,
+        filter,
+        timeout,
+        timeout_action,
+    } = opts;
+    let settings = InterceptSettings {
+        enabled,
+        requests: requests || !(responses || ws_to_server || ws_to_client),
+        responses,
+        ws_to_server,
+        ws_to_client,
+        host,
+        path,
+        method,
+        filter: filter.filter(|f| !f.trim().is_empty()),
+        timeout_secs: timeout,
+        timeout_action: match timeout_action {
+            TimeoutArg::Forward => TimeoutAction::Forward,
+            TimeoutArg::Drop => TimeoutAction::Drop,
+        },
+    };
+    settings.compile()?;
+    Ok(settings)
+}
+
 pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
     match cmd {
-        InterceptCmd::Enable {
-            requests,
-            responses,
-            ws_to_server,
-            ws_to_client,
-            host,
-            path,
-            method,
-            filter,
-            timeout,
-            timeout_action,
-        } => {
-            let settings = InterceptSettings {
-                enabled: true,
-                requests: requests || !(responses || ws_to_server || ws_to_client),
-                responses,
-                ws_to_server,
-                ws_to_client,
-                host,
-                path,
-                method,
-                filter: filter.filter(|f| !f.trim().is_empty()),
-                timeout_secs: timeout,
-                timeout_action: match timeout_action {
-                    TimeoutArg::Forward => TimeoutAction::Forward,
-                    TimeoutArg::Drop => TimeoutAction::Drop,
-                },
-            };
-            settings.compile()?;
+        InterceptCmd::Enable { opts } => {
+            let settings = intercept_settings(opts, true)?;
             store.set_setting(INTERCEPT_KEY, &settings)?;
             let warning = running(&store)?.is_none().then_some("no proxy is running for this project");
             out.ok(json!({"settings": settings, "warning": warning}), || "intercept enabled".into());
+        }
+        InterceptCmd::Set { opts } => {
+            let was: InterceptSettings = store.setting(INTERCEPT_KEY)?;
+            let settings = intercept_settings(opts, was.enabled)?;
+            store.set_setting(INTERCEPT_KEY, &settings)?;
+            let warning =
+                (settings.enabled && running(&store)?.is_none()).then_some("no proxy is running for this project");
+            let on = if settings.enabled { "on" } else { "off" };
+            out.ok(json!({"settings": settings, "warning": warning}), || {
+                format!("intercept settings saved (intercept is {on})")
+            });
         }
         InterceptCmd::Disable => {
             let mut settings: InterceptSettings = store.setting(INTERCEPT_KEY)?;

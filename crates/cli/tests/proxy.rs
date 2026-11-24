@@ -233,6 +233,45 @@ fn intercept_holds_what_its_filter_matches() {
 }
 
 #[test]
+fn intercept_set_changes_filters_and_leaves_intercept_off() {
+    let env = Env::new("intercept-set");
+    let https_port = spawn_echo(true, &env.dir);
+    let started = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let proxy = started["usage"]["proxy_url"].as_str().unwrap().to_string();
+
+    // Off: set saves the filter, intercept stays off, and nothing is held meanwhile.
+    let set = env.ok(&["intercept", "set", "--path", "^/held", "--filter", "method=POST", "--timeout", "30"]);
+    assert_eq!((set["settings"]["enabled"].as_bool(), set["warning"].as_str()), (Some(false), None), "{set}");
+    let status = env.ok(&["intercept", "status"]);
+    assert_eq!(status["settings"]["enabled"], false, "{status}");
+    assert_eq!(
+        (status["settings"]["filter"].as_str(), status["settings"]["path"].as_str()),
+        (Some("method=POST"), Some("^/held"))
+    );
+    wait_for_settings();
+    let (code, _) = curl(&proxy, &env.ca(), &format!("https://localhost:{https_port}/held"), &["-d", "a=1"]);
+    assert_eq!(code, 200, "a request intercept would match isn't held while it is off");
+    assert_eq!(env.ok(&["intercept", "list", "--state", "all"])["count"], 0);
+
+    // An invalid filter is refused and changes nothing.
+    let (code, v) = env.run(&["intercept", "set", "--filter", "stauts:5"]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+    assert_eq!(env.ok(&["intercept", "status"])["settings"], status["settings"]);
+
+    // On: set keeps it on with the new filter.
+    env.ok(&["intercept", "enable"]);
+    let set = env.ok(&["intercept", "set", "--responses", "--timeout", "5"]);
+    assert_eq!(
+        (set["settings"]["enabled"].as_bool(), set["settings"]["responses"].as_bool()),
+        (Some(true), Some(true))
+    );
+    assert_eq!(set["settings"]["requests"], false, "{set}");
+    assert!(set["settings"].get("filter").is_none(), "set replaces every setting: {set}");
+    env.ok(&["intercept", "disable"]);
+    env.ok(&["proxy", "stop"]);
+}
+
+#[test]
 fn proxy_end_to_end() {
     let env = Env::new("e2e");
     let http_port = spawn_echo(false, &env.dir);
