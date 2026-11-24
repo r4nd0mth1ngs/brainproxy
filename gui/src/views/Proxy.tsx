@@ -23,7 +23,7 @@ import {
   mergePage,
   needsSearch,
   newSearch,
-  refilter,
+  refusedForGood,
   rerun,
   searchFrom,
   mergeLocal,
@@ -185,7 +185,7 @@ const QUERY_HELP =
 const MODE_HELP: Record<SearchMode, string> = {
   text: "The text filters the URL, title and method of the rows shown",
   contents:
-    "Search inside requests and responses: headers and bodies, compressed bodies included. Literal: the text must appear as stored (URL-encoded or JSON-escaped text included), in the same case unless Aa is off. Runs history list --contains.",
+    "Search inside requests and responses: headers and bodies, compressed bodies included. Literal unless .* is on: the text must appear as stored (URL-encoded or JSON-escaped text included), in the same case unless Aa is off. Runs history list --contains.",
   query: QUERY_HELP,
 };
 
@@ -286,10 +286,10 @@ function History({ active }: { active: boolean }) {
         searchCall.current = call;
         let next: ContentSearch;
         try {
-          next = mergePage(s, (await run<{ items: HistoryItem[] }>(searchArgs(s), { call })).items, upTo, current.current);
+          next = mergePage(s, (await run<{ items: HistoryItem[] }>(searchArgs(s), { call })).items, upTo);
         } catch (e: any) {
           // A query that doesn't parse fails the same way every time: stop until it changes.
-          next = failPage(s, e.message, Date.now(), e instanceof CliError && e.kind === "invalid_input" && s.query.kind === "filter");
+          next = failPage(s, e.message, Date.now(), e instanceof CliError && e.kind === "invalid_input" && refusedForGood(s.query));
         } finally {
           searchCall.current = null;
         }
@@ -374,18 +374,6 @@ function History({ active }: { active: boolean }) {
       if (searchCall.current) cancelCli(searchCall.current).catch(() => {});
     };
   }, [wanted]);
-
-  // The other filters only decide which matches show and count toward the cap: work that out
-  // again here, searching on only if the cap no longer applies.
-  useEffect(() => {
-    const s = search.current;
-    if (!isCurrent(s, filter)) return;
-    const next = refilter(s, filter);
-    if (next === s) return;
-    search.current = next;
-    setFound(next);
-    searchMore();
-  }, [filter]);
 
   // A rule-changed exchange has two of each: the request before the rules and as sent, the
   // response as received and after the rules. The row's own (sent, received) show first.
@@ -581,12 +569,25 @@ function History({ active }: { active: boolean }) {
               aria-label="Match case"
               title={
                 filter.ignoreCase
-                  ? "Match case is off: A-Z and a-z match in any case (history list --ignore-case). Letters outside ASCII (é, É) and other bytes still match only as stored."
-                  : "Match case is on: the text must match in the case it was recorded. Click to match ASCII letters in any case."
+                  ? "Match case is off: letters match in any case (history list --ignore-case), é and É, ß and SS included. With .* on it is the regex's (?i), which folds one letter to one: ß doesn't match SS."
+                  : "Match case is on: the text must match in the case it was recorded. Click to match in any case."
               }
               onClick={() => setFilter({ ...filter, ignoreCase: !filter.ignoreCase })}
             >
               Aa
+            </button>
+            <button
+              className={filter.regex ? "on" : ""}
+              aria-pressed={filter.regex}
+              aria-label="Regex"
+              title={
+                filter.regex
+                  ? "Regex is on: the text is a regex in Rust syntax, matched against the recorded bytes (history list --regex). (?m) makes ^ and $ match at each line."
+                  : "Regex is off: the text is matched literally. Click to search with a regex."
+              }
+              onClick={() => setFilter({ ...filter, regex: !filter.regex })}
+            >
+              .*
             </button>
           </div>
         )}

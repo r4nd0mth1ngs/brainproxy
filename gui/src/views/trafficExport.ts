@@ -104,7 +104,7 @@ export function exportProblem(f: TrafficFilter, o: ExportOptions): string | null
 export function exportArgs(f: TrafficFilter, o: ExportOptions, path: string, overwrite: boolean): string[] {
   const query = exportQuery(f);
   // The same search Traffic runs (searchArgs), so the file holds the rows the table shows.
-  const contains = f.contents && !f.query && f.text.trim() ? [`--contains=${f.text}`, ...(f.ignoreCase ? ["--ignore-case"] : [])] : [];
+  const contains = f.contents && !f.query && f.text.trim() ? [`--contains=${f.text}`, ...(f.ignoreCase ? ["--ignore-case"] : []), ...(f.regex ? ["--regex"] : [])] : [];
   return [
     "history",
     "export",

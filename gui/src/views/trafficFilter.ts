@@ -10,10 +10,13 @@ export interface TrafficFilter {
   /** Search `text` inside requests and responses (the CLI) instead of URL, title and method. */
   contents: boolean;
   /**
-   * The contents search matches ASCII letters in any case (`--ignore-case`). Off: the text must
-   * match as stored. Only the contents search reads it.
+   * The contents search matches in any case (`--ignore-case`: Unicode full case folding, or the
+   * regex's own `(?i)` with `regex`). Off: the text must match as stored. Only the contents
+   * search reads it.
    */
   ignoreCase: boolean;
+  /** The contents search's text is a regex (`--regex`). Only the contents search reads it. */
+  regex: boolean;
   /**
    * `text` is a query in the filter language (`history list --filter`), run by the CLI. Wins
    * over `contents`: at most one of them is on.
@@ -27,7 +30,7 @@ export interface TrafficFilter {
 }
 
 // Refused requests (outside the engagement scope) are mostly browser background noise.
-export const DEFAULT_FILTER: TrafficFilter = { text: "", contents: false, ignoreCase: false, query: false, sources: [], hideErrors: false, hideAssets: false, hideRefused: true };
+export const DEFAULT_FILTER: TrafficFilter = { text: "", contents: false, ignoreCase: false, regex: false, query: false, sources: [], hideErrors: false, hideAssets: false, hideRefused: true };
 
 /** Which search the text box does: the URL, title and method here, or a CLI search. */
 export type SearchMode = "text" | "contents" | "query";
@@ -64,7 +67,7 @@ export const savedKey = (project: string) => `traffic-filters:${project}`;
 
 /**
  * A filter from stored JSON: unknown fields are dropped and missing ones take the defaults.
- * `ignoreCase` is kept only on a contents search, the one that reads it, so a URL or query
+ * `ignoreCase` and `regex` are kept only on a contents search, the one that reads them, so a URL or query
  * filter saved with it left over equals the same filter without it. (The toolbar's own state
  * keeps it across a mode change: withMode doesn't come through here.)
  */
@@ -77,6 +80,7 @@ export function parseFilter(v: unknown): TrafficFilter {
     text: typeof o.text === "string" ? o.text : "",
     contents,
     ignoreCase: contents && bool("ignoreCase"),
+    regex: contents && bool("regex"),
     query,
     sources: Array.isArray(o.sources) ? [...new Set(o.sources.filter((s): s is string => typeof s === "string"))] : [],
     hideErrors: bool("hideErrors"),
@@ -139,14 +143,14 @@ export const FILTERS_LIST_ARGS = ["history", "filters", "list"];
 export const filtersSaveArgs = (rev: number) => ["history", "filters", "save", "--if-revision", String(rev)];
 
 /**
- * A save's stdin: the whole list, each filter in its stored form. ignoreCase is left out when
- * off, as the CLI stores it: a large set stays within what a save takes, and a build from
- * before it existed still reads the filters.
+ * A save's stdin: the whole list, each filter in its stored form. ignoreCase and regex are left
+ * out when off, as the CLI stores them: a large set stays within what a save takes, and a build
+ * from before they existed still reads the filters.
  */
 export function savedBody(list: SavedFilter[]): string {
   const stored = (f: TrafficFilter) => {
-    const { ignoreCase, ...rest } = parseFilter(f);
-    return ignoreCase ? { ...rest, ignoreCase } : rest;
+    const { ignoreCase, regex, ...rest } = parseFilter(f);
+    return { ...rest, ...(ignoreCase ? { ignoreCase } : {}), ...(regex ? { regex } : {}) };
   };
   return JSON.stringify({ filters: list.map((s) => ({ name: s.name, filter: stored(s.filter) })) });
 }
@@ -300,8 +304,8 @@ export function copySaved(from: string, to: string): boolean {
 
 /** Rows per `history list --contains` call. */
 export const SEARCH_PAGE = 2000;
-/** A search stops after this many matches (oldest first); the rest needs a narrower search. */
-export const MAX_MATCHES = 10000;
+/** From this many matches the toolbar says how many are loaded. A search never stops at it. */
+export const MANY_MATCHES = 10000;
 /** After a failed page the next try waits this long, doubling per failure up to RETRY_MAX (ms). */
 export const RETRY_BASE = 2000;
 export const RETRY_MAX = 60000;
@@ -314,21 +318,22 @@ export interface SearchQuery {
   kind: "contains" | "filter";
   text: string;
   source: string | null;
-  /** --ignore-case, for kind "contains" only (the filter language folds ASCII case itself). */
+  /** --ignore-case, for kind "contains" only (the filter language folds case itself). */
   ignoreCase: boolean;
+  /** --regex, for kind "contains" only. */
+  regex: boolean;
 }
 
 export interface ContentSearch {
   query: SearchQuery;
   /**
-   * Every row the CLI matched up to `cursor`, whether the other filters show it or not, so
-   * changing a checkbox needs no new search. The fields those filters use never change.
+   * The ids of every row the CLI matched up to `cursor`, whether the other filters show it or
+   * not, so changing a checkbox needs no new search. Ids only: the rows themselves are the
+   * polled ones, so a search with hundreds of thousands of matches holds no copy of them.
    */
-  matches: Map<number, HistoryItem>;
+  matches: Set<number>;
   /** Every match with an id up to here is in `matches`. */
   cursor: number;
-  /** Stopped at MAX_MATCHES shown matches: rows after `cursor` aren't searched. */
-  capped: boolean;
   /** The last page failed; it is tried again from `retryAt` (ms, Date.now). */
   error: string | null;
   /** The CLI refused the query itself (it doesn't parse): never tried again until it changes. */
@@ -337,7 +342,7 @@ export interface ContentSearch {
    * The matches of the search this one reruns (`rerun`): rows past `cursor` keep showing as
    * they did until this one reaches them, so the table doesn't empty meanwhile.
    */
-  previous?: Map<number, HistoryItem>;
+  previous?: Set<number>;
   /** Pages failed in a row, for the backoff. */
   failures: number;
   retryAt: number;
@@ -346,20 +351,20 @@ export interface ContentSearch {
 /**
  * The search a filter asks for, or null when the contents search is off or its text is only
  * whitespace (it would match almost every row). Only the text, a single source and (for a
- * contents search) the case setting are sent to the CLI, so only they make a new search; the
- * checkboxes are applied here (see refilter).
+ * contents search) the case and regex settings are sent to the CLI, so only they make a new
+ * search; the checkboxes are applied here (visibleRows).
  */
 export function searchFor(f: TrafficFilter): SearchQuery | null {
   if (!(f.contents || f.query) || !f.text.trim()) return null;
   const kind = f.query ? "filter" : "contains";
-  return { kind, text: f.text, source: f.sources.length === 1 ? f.sources[0] : null, ignoreCase: kind === "contains" && f.ignoreCase };
+  const contains = kind === "contains";
+  return { kind, text: f.text, source: f.sources.length === 1 ? f.sources[0] : null, ignoreCase: contains && f.ignoreCase, regex: contains && f.regex };
 }
 
 export const newSearch = (query: SearchQuery): ContentSearch => ({
   query: { ...query },
-  matches: new Map(),
+  matches: new Set(),
   cursor: 0,
-  capped: false,
   error: null,
   invalid: false,
   failures: 0,
@@ -376,22 +381,22 @@ export const rerun = (s: ContentSearch): ContentSearch => ({ ...newSearch(s.quer
  */
 export function searchFrom(s: ContentSearch, id: number): ContentSearch {
   if (id > s.cursor) return s;
-  const matches = new Map([...s.matches].filter(([k]) => k < id));
-  const previous = new Map([...(s.previous ?? []), ...s.matches]);
-  return { ...s, matches, cursor: id - 1, capped: false, previous };
+  const matches = new Set([...s.matches].filter((k) => k < id));
+  const previous = new Set([...(s.previous ?? []), ...s.matches]);
+  return { ...s, matches, cursor: id - 1, previous };
 }
 
 /** Whether `s` is the search the filter asks for (else its matches belong to an older query). */
 export const isCurrent = (s: ContentSearch | null, f: TrafficFilter): s is ContentSearch => {
   const want = searchFor(f);
   const q = s?.query;
-  return !!q && !!want && q.kind === want.kind && q.text === want.text && q.source === want.source && q.ignoreCase === want.ignoreCase;
+  return !!q && !!want && q.kind === want.kind && q.text === want.text && q.source === want.source && q.ignoreCase === want.ignoreCase && q.regex === want.regex;
 };
 
 /** `history list` arguments for the next page of a search. */
 export function searchArgs(s: ContentSearch): string[] {
-  const { kind, text, source, ignoreCase } = s.query;
-  const what = kind === "filter" ? [`--filter=${text}`] : [`--contains=${text}`, ...(ignoreCase ? ["--ignore-case"] : [])];
+  const { kind, text, source, ignoreCase, regex } = s.query;
+  const what = kind === "filter" ? [`--filter=${text}`] : [`--contains=${text}`, ...(ignoreCase ? ["--ignore-case"] : []), ...(regex ? ["--regex"] : [])];
   return ["history", "list", ...what, ...(source ? [`--source=${source}`] : []), `--after=${s.cursor}`, `--limit=${SEARCH_PAGE}`];
 }
 
@@ -399,43 +404,33 @@ export function searchArgs(s: ContentSearch): string[] {
  * Whether rows up to `upTo` (the newest id the poll has) still need searching. After a failure,
  * not before `retryAt`: the caller stops and a later poll tries again.
  */
-export const needsSearch = (s: ContentSearch, upTo: number, now = Date.now()) => !s.capped && s.cursor < upTo && now >= s.retryAt;
+export const needsSearch = (s: ContentSearch, upTo: number, now = Date.now()) => s.cursor < upTo && now >= s.retryAt;
 
-/** How many of the search's matches `f` shows. */
-export function shownMatches(s: ContentSearch, f: TrafficFilter): number {
-  let n = 0;
-  for (const i of s.matches.values()) if (matchesFilter(i, f)) n++;
-  return n;
-}
+/**
+ * Whether the CLI refusing this search as invalid input means it would refuse it again: a query
+ * that doesn't parse, or a regex that doesn't compile. (A literal search isn't refused that way.)
+ */
+export const refusedForGood = (q: SearchQuery) => q.kind === "filter" || q.regex;
 
 /**
  * The search after one page of results. `upTo` is the newest polled id, read before the call:
  * a short page means every match up to it (and up to the last match) is known; a full page
- * covers ids up to its last row only, so the next page starts there. Every match is kept, but
- * only those `f` shows count: a shown match past MAX_MATCHES stops the search.
+ * covers ids up to its last row only, so the next page starts there. Every match is kept,
+ * however many: the search runs to the newest row.
  */
-export function mergePage(s: ContentSearch, items: HistoryItem[], upTo: number, f: TrafficFilter): ContentSearch {
-  const matches = new Map(s.matches);
-  let shown = shownMatches(s, f);
+export function mergePage(s: ContentSearch, items: { id: number }[], upTo: number): ContentSearch {
+  const matches = new Set(s.matches);
   let cursor = s.cursor;
-  let capped = false;
   for (const i of items) {
     if (i.id <= s.cursor) continue;
-    if (matchesFilter(i, f)) {
-      if (shown >= MAX_MATCHES) {
-        capped = true;
-        break;
-      }
-      shown++;
-    }
-    matches.set(i.id, i);
+    matches.add(i.id);
     cursor = Math.max(cursor, i.id);
   }
-  const done = !capped && items.length < SEARCH_PAGE;
+  const done = items.length < SEARCH_PAGE;
   if (done) cursor = Math.max(cursor, upTo);
   // Caught up: what the rerun search replaced isn't needed any more.
   const previous = done ? undefined : s.previous;
-  return { ...s, matches, cursor, capped, previous, error: null, invalid: false, failures: 0, retryAt: 0 };
+  return { ...s, matches, cursor, previous, error: null, invalid: false, failures: 0, retryAt: 0 };
 }
 
 /**
@@ -447,27 +442,6 @@ export function failPage(s: ContentSearch, error: string, now = Date.now(), inva
   const failures = s.failures + 1;
   const retryAt = invalid ? Infinity : now + Math.min(RETRY_MAX, RETRY_BASE * 2 ** (failures - 1));
   return { ...s, error, invalid, failures, retryAt };
-}
-
-/**
- * The search with the cap worked out again for `f`, after a checkbox (or a second source)
- * changed: the matches stay, nothing is searched again. Capped, it carries on from its cursor
- * when `f` shows no more than MAX_MATCHES of them (the next shown match stops it again); when
- * `f` shows more, it stops before the first match past the cap. The same object when nothing
- * changes.
- */
-export function refilter(s: ContentSearch, f: TrafficFilter): ContentSearch {
-  const ids = [...s.matches.keys()].sort((a, b) => a - b);
-  let shown = 0;
-  for (const id of ids) {
-    if (!matchesFilter(s.matches.get(id)!, f)) continue;
-    if (shown === MAX_MATCHES) {
-      const matches = new Map(ids.filter((x) => x < id).map((x) => [x, s.matches.get(x)!]));
-      return { ...s, matches, cursor: id - 1, capped: true };
-    }
-    shown++;
-  }
-  return s.capped ? { ...s, capped: false } : s;
 }
 
 /**
@@ -487,9 +461,9 @@ export function visibleRows(rows: HistoryItem[], f: TrafficFilter, s: ContentSea
 /** A short status for the toolbar while a CLI search is on. */
 export function searchNote(s: ContentSearch | null, upTo: number): string {
   if (!s) return "Searching…";
-  if (s.invalid) return `Query: ${(s.error ?? "").replace(/^filter: /, "")}`;
+  if (s.invalid) return s.query.kind === "filter" ? `Query: ${(s.error ?? "").replace(/^filter: /, "")}` : (s.error ?? "");
   if (s.error) return `Search failed (trying again): ${s.error}`;
-  if (s.capped) return `Stopped at the first ${MAX_MATCHES.toLocaleString("en-US")} matches (up to #${s.cursor}); narrow the search or filters to see later ones`;
-  if (needsSearch(s, upTo)) return "Searching…";
-  return "";
+  const many = s.matches.size >= MANY_MATCHES ? `${s.matches.size.toLocaleString("en-US")} matches loaded` : "";
+  if (needsSearch(s, upTo)) return many ? `Searching… ${many}` : "Searching…";
+  return many;
 }

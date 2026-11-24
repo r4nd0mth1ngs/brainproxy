@@ -6,7 +6,7 @@ import {
   copySaved,
   DEFAULT_FILTER,
   failPage,
-  MAX_MATCHES,
+  MANY_MATCHES,
   RETRY_BASE,
   RETRY_MAX,
   SEARCH_PAGE,
@@ -19,7 +19,7 @@ import {
   newSearch,
   parseFilter,
   parseSaved,
-  refilter,
+  refusedForGood,
   rerun,
   searchFrom,
   deleteNamed,
@@ -37,7 +37,6 @@ import {
   searchArgs,
   searchFor,
   searchNote,
-  shownMatches,
   storeSaved,
   visibleRows,
   withMode,
@@ -174,13 +173,13 @@ test("unavailable storage loads nothing and reports a failed save", () => {
 /** A new contents search for `text` (and the filter's single source). */
 const ns = (text: string, patch: Partial<TrafficFilter> = {}) => newSearch(searchFor(cf(text, patch))!);
 /** A search whose earlier pages matched `ids` (rows the default filter shows). */
-const found = (text: string, ids: number[], cursor = Math.max(0, ...ids)) => ({ ...ns(text), matches: new Map(ids.map((id) => [id, row(id)])), cursor });
-const ids = (s: ContentSearch) => [...s.matches.keys()];
+const found = (text: string, ids: number[], cursor = Math.max(0, ...ids)) => ({ ...ns(text), matches: new Set(ids), cursor });
+const ids = (s: ContentSearch) => [...s.matches];
 
 test("a contents search needs text and passes a single source to the CLI", () => {
   assert.equal(searchFor(filter({ text: "token" })), null);
   assert.equal(searchFor(filter({ contents: true })), null);
-  assert.deepEqual(searchFor(cf("token", { sources: ["send", "proxy"] })), { kind: "contains", text: "token", source: null, ignoreCase: false });
+  assert.deepEqual(searchFor(cf("token", { sources: ["send", "proxy"] })), { kind: "contains", text: "token", source: null, ignoreCase: false, regex: false });
   assert.deepEqual(searchArgs(ns("token", { sources: ["send", "proxy"] })), ["history", "list", "--contains=token", "--after=0", `--limit=${SEARCH_PAGE}`]);
   const s = { ...ns("-x y", { sources: ["send"] }), cursor: 41 };
   assert.deepEqual(searchArgs(s), ["history", "list", "--contains=-x y", "--source=send", `--after=41`, `--limit=${SEARCH_PAGE}`]);
@@ -192,7 +191,7 @@ test("ignoring case adds --ignore-case to a contents search, and changing it is 
   const s = { ...ns("Token", { ignoreCase: true, sources: ["send"] }), cursor: 7 };
   assert.deepEqual(searchArgs(s), ["history", "list", "--contains=Token", "--ignore-case", "--source=send", "--after=7", `--limit=${SEARCH_PAGE}`]);
   const sent = row(1, { source: "send" });
-  const matched: ContentSearch = { ...s, matches: new Map([[1, sent]]) };
+  const matched: ContentSearch = { ...s, matches: new Set([1]) };
   assert.deepEqual(visibleRows([sent], cf("Token", { ignoreCase: true, sources: ["send"] }), matched), [sent]);
   // Flipping it makes the search the app holds an old one: its matches don't show, a new one runs.
   assert.deepEqual(visibleRows([sent], cf("Token", { sources: ["send"] }), matched), []);
@@ -203,6 +202,27 @@ test("ignoring case adds --ignore-case to a contents search, and changing it is 
   assert.deepEqual(searchArgs(newSearch(searchFor(qf("resp:token", { ignoreCase: true }))!)), ["history", "list", "--filter=resp:token", "--after=0", `--limit=${SEARCH_PAGE}`]);
   // Outside the CLI searches the URL filter is already case-insensitive and doesn't read it.
   assert.equal(searchFor(filter({ text: "token", ignoreCase: true })), null);
+});
+
+test("the regex toggle adds --regex to a contents search, and changing it is a new search", () => {
+  assert.equal(DEFAULT_FILTER.regex, false, "literal unless turned on");
+  const s = { ...ns("tok(en)?", { regex: true, ignoreCase: true }), cursor: 3 };
+  assert.deepEqual(searchArgs(s), ["history", "list", "--contains=tok(en)?", "--ignore-case", "--regex", "--after=3", `--limit=${SEARCH_PAGE}`]);
+  assert.ok(isCurrent(s, cf("tok(en)?", { regex: true, ignoreCase: true })));
+  assert.equal(isCurrent(s, cf("tok(en)?", { ignoreCase: true })), false);
+  // Only the contents search reads it.
+  assert.equal(searchFor(qf("status:5xx", { regex: true }))!.regex, false);
+  assert.equal(parseFilter({ text: "x", regex: true }).regex, false, "a URL filter");
+  // A regex that doesn't compile isn't tried again until it changes; a literal search is.
+  assert.ok(refusedForGood(s.query) && refusedForGood(searchFor(qf("x"))!) && !refusedForGood(searchFor(cf("x"))!));
+  const bad = failPage(s, "the contents search isn't a valid regex: unclosed group", 1000, true);
+  assert.equal(searchNote(bad, 50), "the contents search isn't a valid regex: unclosed group");
+  // Saved: kept when on, left out when off, as the CLI stores it (format 3).
+  const list = withSaved([], "tokens", cf("tok(en)?", { regex: true }));
+  assert.equal(JSON.parse(savedBody(list)).filters[0].filter.regex, true);
+  assert.equal(parseFilter(JSON.parse(savedBody(list)).filters[0].filter).regex, true);
+  assert.equal("regex" in JSON.parse(savedBody(withSaved([], "t", cf("Token")))).filters[0].filter, false);
+  assert.equal(savedMatching(list, cf("tok(en)?")), null);
 });
 
 test("a saved filter keeps whether its contents search ignores case", () => {
@@ -242,7 +262,7 @@ test("saved filters go to the project as history filters save takes them", () =>
   assert.deepEqual(filtersSaveArgs(3), ["history", "filters", "save", "--if-revision", "3"]);
   const list = [{ name: "errors", filter: filter({ query: true, text: "status:5xx", sources: ["proxy"] }) }];
   const body = JSON.parse(savedBody(list));
-  const { ignoreCase: _off, ...stored } = DEFAULT_FILTER;
+  const { ignoreCase: _off, regex: _literal, ...stored } = DEFAULT_FILTER;
   assert.deepEqual(body, { filters: [{ name: "errors", filter: { ...stored, query: true, text: "status:5xx", sources: ["proxy"] } }] });
   // What `history filters list` returns reads back the same (its mode field is ignored).
   assert.deepEqual(savedFrom([{ ...body.filters[0], mode: "query" }]), list);
@@ -285,15 +305,15 @@ test("filters kept by an older build are added to the project's without losing e
 test("a rerun search keeps showing the earlier matches it hasn't reached yet", () => {
   const f = qf("NOT tag=highlight");
   const all = rows(1, 6);
-  let s = mergePage(newSearch(searchFor(f)!), [row(1), row(3), row(5)], 6, f);
+  let s = mergePage(newSearch(searchFor(f)!), [row(1), row(3), row(5)], 6);
   s = rerun(s);
   // Nothing searched yet: the table shows what it showed.
   assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 3, 5]);
   // Searched up to 3 (row 3 was highlighted meanwhile): below the cursor only the new matches count.
-  s = { ...s, matches: new Map([[1, row(1)]]), cursor: 3 };
+  s = { ...s, matches: new Set([1]), cursor: 3 };
   assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 5]);
   // Caught up: the earlier matches are dropped.
-  s = mergePage(s, [row(6)], 6, f);
+  s = mergePage(s, [row(6)], 6);
   assert.equal(s.previous, undefined);
   assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 6]);
 });
@@ -301,14 +321,14 @@ test("a rerun search keeps showing the earlier matches it hasn't reached yet", (
 test("rows searched before their response came are searched again from the first of them", () => {
   const f = qf("status=200");
   const all = rows(1, 6);
-  let s = mergePage(newSearch(searchFor(f)!), [row(1), row(5)], 6, f);
+  let s = mergePage(newSearch(searchFor(f)!), [row(1), row(5)], 6);
   assert.equal(searchFrom(s, 7), s, "not searched yet: nothing to do");
   s = searchFrom(s, 3);
   assert.equal(s.cursor, 2);
-  assert.deepEqual([...s.matches.keys()], [1]);
+  assert.deepEqual([...s.matches], [1]);
   // Until the search gets there again, what showed still shows.
   assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 5]);
-  s = mergePage(s, [row(3), row(5)], 6, f);
+  s = mergePage(s, [row(3), row(5)], 6);
   assert.deepEqual(visibleRows(all, f, s).map((r) => r.id), [1, 3, 5]);
 });
 
@@ -362,7 +382,7 @@ const qf = (text: string, patch: Partial<TrafficFilter> = {}) => filter({ query:
 
 test("query mode sends the text as --filter, and is its own search", () => {
   assert.equal(searchFor(qf("  ")), null);
-  assert.deepEqual(searchFor(qf("status:5xx", { sources: ["send"] })), { kind: "filter", text: "status:5xx", source: "send", ignoreCase: false });
+  assert.deepEqual(searchFor(qf("status:5xx", { sources: ["send"] })), { kind: "filter", text: "status:5xx", source: "send", ignoreCase: false, regex: false });
   const s = { ...newSearch(searchFor(qf('-x resp.body:"a b"'))!), cursor: 9 };
   assert.deepEqual(searchArgs(s), ["history", "list", '--filter=-x resp.body:"a b"', "--after=9", `--limit=${SEARCH_PAGE}`]);
   // The same text as a contents search is another search.
@@ -392,15 +412,14 @@ test("a query the CLI refuses is not tried again until it changes", () => {
   // Any other failure is retried, and a good page clears it.
   const flaky = failPage(s, "busy", 1000);
   assert.ok(!flaky.invalid && needsSearch(flaky, 50, 1000 + RETRY_BASE));
-  assert.ok(!mergePage(bad, [], 50, qf("stauts:500")).invalid);
+  assert.ok(!mergePage(bad, [], 50).invalid);
 });
 
 test("a short page covers everything up to the polled id", () => {
-  const f = cf("token");
   let s = ns("token");
   assert.ok(needsSearch(s, 50));
   assert.ok(!needsSearch(s, 0));
-  s = mergePage(s, [row(3), row(17)], 50, f);
+  s = mergePage(s, [row(3), row(17)], 50);
   assert.deepEqual(ids(s), [3, 17]);
   assert.equal(s.cursor, 50);
   assert.ok(!needsSearch(s, 50));
@@ -408,56 +427,53 @@ test("a short page covers everything up to the polled id", () => {
   assert.ok(needsSearch(s, 60));
   assert.deepEqual(searchArgs(s).slice(-2), ["--after=50", `--limit=${SEARCH_PAGE}`]);
   // A match newer than the polled rows (recorded during the call) moves the cursor past it.
-  s = mergePage(s, [row(55), row(63)], 60, f);
+  s = mergePage(s, [row(55), row(63)], 60);
   assert.equal(s.cursor, 63);
   assert.deepEqual(ids(s), [3, 17, 55, 63]);
 });
 
 test("a full page continues from its last row", () => {
   const page = rows(1, SEARCH_PAGE).map((r) => row(r.id * 2));
-  const s = mergePage(ns("a"), page, 100000, cf("a"));
+  const s = mergePage(ns("a"), page, 100000);
   assert.equal(s.cursor, SEARCH_PAGE * 2);
   assert.ok(needsSearch(s, 100000));
-  assert.ok(!s.capped);
 });
 
 test("rows already searched are not counted twice", () => {
-  let s = mergePage(ns("a"), [row(5)], 10, cf("a"));
-  s = mergePage(s, [row(5), row(11)], 12, cf("a"));
+  let s = mergePage(ns("a"), [row(5)], 10);
+  s = mergePage(s, [row(5), row(11)], 12);
   assert.deepEqual(ids(s), [5, 11]);
 });
 
-test("the search stops at MAX_MATCHES and says so", () => {
-  const f = cf("a");
+test("the search never stops at a number of matches, and says how many it has loaded", () => {
   let s = ns("a");
   let id = 0;
-  while (s.matches.size < MAX_MATCHES) {
-    const page = Array.from({ length: SEARCH_PAGE }, () => row(++id));
-    s = mergePage(s, page, 1e9, f);
+  const started = performance.now();
+  // 200,000 matches, a page at a time, as the poll would bring them.
+  while (s.matches.size < 200_000) {
+    const page = Array.from({ length: SEARCH_PAGE }, () => ({ id: ++id }));
+    s = mergePage(s, page, 1e9);
+    assert.ok(needsSearch(s, 1e9));
   }
-  assert.equal(s.matches.size, MAX_MATCHES);
-  // Exactly MAX_MATCHES so far: one more page tells whether there are more.
-  assert.ok(!s.capped && needsSearch(s, 1e9));
-  const end = mergePage(s, [], 1e9, f);
-  assert.ok(!end.capped && !needsSearch(end, 1e9));
-  s = mergePage(s, [row(++id)], 1e9, f);
-  assert.ok(s.capped);
-  assert.equal(s.matches.size, MAX_MATCHES);
-  assert.equal(s.cursor, MAX_MATCHES);
+  const took = performance.now() - started;
+  assert.ok(took < 20_000, `merging 200,000 matches took ${Math.round(took)} ms`);
+  assert.equal(searchNote(s, 1e9), "Searching… 200,000 matches loaded");
+  s = mergePage(s, [], 1e9);
   assert.ok(!needsSearch(s, 1e9));
-  assert.match(searchNote(s, 1e9), /first 10,000 matches \(up to #10000\)/);
+  assert.equal(searchNote(s, 1e9), "200,000 matches loaded");
+  assert.equal(searchNote(found("a", Array.from({ length: MANY_MATCHES - 1 }, (_, i) => i + 1)), MANY_MATCHES - 1), "");
 });
 
 test("contents mode shows matched rows only, and nothing for an older query", () => {
   const all = [...rows(1, 6), row(7, { source: "scan" })];
   const f = cf("token");
   // Rows 6 and 7 were polled after the search covered up to 5: hidden until searched.
-  let s = mergePage(ns("token"), [row(2), row(4)], 5, f);
+  let s = mergePage(ns("token"), [row(2), row(4)], 5);
   assert.deepEqual(
     visibleRows(all, f, s).map((r) => r.id),
     [2, 4],
   );
-  s = mergePage(s, [row(7, { source: "scan" })], 7, f);
+  s = mergePage(s, [row(7, { source: "scan" })], 7);
   assert.deepEqual(
     visibleRows(all, f, s).map((r) => r.id),
     [2, 4, 7],
@@ -483,7 +499,7 @@ test("the search note says when it is still running or failed", () => {
   assert.equal(searchNote(null, 0), "Searching…");
   const s = ns("a");
   assert.equal(searchNote(s, 10), "Searching…");
-  assert.equal(searchNote(mergePage(s, [], 10, cf("a")), 10), "");
+  assert.equal(searchNote(mergePage(s, [], 10), 10), "");
   assert.equal(searchNote(failPage(s, "boom"), 10), "Search failed (trying again): boom");
 });
 
@@ -506,29 +522,12 @@ test("search text stays one argument whatever it holds", () => {
   assert.equal(searchArgs(ns("a", { sources: ["proxy"] }))[3], "--source=proxy");
 });
 
-test("a cap reached in the middle of a page stops at the last match kept", () => {
-  let s = found("a", Array.from({ length: MAX_MATCHES - 1 }, (_, i) => i + 1));
-  s = mergePage(s, [row(20001), row(20005), row(20009)], 30000, cf("a"));
-  assert.ok(s.capped);
-  assert.equal(s.matches.size, MAX_MATCHES);
-  assert.ok(s.matches.has(20001) && !s.matches.has(20005));
-  assert.equal(s.cursor, 20001);
-  // Capped: later polls don't search on.
-  assert.ok(!needsSearch(s, 40000));
-  assert.match(searchNote(s, 40000), /up to #20001/);
-  const all = [row(20001), row(20005), row(20009)];
-  assert.deepEqual(
-    visibleRows(all, cf("a"), s).map((r) => r.id),
-    [20001],
-  );
-});
-
 test("a full page followed by a short one covers everything up to the polled id", () => {
-  let s = mergePage(ns("a"), rows(1, SEARCH_PAGE), 5000, cf("a"));
+  let s = mergePage(ns("a"), rows(1, SEARCH_PAGE), 5000);
   assert.equal(s.cursor, SEARCH_PAGE);
   assert.ok(needsSearch(s, 5000));
   assert.equal(searchArgs(s)[3], `--after=${SEARCH_PAGE}`);
-  s = mergePage(s, [row(4000)], 5000, cf("a"));
+  s = mergePage(s, [row(4000)], 5000);
   assert.equal(s.cursor, 5000);
   assert.equal(s.matches.size, SEARCH_PAGE + 1);
   assert.ok(!needsSearch(s, 5000));
@@ -537,17 +536,17 @@ test("a full page followed by a short one covers everything up to the polled id"
 
 test("a full page past the polled rows waits for the poll to catch up", () => {
   // Rows were recorded during the call: the page ends after the newest polled id.
-  const s = mergePage(ns("a"), rows(1, SEARCH_PAGE), 10, cf("a"));
+  const s = mergePage(ns("a"), rows(1, SEARCH_PAGE), 10);
   assert.equal(s.cursor, SEARCH_PAGE);
   assert.ok(!needsSearch(s, 10));
   assert.ok(needsSearch(s, SEARCH_PAGE + 1));
 });
 
 test("a failed search keeps its matches and says why", () => {
-  const s = failPage(mergePage(ns("a"), [row(2)], 5, cf("a")), "database is locked");
+  const s = failPage(mergePage(ns("a"), [row(2)], 5), "database is locked");
   assert.equal(searchNote(s, 100), "Search failed (trying again): database is locked");
-  // The error wins over the cap note.
-  assert.match(searchNote({ ...s, capped: true }, 100), /^Search failed/);
+  // The error wins over the count.
+  assert.match(searchNote({ ...s, matches: new Set(Array.from({ length: MANY_MATCHES }, (_, i) => i + 1)) }, 100), /^Search failed/);
   assert.deepEqual(
     visibleRows(rows(1, 6), cf("a"), s).map((r) => r.id),
     [2],
@@ -556,7 +555,7 @@ test("a failed search keeps its matches and says why", () => {
 
 test("matches the poll hasn't fetched yet show once their rows arrive", () => {
   const f = cf("a");
-  const s = mergePage(ns("a"), [row(3), row(8)], 5, f);
+  const s = mergePage(ns("a"), [row(3), row(8)], 5);
   assert.equal(s.cursor, 8);
   assert.deepEqual(
     visibleRows(rows(1, 5), f, s).map((r) => r.id),
@@ -571,7 +570,7 @@ test("matches the poll hasn't fetched yet show once their rows arrive", () => {
 test("contents mode still hides out-of-scope matches by default", () => {
   const f = cf("a");
   const all = [row(1), row(2, { status: null, error: "out of scope: b.test" })];
-  const s = mergePage(ns("a"), all, 2, f);
+  const s = mergePage(ns("a"), all, 2);
   assert.deepEqual(
     visibleRows(all, f, s).map((r) => r.id),
     [1],
@@ -644,7 +643,7 @@ test("no storage at all loads nothing and reports a failed save", () => {
 // ---------------- Review fixes ----------------
 
 test("a failed search tries again after a backoff and carries on", () => {
-  let s = failPage(mergePage(ns("a"), [row(2)], 5, cf("a")), "database is locked", 1000);
+  let s = failPage(mergePage(ns("a"), [row(2)], 5), "database is locked", 1000);
   // Not on the very next poll: after RETRY_BASE, doubling per failure up to RETRY_MAX.
   assert.ok(!needsSearch(s, 9, 1000 + RETRY_BASE - 1));
   assert.ok(needsSearch(s, 9, 1000 + RETRY_BASE));
@@ -656,7 +655,7 @@ test("a failed search tries again after a backoff and carries on", () => {
   for (let i = 0; i < 20; i++) many = failPage(many, "locked", 0);
   assert.equal(many.retryAt, RETRY_MAX);
   // A good page clears the error and the backoff.
-  s = mergePage(s, [row(7)], 9, cf("a"));
+  s = mergePage(s, [row(7)], 9);
   assert.equal(s.error, null);
   assert.equal(s.failures, 0);
   assert.ok(needsSearch(s, 10, 0));
@@ -669,29 +668,6 @@ test("a failed search tries again after a backoff and carries on", () => {
   );
 });
 
-test("hidden rows don't count toward the cap", () => {
-  // Hide out-of-scope is on by default: a page full of refused matches counts for nothing.
-  const refused = Array.from({ length: SEARCH_PAGE }, (_, i) => row(i + 1, { status: null, error: "out of scope: b.test" }));
-  let s = { ...found("a", []), matches: new Map(Array.from({ length: MAX_MATCHES - 1 }, (_, i) => [-i - 1, row(-i - 1)])) };
-  s = mergePage(s, refused, 1e9, cf("a"));
-  assert.ok(!s.capped);
-  assert.equal(shownMatches(s, cf("a")), MAX_MATCHES - 1);
-  // Every row of the page moves the cursor, counted or not, and is kept for later.
-  assert.equal(s.cursor, SEARCH_PAGE);
-  assert.equal(s.matches.size, MAX_MATCHES - 1 + SEARCH_PAGE);
-  // Assets and errors too, when those boxes are ticked.
-  const f = cf("a", { hideAssets: true, hideErrors: true });
-  let t = mergePage(ns("a"), [row(1, { url: "https://a.test/app.js" }), row(2, { status: 500 }), row(3)], 3, f);
-  assert.equal(shownMatches(t, f), 1);
-  assert.equal(t.cursor, 3);
-  // The cap is reached only by rows the table shows.
-  t = { ...found("a", []), matches: new Map(Array.from({ length: MAX_MATCHES }, (_, i) => [-i - 1, row(-i - 1)])) };
-  t = mergePage(t, [row(1, { status: null, error: "out of scope: b.test" }), row(2)], 9, cf("a"));
-  assert.ok(t.capped);
-  assert.equal(t.cursor, 1);
-  assert.ok(!t.matches.has(2));
-});
-
 test("whitespace-only text doesn't search, other text is kept as typed", () => {
   for (const t of [" ", "   ", "\t", "\n "]) assert.equal(searchFor(cf(t)), null, JSON.stringify(t));
   // Contents mode with no search shows rows by the other filters, as with no text.
@@ -701,54 +677,16 @@ test("whitespace-only text doesn't search, other text is kept as typed", () => {
   assert.equal(searchFor(cf(" a "))!.text, " a ");
 });
 
-test("changing a checkbox keeps the matches and only works out the cap again", () => {
+test("changing a checkbox keeps the matches", () => {
   const all = [row(1), row(2, { url: "https://a.test/app.js" }), row(3, { status: 500 })];
-  const s = mergePage(ns("a"), all, 3, cf("a"));
-  // Nothing to change: the same search, no new CLI call.
-  assert.equal(refilter(s, cf("a", { hideAssets: true })), s);
+  const s = mergePage(ns("a"), all, 3);
+  // The same search: no new CLI call.
+  assert.ok(isCurrent(s, cf("a", { hideAssets: true })));
   assert.deepEqual(
     visibleRows(all, cf("a", { hideAssets: true, hideErrors: true }), s).map((r) => r.id),
     [1],
   );
   assert.equal(visibleRows(all, cf("a"), s).length, 3);
-});
-
-test("a capped search carries on when a checkbox hides enough of its matches", () => {
-  const f = cf("a");
-  // MAX_MATCHES shown matches, half of them static assets, then one more stops it.
-  const page = Array.from({ length: MAX_MATCHES + 1 }, (_, i) => row(i + 1, i % 2 ? { url: `https://a.test/s${i}.css` } : {}));
-  let s = mergePage(ns("a"), page, 1e9, f);
-  assert.ok(s.capped);
-  assert.equal(s.cursor, MAX_MATCHES);
-  const fewer = cf("a", { hideAssets: true });
-  const next = refilter(s, fewer);
-  assert.ok(!next.capped);
-  assert.equal(next.cursor, MAX_MATCHES);
-  assert.ok(needsSearch(next, 1e9));
-  assert.deepEqual(searchArgs(next).slice(-2), [`--after=${MAX_MATCHES}`, `--limit=${SEARCH_PAGE}`]);
-  // Same count after all: the next shown match stops it again, where it was.
-  s = mergePage(refilter(s, f), [row(MAX_MATCHES + 1)], 1e9, f);
-  assert.ok(s.capped);
-  assert.equal(s.cursor, MAX_MATCHES);
-});
-
-test("unhiding rows past the cap stops the search before the first one over", () => {
-  // MAX_MATCHES shown rows with refused (hidden) matches among them.
-  const page = [row(1, { status: null, error: "out of scope: b.test" }), ...Array.from({ length: MAX_MATCHES }, (_, i) => row(i + 2)), row(MAX_MATCHES + 5, { status: null, error: "out of scope: b.test" })];
-  const s = mergePage(ns("a"), page, MAX_MATCHES + 5, cf("a"));
-  assert.ok(!s.capped);
-  assert.equal(s.cursor, MAX_MATCHES + 5);
-  const all = refilter(s, cf("a", { hideRefused: false }));
-  assert.ok(all.capped);
-  // Row 1 and the first MAX_MATCHES - 1 others are shown; the last one kept is MAX_MATCHES.
-  assert.equal(shownMatches(all, cf("a", { hideRefused: false })), MAX_MATCHES);
-  assert.equal(all.cursor, MAX_MATCHES);
-  assert.ok(!all.matches.has(MAX_MATCHES + 1));
-  assert.match(searchNote(all, 1e9), /up to #10000/);
-  // Hiding them again: it carries on from there.
-  const back = refilter(all, cf("a"));
-  assert.ok(!back.capped && needsSearch(back, MAX_MATCHES + 5));
-  assert.equal(back.cursor, MAX_MATCHES);
 });
 
 test("copying saved filters says when the destination can't be written", () => {
