@@ -268,7 +268,12 @@ fn an_agent_can_prepare_replay_tabs() {
     assert_eq!(r["result"]["_meta"]["provenance"]["untrusted_content"], true, "{r}");
     let (err, env) = m.call("replay_tabs_list", json!({}));
     assert!(!err, "{env}");
-    assert_eq!(env["data"]["tabs"], set["tabs"]);
+    // As given, with the id the save gave it.
+    let mut listed = env["data"]["tabs"][0].clone();
+    assert!(listed["id"].as_str().is_some_and(|i| i.starts_with('t')), "{env}");
+    listed.as_object_mut().unwrap().remove("id");
+    assert_eq!(listed, set["tabs"][0]);
+    let id = env["data"]["tabs"][0]["id"].clone();
     assert_eq!(env["data"]["active"], 0);
 
     // A bad set is a tool error and leaves the saved one alone; list takes no stdin.
@@ -285,7 +290,7 @@ fn an_agent_can_prepare_replay_tabs() {
     let (err, env) = m.call("replay_tabs_list", json!({"summary": true}));
     assert!(!err, "{env}");
     assert!(env["data"]["tabs"][0].get("request").is_none(), "{env}");
-    assert_eq!(m.call("replay_tabs_list", json!({"index": 0})).1["data"]["tab"], set["tabs"][0]);
+    assert_eq!(m.call("replay_tabs_list", json!({"index": 0})).1["data"]["tab"]["id"], id);
 }
 
 #[test]

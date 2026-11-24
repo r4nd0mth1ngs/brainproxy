@@ -1882,6 +1882,14 @@ fn clip_text(s: &str, max: usize) -> String {
     format!("{}…[truncated, {} bytes total]", &s[..end], s.len())
 }
 
+/// A new random id: `prefix` and 96 random bits as hex, for records kept inside a meta value
+/// (a Replay tab), which have no row id of their own.
+pub fn random_id(prefix: &str) -> Result<String> {
+    let mut b = [0u8; 12];
+    getrandom::fill(&mut b).map_err(|e| Error::Io(std::io::Error::other(format!("random id: {e}"))))?;
+    Ok(format!("{prefix}{}", hex::encode(b)))
+}
+
 pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
     conn.create_scalar_function("header", 2, flags, |ctx| {

@@ -876,6 +876,13 @@ fn replay_tabs_are_saved_in_the_project() {
     assert_eq!(v["data"]["tabs"][0]["request"], req);
     assert_eq!(v["data"]["tabs"][1]["messages"][0], "hi");
     assert_eq!(v["_meta"]["provenance"]["untrusted_content"], true);
+    // Each tab was given an id, which every listing shows the same; a set with ids is format 3.
+    let ids: Vec<String> =
+        v["data"]["tabs"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap().to_string()).collect();
+    assert!(ids[0] != ids[1] && ids.iter().all(|i| i.starts_with('t')), "{ids:?}");
+    assert_eq!(v["data"]["v"], 3, "{v}");
+    let (_, again) = run(&["replay", "tabs", "list"], &project, None);
+    assert_eq!(again["data"]["tabs"][0]["id"], ids[0].as_str());
 
     // A refused set leaves the saved one alone.
     let (code, v) = run(&["replay", "tabs", "save"], &project, Some(br#"{"tabs": [{"title": "no request"}]}"#));
@@ -901,10 +908,10 @@ fn replay_tabs_are_saved_in_the_project() {
     // can be paged through under an output cap.
     let (code, v) = run(&["replay", "tabs", "list", "--summary"], &project, None);
     assert_eq!(code, 0, "{v}");
-    assert_eq!((&v["data"]["rev"], &v["data"]["v"]), (&1.into(), &1.into()));
+    assert_eq!((&v["data"]["rev"], &v["data"]["v"]), (&1.into(), &3.into()));
     assert_eq!(
         v["data"]["tabs"][0],
-        serde_json::json!({"index": 0, "kind": "http", "title": "one",
+        serde_json::json!({"index": 0, "id": ids[0], "kind": "http", "title": "one",
         "target": "http://127.0.0.1", "request_bytes": req.len()})
     );
     assert_eq!(v["data"]["tabs"][1]["messages"], 1);
@@ -930,6 +937,23 @@ fn replay_tabs_are_saved_in_the_project() {
     assert_eq!(v["data"]["tabs"][0]["title"], "one");
     assert_eq!(v["data"]["tabs"][2]["title"], "agent");
     assert_eq!(v["data"]["active"], 2);
+    // An append keeps the saved tabs' ids, and can't bring one of them again.
+    assert_eq!(v["data"]["tabs"][0]["id"], ids[0].as_str());
+    let dup = serde_json::json!({"tabs": [{"id": ids[0], "request": ""}]}).to_string();
+    let (code, v) = run(&["replay", "tabs", "save", "--append"], &project, Some(dup.as_bytes()));
+    assert_eq!((code, v["error"]["kind"].as_str()), (2, Some("invalid_input")), "{v}");
+
+    // Tabs an older build saved without ids are listed by their place, and keep those ids when saved again.
+    let old = r#"{"v":1,"rev":2,"tabs":[{"kind":"http","title":"a","target":"","request":"x"},{"kind":"http","title":"b","target":"","request":"y"}]}"#;
+    let kept = brainproxy_core::store::Store::open(&project).unwrap().meta_get("replay.tabs").unwrap();
+    brainproxy_core::store::Store::open(&project).unwrap().meta_set("replay.tabs", Some(old)).unwrap();
+    let (_, v) = run(&["replay", "tabs", "list", "--summary"], &project, None);
+    assert_eq!((&v["data"]["tabs"][0]["id"], &v["data"]["tabs"][1]["id"]), (&"i0".into(), &"i1".into()), "{v}");
+    let (code, v) = run(&["replay", "tabs", "save", "--append"], &project, Some(br#"{"tabs": [{"request": "z"}]}"#));
+    assert_eq!(code, 0, "{v}");
+    let (_, v) = run(&["replay", "tabs", "list"], &project, None);
+    assert_eq!((&v["data"]["tabs"][1]["id"], &v["data"]["v"]), (&"i1".into(), &3.into()), "{v}");
+    brainproxy_core::store::Store::open(&project).unwrap().meta_set("replay.tabs", kept.as_deref()).unwrap();
 
     // The tabs travel with a saved copy; an empty set leaves none but keeps the revision going.
     let copy = project.with_file_name("copy.bpdb");
@@ -942,16 +966,16 @@ fn replay_tabs_are_saved_in_the_project() {
     let (_, v) = run(&["replay", "tabs", "list"], &project, None);
     assert_eq!((&v["data"]["count"], &v["data"]["rev"]), (&0.into(), &3.into()), "{v}");
 
-    // Binary WebSocket messages are kept as typed, in format 2; 0.9.0 (format 1) won't save over them.
+    // Binary WebSocket messages are kept as typed; 0.9.0 (format 1) won't save over them.
     let set = br#"{"tabs": [{"kind": "ws", "request": "GET / HTTP/1.1\n\n", "messages": ["hi", {"hex": "00 ff"}, {"base64": "AP8="}]}]}"#;
     let (code, v) = run(&["replay", "tabs", "save"], &project, Some(set));
     assert_eq!(code, 0, "{v}");
     let (_, v) = run(&["replay", "tabs", "list"], &project, None);
-    assert_eq!(v["data"]["v"], 2, "{v}");
+    assert_eq!(v["data"]["v"], 3, "{v}");
     assert_eq!(v["data"]["tabs"][0]["messages"], serde_json::json!(["hi", {"hex": "00 ff"}, {"base64": "AP8="}]));
 
     // A set saved by a newer version isn't saved over (its new fields would be lost), but lists.
-    let newer = r#"{"v":3,"rev":7,"tabs":[{"kind":"grpc","request":""}]}"#;
+    let newer = r#"{"v":4,"rev":7,"tabs":[{"kind":"grpc","request":""}]}"#;
     brainproxy_core::store::Store::open(&project).unwrap().meta_set("replay.tabs", Some(newer)).unwrap();
     let (code, v) = run(&["replay", "tabs", "save"], &project, Some(br#"{"tabs": []}"#));
     assert_eq!(v["error"]["kind"], "conflict", "{v}");
@@ -960,9 +984,9 @@ fn replay_tabs_are_saved_in_the_project() {
     let (_, v) = run(&["replay", "tabs", "list"], &project, None);
     assert_eq!(
         (&v["data"]["tabs"][0]["kind"], &v["data"]["v"], &v["data"]["rev"]),
-        (&"grpc".into(), &3.into(), &7.into())
+        (&"grpc".into(), &4.into(), &7.into())
     );
-    assert_eq!(run(&["replay", "tabs", "list", "--summary"], &project, None).1["data"]["v"], 3);
+    assert_eq!(run(&["replay", "tabs", "list", "--summary"], &project, None).1["data"]["v"], 4);
 }
 
 #[test]

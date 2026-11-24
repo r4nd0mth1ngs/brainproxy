@@ -19,8 +19,12 @@ use crate::ws_cmd::{OutMessage, MAX_WAIT_SECS};
 const KEY: &str = "replay.tabs";
 /// Format of the saved set. A build refuses to save over a newer one, whose fields it would drop.
 /// 2 added binary WebSocket messages; a set without one is still written as 1, so 0.9.0 and
-/// older keep saving it, and never drop a binary message they can't read.
-const VERSION: u64 = 2;
+/// older keep saving it, and never drop a binary message they can't read. 3 added each tab's
+/// `id`, which every save fills in: an app that merges tabs saved elsewhere by id needs them
+/// kept, and an older app would save its open tabs over removals made elsewhere.
+const VERSION: u64 = 3;
+/// Longest tab id.
+const MAX_ID: usize = 64;
 /// Largest saved set, in bytes of JSON.
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TABS: usize = 500;
@@ -43,9 +47,10 @@ pub enum ReplayCmd {
 #[derive(Subcommand)]
 pub enum TabsCmd {
     /// List the saved Replay tabs: title, target, and the request or handshake and messages.
-    #[command(after_help = "Tabs are numbered from 0 (the index in `tabs`, as `active` counts). rev goes up \
-        with every save; `save --if-revision` checks it. Requests are listed as stored, so a live Cookie or \
-        Authorization typed into a tab is listed in full.")]
+    #[command(after_help = "Tabs are numbered from 0 (the index in `tabs`, as `active` counts). Each tab has \
+        an id that stays the same while it is kept (one saved by an older build is listed as i0, i1, ... by \
+        its place). rev goes up with every save; `save --if-revision` checks it. Requests are listed as \
+        stored, so a live Cookie or Authorization typed into a tab is listed in full.")]
     List {
         /// Each tab's index, kind, title, target and sizes, without its request or messages.
         #[arg(long, conflicts_with = "index")]
@@ -59,7 +64,8 @@ pub enum TabsCmd {
         \"target\": \"https://app.example.com\", \"request\": \"POST /login HTTP/1.1\\nHost: ...\"}, \
         {\"kind\": \"ws\", \"title\": \"feed\", \"target\": \"wss://app.example.com\", \"request\": \"GET /ws HTTP/1.1\\n...\", \
         \"messages\": [\"{\\\"op\\\":\\\"sub\\\"}\", {\"hex\": \"00ff\"}], \"wait\": 3, \"until\": \"done\"}], \"active\": 0}. \
-        kind is http (default) or ws; binary marks an http request held one character per byte; messages, \
+        id (letters, digits, - and _, at most 64) names a tab across saves, and is made when left out; ids are \
+        unique in the set. kind is http (default) or ws; binary marks an http request held one character per byte; messages, \
         wait (seconds, at most 86400) and until (regex) are for ws tabs; a message is a string (text) or \
         {\"hex\": \"...\"} or {\"base64\": \"...\"} (binary, kept as typed and decoded when sent); options holds how a tab sends: \
         {\"http2\", \"http3\", \"verbatim\", \"crlfBody\" (http tabs), \"sni\", \"timeout\" (seconds, at most 86400), \
@@ -92,6 +98,10 @@ enum Kind {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Tab {
+    /// Stays the same while the tab is open anywhere, so the app can tell an edit from a new tab.
+    /// Made when a tab is saved without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     #[serde(default)]
     kind: Kind,
     #[serde(default)]
@@ -189,7 +199,14 @@ pub fn replay(project: &Path, cmd: ReplayCmd, out: &Out) -> Result<(), Error> {
     match cmd {
         TabsCmd::List { summary, index } => {
             let saved = load(&Store::open(project)?)?;
-            let tabs = saved["tabs"].as_array().cloned().unwrap_or_default();
+            let mut tabs = saved["tabs"].as_array().cloned().unwrap_or_default();
+            // Saved before tabs had ids: named by their place, the same for every reader until
+            // a save stores ids.
+            for (i, t) in tabs.iter_mut().enumerate() {
+                if t.is_object() && !t["id"].is_string() {
+                    t["id"] = json!(format!("i{i}"));
+                }
+            }
             let rev = saved["rev"].as_u64().unwrap_or(0);
             // The app shows a newer format's tabs but doesn't save over them.
             // A set without one (none saved yet) is format 1, as `current` reads it.
@@ -228,7 +245,7 @@ pub fn replay(project: &Path, cmd: ReplayCmd, out: &Out) -> Result<(), Error> {
                 tabs.iter()
                     .enumerate()
                     .map(|(i, t)| {
-                        let mut s = json!({"index": i, "kind": t["kind"], "title": t["title"], "target": t["target"],
+                        let mut s = json!({"index": i, "id": t["id"], "kind": t["kind"], "title": t["title"], "target": t["target"],
                             "request_bytes": t["request"].as_str().map_or(0, str::len)});
                         if let Some(m) = t["messages"].as_array() {
                             s["messages"] = json!(m.len());
@@ -257,7 +274,12 @@ pub fn replay(project: &Path, cmd: ReplayCmd, out: &Out) -> Result<(), Error> {
             }
             let mut input = Vec::new();
             std::io::stdin().take(MAX_BYTES as u64 + 1).read_to_end(&mut input)?;
-            let set = parse(&input)?;
+            let mut set = parse(&input)?;
+            for t in &mut set.tabs {
+                if t.id.is_none() {
+                    t.id = Some(new_id()?);
+                }
+            }
             let given = set.tabs.len();
             let mut store = Store::open(project)?;
             let (count, bytes, rev) = store.meta_update(KEY, |old| {
@@ -268,7 +290,13 @@ pub fn replay(project: &Path, cmd: ReplayCmd, out: &Out) -> Result<(), Error> {
                          meanwhile; list them again"
                     )));
                 }
-                let (before, active) = if append { (before, active) } else { (Vec::new(), None) };
+                let (mut before, active) = if append { (before, active) } else { (Vec::new(), None) };
+                for (i, b) in before.iter_mut().enumerate() {
+                    if b.is_object() && !b["id"].is_string() {
+                        // The id a listing showed it by, so an app that read it keeps knowing it.
+                        b["id"] = json!(format!("i{i}"));
+                    }
+                }
                 let (json, count) = build(set, before, active, rev + 1)?;
                 let len = json.len();
                 Ok((Some(json), (count, len, rev + 1)))
@@ -288,6 +316,11 @@ pub fn replay(project: &Path, cmd: ReplayCmd, out: &Out) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// A new tab id.
+fn new_id() -> Result<String, Error> {
+    brainproxy_core::store::random_id("t")
 }
 
 /// The saved set as stored, or an empty one. Not re-validated, so a set saved by a newer
@@ -342,6 +375,12 @@ fn parse(input: &[u8]) -> Result<Tabs, Error> {
     }
     for (i, t) in set.tabs.iter().enumerate() {
         let bad = |what: String| Error::InvalidInput(format!("Replay tab {i} ({:?}): {what}", t.title));
+        if let Some(id) = &t.id {
+            let ok = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+            if id.is_empty() || id.len() > MAX_ID || !id.bytes().all(ok) {
+                return Err(bad(format!("id must be 1 to {MAX_ID} letters, digits, - or _")));
+            }
+        }
         if t.title.chars().count() > MAX_TITLE {
             return Err(bad(format!("title is longer than {MAX_TITLE} characters")));
         }
@@ -403,9 +442,21 @@ fn build(set: Tabs, before: Vec<Value>, active: Option<usize>, rev: u64) -> Resu
     for t in set.tabs {
         tabs.push(serde_json::to_value(t).map_err(|e| Error::InvalidInput(e.to_string()))?);
     }
-    // Format 1 unless a tab needs 2: then a build that can't read binary messages won't save over them.
+    let mut ids = std::collections::HashSet::new();
+    if let Some(id) = tabs.iter().filter_map(|t| t["id"].as_str()).find(|id| !ids.insert(*id)) {
+        return Err(Error::InvalidInput(format!("two Replay tabs have the id {id:?}; ids are unique")));
+    }
+    // The lowest format that holds what the tabs need: a build that can't read binary messages,
+    // or doesn't keep ids, won't save over them.
     let binary = tabs.iter().any(|t| t["messages"].as_array().is_some_and(|m| m.iter().any(|m| !m.is_string())));
-    let mut stored = json!({"v": if binary { VERSION } else { 1 }, "rev": rev, "tabs": tabs});
+    let v = if tabs.iter().any(|t| t["id"].is_string()) {
+        VERSION
+    } else if binary {
+        2
+    } else {
+        1
+    };
+    let mut stored = json!({"v": v, "rev": rev, "tabs": tabs});
     if let Some(a) = active {
         stored["active"] = json!(a);
     }
@@ -640,15 +691,34 @@ mod tests {
         // Before revisions: revision 0; an active past the end is dropped.
         let (rev, tabs, active) = current(Some(r#"{"tabs": [{"request": ""}], "active": 3}"#), true).unwrap();
         assert_eq!((rev, tabs.len(), active), (0, 1, None));
-        let newer = json!({"v": 3, "rev": 9, "tabs": []}).to_string();
+        let newer = json!({"v": 4, "rev": 9, "tabs": []}).to_string();
         let e = current(Some(&newer), false).unwrap_err();
         assert_eq!(e.kind(), "conflict");
-        assert!(e.to_string().contains("newer brainproxy (format 3"), "{e}");
-        // Format 2 (binary messages) is this build's own.
+        assert!(e.to_string().contains("newer brainproxy (format 4"), "{e}");
+        // Formats 2 (binary messages) and 3 (ids) are this build's own.
         assert_eq!(current(Some(r#"{"v": 2, "rev": 2, "tabs": []}"#), true).unwrap().0, 2);
+        assert_eq!(current(Some(r#"{"v": 3, "rev": 3, "tabs": []}"#), true).unwrap().0, 3);
+        assert_eq!(current(Some(r#"{"v": 4, "rev": 3, "tabs": []}"#), true).unwrap_err().kind(), "conflict");
         // A broken set can only be replaced outright.
         assert_eq!(current(Some("{"), false).unwrap(), (0, Vec::new(), None));
         assert!(current(Some("{"), true).unwrap_err().to_string().contains("without --append"));
+    }
+
+    #[test]
+    fn ids_are_checked_unique_and_raise_the_format_to_3() {
+        let (json, _) = save(br#"{"tabs": [{"id": "a-1", "request": "x"}, {"id": "b_2", "request": "y"}]}"#).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!((v["v"].as_u64(), v["tabs"][0]["id"].as_str()), (Some(3), Some("a-1")));
+        assert!(err(r#"{"tabs": [{"id": "a", "request": ""}, {"id": "a", "request": ""}]}"#).contains("unique"));
+        for bad in ["", "a b", "x/y", &"a".repeat(65)] {
+            assert!(err(&json!({"tabs": [{"id": bad, "request": ""}]}).to_string()).contains("id must be"), "{bad:?}");
+        }
+        // An append can't bring an id the saved tabs have.
+        let before = vec![json!({"id": "a", "request": ""})];
+        let e = build(parse(br#"{"tabs": [{"id": "a", "request": ""}]}"#).unwrap(), before, None, 2).unwrap_err();
+        assert!(e.to_string().contains("unique"), "{e}");
+        let id = new_id().unwrap();
+        assert!(id.len() == 25 && id.starts_with('t') && id != new_id().unwrap(), "{id}");
     }
 
     #[test]
