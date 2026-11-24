@@ -18,7 +18,7 @@ use crate::http::{Exchange, Target};
 
 /// The schema this build writes. A proxy records it when it starts, so `proxy status` can tell
 /// one started by an older build.
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// The most history rows [`Store::prune_unreferenced`] deletes in one transaction.
 pub const PRUNE_CHUNK: usize = 500;
@@ -147,6 +147,19 @@ ALTER TABLE issues ADD COLUMN decision_at TEXT;
 ALTER TABLE findings ADD COLUMN suppressed_by INTEGER;
 CREATE TABLE IF NOT EXISTS suppressions (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), alert_ref TEXT NOT NULL, host TEXT NOT NULL, path_prefix TEXT NOT NULL DEFAULT '', param TEXT, reason TEXT NOT NULL, origin TEXT, port INTEGER);
 ALTER TABLE suppressions ADD COLUMN port INTEGER;
+";
+
+/// v23: alert filters (`findings filter`): rules in the suppressions table that re-rate what
+/// they match (a risk and/or confidence) instead of marking it a false positive, which can
+/// match any host and a URL or parameter by regex; and on each finding the filter that rated it.
+/// Rules from before are suppressions.
+const SCHEMA_V23: &str = "
+ALTER TABLE suppressions ADD COLUMN action TEXT NOT NULL DEFAULT 'suppress';
+ALTER TABLE suppressions ADD COLUMN risk TEXT;
+ALTER TABLE suppressions ADD COLUMN confidence TEXT;
+ALTER TABLE suppressions ADD COLUMN url_regex TEXT;
+ALTER TABLE suppressions ADD COLUMN param_regex TEXT;
+ALTER TABLE findings ADD COLUMN rated_by INTEGER;
 ";
 
 /// Column documentation for the log of setting changes.
@@ -803,6 +816,9 @@ impl Store {
         }
         if version < 22 {
             add_missing_columns(&self.conn, SCHEMA_V22)?;
+        }
+        if version < 23 {
+            add_missing_columns(&self.conn, SCHEMA_V23)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -2180,6 +2196,58 @@ mod tests {
             assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
             assert!(has_column(&store.conn, "findings", "base_history_id").unwrap());
             assert!(has_column(&store.conn, "oob_payloads", "base_history_id").unwrap());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_on_v22_keeps_its_suppression_rules_and_gets_alert_filters() {
+        let dir = std::env::temp_dir().join(format!("bp-store-v22-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let _ = std::fs::remove_file(&path);
+        drop(Store::open(&path).unwrap());
+        let undo: String = SCHEMA_V23
+            .lines()
+            .filter_map(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
+                ["ALTER", "TABLE", t, "ADD", "COLUMN", c, ..] => Some(format!("ALTER TABLE {t} DROP COLUMN {c};")),
+                _ => None,
+            })
+            .collect();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "{undo} INSERT INTO suppressions (alert_ref, host, path_prefix, reason, origin)
+                VALUES ('10037', 'app.test', '/static/', 'CDN', 'gui');
+             PRAGMA user_version = 22;"
+        ))
+        .unwrap();
+        drop(conn);
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            assert!(has_column(&store.conn, "findings", "rated_by").unwrap());
+            let action: String = store.conn.query_row("SELECT action FROM suppressions", [], |r| r.get(0)).unwrap();
+            assert_eq!(action, "suppress");
+            let list = store.suppressions_list().unwrap();
+            assert_eq!(list.len(), 1);
+            assert_eq!(
+                list[0].as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+                [
+                    "id",
+                    "time",
+                    "alert_ref",
+                    "host",
+                    "path_prefix",
+                    "param",
+                    "reason",
+                    "by",
+                    "origin",
+                    "findings",
+                    "port"
+                ]
+            );
+            assert_eq!((list[0]["path_prefix"].as_str(), list[0]["origin"].as_str()), (Some("/static/"), Some("gui")));
+            assert!(store.filters_list().unwrap().is_empty());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

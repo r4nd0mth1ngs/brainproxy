@@ -123,8 +123,19 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("scanner_risk_level", "INTEGER", "scanner_risk as a level"),
     ("scanner_confidence", "TEXT", "While a person's rating holds: the scanner's own confidence"),
     ("rated_reason", "TEXT", "Why a person rated it"),
-    ("rated_origin", "TEXT", "gui or cli: who rated it; NULL when the scanner's rating stands"),
+    (
+        "rated_origin",
+        "TEXT",
+        "gui or cli: who rated it (for an alert filter's rating, who added the filter); NULL when the scanner's \
+         rating stands",
+    ),
     ("rated_at", "TEXT", "When it was rated"),
+    (
+        "rated_by",
+        "INTEGER",
+        "The alert filter (suppressions.id with action 'rate', `findings filter`) whose rating it has; NULL when \
+         a person rated it, or the scanner's rating stands",
+    ),
 ];
 
 /// Column documentation for the alert types.
@@ -294,7 +305,7 @@ pub(crate) fn rate_one(
             scanner_risk_level = CASE WHEN rated_origin IS NULL THEN risk_level ELSE scanner_risk_level END,
             scanner_confidence = CASE WHEN rated_origin IS NULL THEN confidence ELSE scanner_confidence END,
             risk = ?2, risk_level = ?3, confidence = ?4, rated_reason = ?5, rated_origin = ?6,
-            rated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            rated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), rated_by = NULL
          WHERE id = ?1",
     )?
     .execute(params![id, new_risk, level, new_confidence, reason, origin])?;
@@ -331,7 +342,7 @@ fn unrate_one(conn: &rusqlite::Connection, id: i64) -> Result<bool> {
     conn.execute(
         "UPDATE findings SET risk = scanner_risk, risk_level = scanner_risk_level, confidence = scanner_confidence,
             scanner_risk = NULL, scanner_risk_level = NULL, scanner_confidence = NULL,
-            rated_reason = NULL, rated_origin = NULL, rated_at = NULL
+            rated_reason = NULL, rated_origin = NULL, rated_at = NULL, rated_by = NULL
          WHERE id = ?1",
         [id],
     )?;
@@ -349,13 +360,15 @@ fn unrate_one(conn: &rusqlite::Connection, id: i64) -> Result<bool> {
     Ok(true)
 }
 
-/// A finding's rating as lists show it: null when the scanner's stands.
+/// A finding's rating as lists show it: null when the scanner's stands. `filter` is the alert
+/// filter that rated it, null when a person did.
 fn rated_json(
     reason: Option<String>,
     origin: Option<String>,
     at: Option<String>,
     scanner_risk: Option<String>,
     scanner_confidence: Option<String>,
+    filter: Option<i64>,
 ) -> Value {
     match origin {
         None => Value::Null,
@@ -366,20 +379,36 @@ fn rated_json(
             "by": crate::provenance::describe(Some(&o)),
             "origin": o,
             "at": at,
+            "filter": filter,
         }),
     }
 }
 
-/// Column documentation for the suppression rules (`findings suppress`).
+/// Column documentation for the suppression rules (`findings suppress`) and alert filters
+/// (`findings filter`), which share the table.
 pub const SUPPRESSION_COLUMNS: &[(&str, &str, &str)] = &[
     ("id", "INTEGER", "Rule id"),
     ("time", "TEXT", "When it was added"),
+    (
+        "action",
+        "TEXT",
+        "suppress (`findings suppress`: marks what it matches a false positive) or rate (`findings filter`: \
+         gives what it matches its risk and/or confidence)",
+    ),
     ("alert_ref", "TEXT", "Alert ref or rule id it matches (findings.alert_ref, or findings.rule_id as text)"),
-    ("host", "TEXT", "Host it matches (findings.host, lowercase)"),
+    ("host", "TEXT", "Host it matches (findings.host, lowercase); '' for any host (alert filters only)"),
     ("port", "INTEGER", "Only findings on this port (--host NAME:PORT); NULL for any"),
     ("path_prefix", "TEXT", "Only findings whose URL path starts with this; '' for any path"),
     ("param", "TEXT", "Only findings of this parameter, header or cookie; NULL for any"),
-    ("reason", "TEXT", "Why: the note of each finding it marks"),
+    ("url_regex", "TEXT", "Alert filters: only findings whose URL this regex finds a match in; NULL for any"),
+    ("param_regex", "TEXT", "Alert filters: only findings whose parameter this regex finds a match in; NULL for any"),
+    ("risk", "TEXT", "Alert filters: the risk it gives; NULL keeps the scanner's"),
+    ("confidence", "TEXT", "Alert filters: the confidence it gives; NULL keeps the scanner's"),
+    (
+        "reason",
+        "TEXT",
+        "Why: the note of each finding a suppression marks, the rating reason of each finding a filter rates",
+    ),
     ("origin", "TEXT", "Who added it: gui or cli (agents can't)"),
 ];
 
@@ -394,12 +423,51 @@ pub struct Suppression {
     pub reason: String,
 }
 
+/// An alert filter to add: scanner findings of `alert` (on `host`, any when `None`; under
+/// `path_prefix`; of `param`; whose URL and parameter the regexes find a match in) take `risk`
+/// and/or `confidence` in place of the scanner's, for `reason`, now and whenever found again.
+#[derive(Debug, Clone, Default)]
+pub struct AlertFilter {
+    pub alert: String,
+    pub host: Option<String>,
+    pub path_prefix: String,
+    pub url_regex: Option<String>,
+    pub param: Option<String>,
+    pub param_regex: Option<String>,
+    pub risk: Option<String>,
+    pub confidence: Option<String>,
+    pub reason: String,
+}
+
+/// What a rule does to the findings it matches, as the table's `action` holds it.
+const SUPPRESS: &str = "suppress";
+const RATE: &str = "rate";
+
+/// Longest URL or parameter regex an alert filter takes.
+const FILTER_REGEX_MAX: usize = 1000;
+
+/// A filter's regex, compiled with a size limit, so a pattern that would blow up is refused
+/// rather than run on every finding.
+fn filter_regex(flag: &str, src: &str) -> Result<regex::Regex> {
+    if src.len() > FILTER_REGEX_MAX {
+        return Err(Error::InvalidInput(format!("{flag}: at most {FILTER_REGEX_MAX} bytes")));
+    }
+    regex::RegexBuilder::new(src)
+        .size_limit(1 << 20)
+        .build()
+        .map_err(|e| Error::InvalidInput(format!("{flag} {src:?}: not a valid regex ({e})")))
+}
+
 /// A stored rule, as matching needs it.
 struct Rule {
     id: i64,
     port: Option<u16>,
     path_prefix: String,
     param: Option<String>,
+    url_regex: Option<regex::Regex>,
+    param_regex: Option<regex::Regex>,
+    risk: Option<String>,
+    confidence: Option<String>,
     reason: String,
     origin: Option<String>,
 }
@@ -407,6 +475,12 @@ struct Rule {
 impl Rule {
     fn matches(&self, url: &str, param: &str) -> bool {
         if self.param.as_deref().is_some_and(|p| p != param) {
+            return false;
+        }
+        if self.param_regex.as_ref().is_some_and(|r| !r.is_match(param)) {
+            return false;
+        }
+        if self.url_regex.as_ref().is_some_and(|r| !r.is_match(url)) {
             return false;
         }
         if self.path_prefix.is_empty() && self.port.is_none() {
@@ -418,24 +492,40 @@ impl Rule {
     }
 }
 
-/// The rules for `alert_ref` (or its rule id) on `host`, oldest first.
-fn rules_for(conn: &rusqlite::Connection, alert_ref: &str, rule_id: i64, host: &str) -> Result<Vec<Rule>> {
+/// The rules doing `action` for `alert_ref` (or its rule id) on `host`, or on any host,
+/// oldest first. A stored regex that no longer compiles (a lower size limit in a later build,
+/// say) leaves its rule out rather than letting it match everything.
+fn rules_for(
+    conn: &rusqlite::Connection,
+    action: &str,
+    alert_ref: &str,
+    rule_id: i64,
+    host: &str,
+) -> Result<Vec<Rule>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, path_prefix, param, reason, origin, port FROM suppressions
-         WHERE (alert_ref = ?1 OR alert_ref = CAST(?2 AS TEXT)) AND host = lower(?3) ORDER BY id",
+        "SELECT id, path_prefix, param, reason, origin, port, url_regex, param_regex, risk, confidence
+         FROM suppressions
+         WHERE action = ?4 AND (alert_ref = ?1 OR alert_ref = CAST(?2 AS TEXT)) AND (host = lower(?3) OR host = '')
+         ORDER BY id",
     )?;
-    let rules = stmt
-        .query_map(params![alert_ref, rule_id, host], |r| {
-            Ok(Rule {
-                id: r.get(0)?,
-                path_prefix: r.get(1)?,
-                param: r.get(2)?,
-                reason: r.get(3)?,
-                origin: r.get(4)?,
-                port: r.get(5)?,
-            })
+    type Row = (i64, String, Option<String>, String, Option<String>, Option<u16>, Option<String>, Option<String>);
+    type Given = (Option<String>, Option<String>);
+    let rows: Vec<(Row, Given)> = stmt
+        .query_map(params![alert_ref, rule_id, host, action], |r| {
+            Ok((
+                (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?),
+                (r.get(8)?, r.get(9)?),
+            ))
         })?
         .collect::<std::result::Result<_, _>>()?;
+    let mut rules = Vec::with_capacity(rows.len());
+    for ((id, path_prefix, param, reason, origin, port, url_regex, param_regex), (risk, confidence)) in rows {
+        let compile = |src: Option<String>| src.map(|s| filter_regex("regex", &s)).transpose();
+        let (Ok(url_regex), Ok(param_regex)) = (compile(url_regex), compile(param_regex)) else {
+            continue;
+        };
+        rules.push(Rule { id, port, path_prefix, param, url_regex, param_regex, risk, confidence, reason, origin });
+    }
     Ok(rules)
 }
 
@@ -499,9 +589,47 @@ pub(crate) fn suppress_new(conn: &rusqlite::Connection, finding: i64, history_id
     let (alert_ref, rule_id, host, url, param): (String, i64, String, String, String) = conn
         .prepare_cached("SELECT alert_ref, rule_id, host, url, param FROM findings WHERE id = ?1")?
         .query_row([finding], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
-    for rule in rules_for(conn, &alert_ref, rule_id, &host)? {
+    for rule in rules_for(conn, SUPPRESS, &alert_ref, rule_id, &host)? {
         if rule.matches(&url, &param) {
             return suppress_by(conn, finding, &rule, history_id);
+        }
+    }
+    Ok(false)
+}
+
+/// Gives an open scanner finding nobody rated `rule`'s rating, as the filter's author rated
+/// it, with its timeline naming the filter, and the filter in `rated_by`. Returns whether it
+/// changed.
+fn rate_by(conn: &rusqlite::Connection, finding: i64, rule: &Rule, history_id: Option<i64>) -> Result<bool> {
+    let fits: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM findings WHERE id = ?1 AND state = 'open' AND source != ?2
+                AND rated_origin IS NULL)",
+        )?
+        .query_row(params![finding, MANUAL_SOURCE], |r| r.get(0))?;
+    if !fits {
+        return Ok(false);
+    }
+    let rating = Rating { risk: rule.risk.as_deref(), confidence: rule.confidence.as_deref(), reason: &rule.reason };
+    let text = format!("re-rated by filter {}: {}", rule.id, rule.reason);
+    // Every filter is added with an origin; one without would be from a hand-edited project.
+    let origin = rule.origin.as_deref().unwrap_or("cli");
+    if !rate_one(conn, finding, &rating, origin, Some(&text), history_id)? {
+        return Ok(false);
+    }
+    conn.prepare_cached("UPDATE findings SET rated_by = ?2 WHERE id = ?1")?.execute(params![finding, rule.id])?;
+    Ok(true)
+}
+
+/// A new finding a scanner found, matched against the alert filters: the first (oldest) that
+/// matches rates it. Returns whether one did.
+pub(crate) fn rate_new(conn: &rusqlite::Connection, finding: i64, history_id: Option<i64>) -> Result<bool> {
+    let (alert_ref, rule_id, host, url, param): (String, i64, String, String, String) = conn
+        .prepare_cached("SELECT alert_ref, rule_id, host, url, param FROM findings WHERE id = ?1")?
+        .query_row([finding], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+    for rule in rules_for(conn, RATE, &alert_ref, rule_id, &host)? {
+        if rule.matches(&url, &param) {
+            return rate_by(conn, finding, &rule, history_id);
         }
     }
     Ok(false)
@@ -1188,7 +1316,7 @@ impl Store {
         let sql = format!(
             "SELECT id, alert_ref, name, risk, confidence, host, method, url, param, substr(evidence, 1, 300),
                 hits, history_id, state, origin, state_origin, state_changed_at, note_origin, note_changed_at, source,
-                issue_id, suppressed_by, rated_reason, rated_origin, rated_at, scanner_risk, scanner_confidence
+                issue_id, suppressed_by, rated_reason, rated_origin, rated_at, scanner_risk, scanner_confidence, rated_by
              FROM findings WHERE {where_sql} ORDER BY risk_level DESC, id LIMIT {limit} OFFSET {offset}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -1216,7 +1344,7 @@ impl Store {
                 "issue_id": r.get::<_, Option<i64>>(19)?,
                 "suppressed_by": r.get::<_, Option<i64>>(20)?,
                 // A person's rating in place of the scanner's (`findings rate`); null when none.
-                "rated": rated_json(r.get(21)?, r.get(22)?, r.get(23)?, r.get(24)?, r.get(25)?),
+                "rated": rated_json(r.get(21)?, r.get(22)?, r.get(23)?, r.get(24)?, r.get(25)?, r.get(26)?),
             }))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -1343,6 +1471,10 @@ impl Store {
             port,
             path_prefix: prefix.to_string(),
             param: s.param.clone(),
+            url_regex: None,
+            param_regex: None,
+            risk: None,
+            confidence: None,
             reason: reason.to_string(),
             origin: Some(crate::provenance::origin().to_string()),
         };
@@ -1370,7 +1502,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.time, s.alert_ref, s.host, s.path_prefix, s.param, s.reason, s.origin,
                 (SELECT count(*) FROM findings f WHERE f.suppressed_by = s.id AND f.state = 'false_positive'), s.port
-             FROM suppressions s ORDER BY s.id",
+             FROM suppressions s WHERE s.action = 'suppress' ORDER BY s.id",
         )?;
         let rows = stmt.query_map([], |r| {
             let origin: Option<String> = r.get(7)?;
@@ -1404,7 +1536,7 @@ impl Store {
             ));
         }
         let tx = self.write_tx()?;
-        if tx.execute("DELETE FROM suppressions WHERE id = ?1", [id])? == 0 {
+        if tx.execute("DELETE FROM suppressions WHERE id = ?1 AND action = ?2", params![id, SUPPRESS])? == 0 {
             return Err(Error::NotFound(format!("suppression rule {id}")));
         }
         let mut reopened = 0;
@@ -1424,6 +1556,177 @@ impl Store {
         }
         tx.commit()?;
         Ok(reopened)
+    }
+
+    /// Adds an alert filter and applies it to the open scanner findings it matches that nobody
+    /// rated (a person's rating, or an issue's, stays theirs). A person adds filters: under an
+    /// MCP tool call it is refused. Returns the filter's id and how many findings it rated.
+    pub fn filter_add(&mut self, f: &AlertFilter) -> Result<(i64, usize)> {
+        if crate::provenance::origin() == "mcp" {
+            return Err(Error::InvalidInput(
+                "an alert filter is a person's rating of findings not yet seen; suggest a rating on the findings \
+                 instead (`findings mark ID --suggest --note ...`)"
+                    .into(),
+            ));
+        }
+        let alert = f.alert.trim();
+        let reason = f.reason.trim();
+        let prefix = f.path_prefix.trim();
+        if alert.is_empty() {
+            return Err(Error::InvalidInput("give the alert ref or rule id it re-rates (--alert)".into()));
+        }
+        if reason.is_empty() {
+            return Err(Error::InvalidInput(
+                "give the reason (--reason): it is the rating reason of each finding".into(),
+            ));
+        }
+        let risk = f.risk.as_deref().map(str::trim);
+        let confidence = f.confidence.as_deref().map(str::trim);
+        if risk.is_none() && confidence.is_none() {
+            return Err(Error::InvalidInput("give --risk and/or --confidence".into()));
+        }
+        if let Some(r) = risk {
+            if matches!(r, "false_positive" | "false-positive") {
+                return Err(Error::InvalidInput(
+                    "--risk false_positive: a filter re-rates; to mark findings false positives use findings \
+                     suppress"
+                        .into(),
+                ));
+            }
+            Risk::parse(r).ok_or_else(|| Error::InvalidInput(format!("unknown risk {r:?}")))?;
+        }
+        if let Some(c) = confidence {
+            Confidence::parse(c).ok_or_else(|| Error::InvalidInput(format!("unknown confidence {c:?}")))?;
+        }
+        if !prefix.is_empty() && !prefix.starts_with('/') {
+            return Err(Error::InvalidInput(format!("--path-prefix {prefix:?}: a path starts with /")));
+        }
+        let (host, port) = match f.host.as_deref() {
+            Some(h) => suppression_host(h)?,
+            None => (String::new(), None),
+        };
+        let url_regex = f.url_regex.as_deref().map(|r| filter_regex("--url-regex", r)).transpose()?;
+        let param_regex = f.param_regex.as_deref().map(|r| filter_regex("--param-regex", r)).transpose()?;
+        let origin = crate::provenance::origin();
+        let tx = self.write_tx()?;
+        tx.execute(
+            "INSERT INTO suppressions (action, alert_ref, host, path_prefix, param, reason, origin, port, url_regex,
+                param_regex, risk, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                RATE,
+                alert,
+                host,
+                prefix,
+                f.param,
+                reason,
+                origin,
+                port,
+                f.url_regex,
+                f.param_regex,
+                risk,
+                confidence
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        let rule = Rule {
+            id,
+            port,
+            path_prefix: prefix.to_string(),
+            param: f.param.clone(),
+            url_regex,
+            param_regex,
+            risk: risk.map(str::to_string),
+            confidence: confidence.map(str::to_string),
+            reason: reason.to_string(),
+            origin: Some(origin.to_string()),
+        };
+        let found: Vec<(i64, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, url, param FROM findings WHERE (alert_ref = ?1 OR CAST(rule_id AS TEXT) = ?1)
+                    AND (host = ?2 OR ?2 = '') AND state = 'open' AND source != ?3 AND rated_origin IS NULL
+                 ORDER BY id",
+            )?;
+            let rows =
+                stmt.query_map(params![alert, host, MANUAL_SOURCE], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut rated = 0;
+        for (finding, url, param) in found {
+            if rule.matches(&url, &param) && rate_by(&tx, finding, &rule, None)? {
+                rated += 1;
+            }
+        }
+        tx.commit()?;
+        Ok((id, rated))
+    }
+
+    /// The alert filters, oldest first, with how many findings still have each one's rating
+    /// (`holds`).
+    pub fn filters_list(&self) -> Result<Vec<Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.time, s.alert_ref, s.host, s.port, s.path_prefix, s.url_regex, s.param, s.param_regex,
+                s.risk, s.confidence, s.reason, s.origin,
+                (SELECT count(*) FROM findings f WHERE f.rated_by = s.id AND f.rated_origin IS NOT NULL)
+             FROM suppressions s WHERE s.action = 'rate' ORDER BY s.id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let host: String = r.get(3)?;
+            let origin: Option<String> = r.get(12)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "time": r.get::<_, String>(1)?,
+                "alert_ref": r.get::<_, String>(2)?,
+                // null: any host.
+                "host": Some(host).filter(|h| !h.is_empty()),
+                "port": r.get::<_, Option<u16>>(4)?,
+                "path_prefix": r.get::<_, String>(5)?,
+                "url_regex": r.get::<_, Option<String>>(6)?,
+                "param": r.get::<_, Option<String>>(7)?,
+                "param_regex": r.get::<_, Option<String>>(8)?,
+                "risk": r.get::<_, Option<String>>(9)?,
+                "confidence": r.get::<_, Option<String>>(10)?,
+                "reason": r.get::<_, String>(11)?,
+                "by": crate::provenance::describe(origin.as_deref()),
+                "origin": origin,
+                "holds": r.get::<_, i64>(13)?,
+            }))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Removes an alert filter: findings found later are no longer rated by it. With `unrate`,
+    /// the findings that still have its rating get the scanner's back; otherwise they keep it
+    /// (`rated_by` still names the filter). Refused under an MCP tool call, like adding one.
+    /// Returns how many findings got the scanner's rating back.
+    pub fn filter_remove(&mut self, id: i64, unrate: bool) -> Result<usize> {
+        if crate::provenance::origin() == "mcp" {
+            return Err(Error::InvalidInput(
+                "an alert filter is a person's decision; an agent can't remove it (suggest a rating on its \
+                 findings with `findings mark ID --suggest --note ...`)"
+                    .into(),
+            ));
+        }
+        let tx = self.write_tx()?;
+        if tx.execute("DELETE FROM suppressions WHERE id = ?1 AND action = ?2", params![id, RATE])? == 0 {
+            return Err(Error::NotFound(format!("alert filter {id}")));
+        }
+        let mut unrated = 0;
+        if unrate {
+            let ids: Vec<i64> = {
+                let mut stmt =
+                    tx.prepare("SELECT id FROM findings WHERE rated_by = ?1 AND rated_origin IS NOT NULL ORDER BY id")?;
+                let rows = stmt.query_map([id], |r| r.get(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            for f in ids {
+                if unrate_one(&tx, f)? {
+                    unrated += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(unrated)
     }
 
     /// Rates findings as a person sees them (`rating`), or with `None` gives them the scanner's
@@ -3196,6 +3499,180 @@ mod tests {
         seen_at(&mut s, "/static/c.js");
         assert_eq!(state_of(&s, "/static/c.js").0, "open");
         assert!(matches!(s.suppression_remove(id, false), Err(Error::NotFound(_))));
+    }
+
+    fn filter(alert: &str, risk: Option<&str>, reason: &str) -> AlertFilter {
+        AlertFilter { alert: alert.into(), risk: risk.map(str::to_string), reason: reason.into(), ..Default::default() }
+    }
+
+    fn at(s: &Store, path: &str) -> Value {
+        xpb(s).into_iter().find(|f| f["url"].as_str().unwrap().ends_with(path)).unwrap()
+    }
+
+    #[test]
+    fn alert_filters_match_any_host_a_port_a_url_and_a_parameter() {
+        let rule = |url: Option<&str>, param: Option<&str>| Rule {
+            id: 1,
+            port: None,
+            path_prefix: String::new(),
+            param: None,
+            url_regex: url.map(|r| filter_regex("--url-regex", r).unwrap()),
+            param_regex: param.map(|r| filter_regex("--param-regex", r).unwrap()),
+            risk: Some("info".into()),
+            confidence: None,
+            reason: "r".into(),
+            origin: None,
+        };
+        assert!(rule(Some(r"/api/v\d+/"), None).matches("http://a.test/api/v2/x?q=1", ""));
+        assert!(!rule(Some(r"/api/v\d+/"), None).matches("http://a.test/web/x", ""));
+        // The URL as found, query included.
+        assert!(rule(Some(r"[?&]debug="), None).matches("http://a.test/x?debug=1", ""));
+        assert!(rule(None, Some("^(?i)x-.*")).matches("http://a.test/", "X-Powered-By"));
+        assert!(!rule(None, Some("^(?i)x-.*")).matches("http://a.test/", "Server"));
+        assert!(matches!(filter_regex("--url-regex", "("), Err(Error::InvalidInput(_))));
+        assert!(matches!(filter_regex("--url-regex", &"a".repeat(1001)), Err(Error::InvalidInput(_))));
+
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/a1");
+        seen_at(&mut s, "/b");
+        let url = at(&s, "/a1")["url"].as_str().unwrap().to_string();
+        let port = url::Url::parse(&url).unwrap().port_or_known_default().unwrap();
+        let on = |host: &str| AlertFilter { host: Some(host.into()), ..filter("10037", Some("info"), "noise") };
+        assert_eq!(s.filter_add(&on("other.test")).unwrap().1, 0, "another host");
+        assert_eq!(s.filter_add(&on(&format!("app.test:{}", port.wrapping_add(1)))).unwrap().1, 0, "another port");
+        // No host: any host. A regex picks among the URLs.
+        let by_url = AlertFilter { url_regex: Some(r"/a\d$".into()), ..filter("10037", Some("info"), "noise") };
+        assert_eq!(s.filter_add(&by_url).unwrap().1, 1);
+        assert_eq!(at(&s, "/a1")["risk"], "info");
+        assert_eq!(at(&s, "/b")["rated"], Value::Null);
+        // The rule id matches too, and a later filter leaves what an earlier one rated.
+        let (late, rated) = s.filter_add(&filter("10037", Some("high"), "all of them")).unwrap();
+        assert_eq!(rated, 1);
+        assert_eq!(
+            (at(&s, "/a1")["risk"].as_str(), at(&s, "/b")["rated"]["filter"].as_i64()),
+            (Some("info"), Some(late))
+        );
+        let list = s.filters_list().unwrap();
+        assert_eq!(list.len(), 4);
+        assert_eq!(
+            (list[0]["host"].as_str(), list[1]["port"].as_u64()),
+            (Some("other.test"), Some(u64::from(port) + 1))
+        );
+        assert!(list[2]["host"].is_null());
+        assert_eq!(list.iter().map(|f| f["holds"].as_i64().unwrap()).collect::<Vec<_>>(), [0, 0, 1, 1]);
+        // Filters aren't suppression rules.
+        assert!(s.suppressions_list().unwrap().is_empty());
+        assert!(matches!(s.suppression_remove(late, false), Err(Error::NotFound(_))));
+        // What a filter needs.
+        for bad in [
+            filter("10037", None, "x"),
+            filter("10037", Some("false_positive"), "x"),
+            filter("10037", Some("severe"), "x"),
+            filter("10037", Some("low"), " "),
+            filter(" ", Some("low"), "x"),
+            AlertFilter { path_prefix: "static".into(), ..filter("10037", Some("low"), "x") },
+            AlertFilter { param_regex: Some("[".into()), ..filter("10037", Some("low"), "x") },
+            AlertFilter { confidence: Some("sure".into()), ..filter("10037", None, "x") },
+        ] {
+            assert!(matches!(s.filter_add(&bad), Err(Error::InvalidInput(_))), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_filter_rates_what_it_matches_now_and_when_found_again() {
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/x");
+        seen_at(&mut s, "/y");
+        let scanner = at(&s, "/x")["risk"].as_str().unwrap().to_string();
+        // A person's rating is theirs: the filter leaves it.
+        let y = at(&s, "/y")["id"].as_i64().unwrap();
+        let own = Rating { risk: Some("medium"), confidence: None, reason: "mine" };
+        s.findings_rate(&[y], &[], Some(&own)).unwrap();
+        let f = AlertFilter { confidence: Some("low".into()), ..filter("10037", Some("info"), "internal only") };
+        let (id, rated) = s.filter_add(&f).unwrap();
+        assert_eq!(rated, 1);
+        let x = at(&s, "/x");
+        let xid = x["id"].as_i64().unwrap();
+        assert_eq!((x["risk"].as_str(), x["confidence"].as_str()), (Some("info"), Some("low")));
+        assert_eq!(x["rated"]["filter"], id);
+        assert_eq!(x["rated"]["scanner_risk"].as_str(), Some(scanner.as_str()));
+        assert_eq!(
+            (x["rated"]["reason"].as_str(), x["rated"]["origin"].as_str()),
+            (Some("internal only"), Some("cli"))
+        );
+        assert_eq!(at(&s, "/y")["risk"], "medium");
+        assert!(at(&s, "/y")["rated"]["filter"].is_null());
+        let last = s.finding_events(xid).unwrap().pop().unwrap();
+        assert_eq!(
+            (last["kind"].as_str(), last["text"].as_str()),
+            (Some("rated"), Some(&*format!("re-rated by filter {id}: internal only")))
+        );
+        assert_eq!(s.finding_get(xid).unwrap()["rated_by"], id);
+        // Seen again, the rating stands; found new, it arrives rated.
+        seen_at(&mut s, "/x");
+        assert_eq!((at(&s, "/x")["risk"].as_str(), at(&s, "/x")["hits"].as_i64()), (Some("info"), Some(2)));
+        seen_at(&mut s, "/z");
+        let z = at(&s, "/z");
+        assert_eq!((z["risk"].as_str(), z["rated"]["filter"].as_i64()), (Some("info"), Some(id)), "{z}");
+        assert_eq!(s.filters_list().unwrap()[0]["holds"], 2);
+        // A person rating one takes it from the filter.
+        let zid = z["id"].as_i64().unwrap();
+        s.findings_rate(&[zid], &[], Some(&Rating { risk: Some("high"), confidence: None, reason: "no" })).unwrap();
+        assert!(at(&s, "/z")["rated"]["filter"].is_null());
+        assert!(s.finding_get(zid).unwrap()["rated_by"].is_null());
+        // Removed with --unrate, what it still holds has the scanner's rating again; the rest stay.
+        assert_eq!(s.filter_remove(id, true).unwrap(), 1);
+        let x = at(&s, "/x");
+        assert_eq!((x["risk"].as_str(), x["rated"].is_null()), (Some(scanner.as_str()), true), "{x}");
+        assert_eq!(at(&s, "/z")["risk"], "high");
+        assert_eq!(at(&s, "/y")["risk"], "medium");
+        seen_at(&mut s, "/w");
+        assert!(at(&s, "/w")["rated"].is_null());
+        assert!(matches!(s.filter_remove(id, false), Err(Error::NotFound(_))));
+        // Removed without, they keep it.
+        let (again, _) = s.filter_add(&filter("10037", Some("info"), "again")).unwrap();
+        assert_eq!(s.filter_remove(again, false).unwrap(), 0);
+        assert_eq!(at(&s, "/w")["risk"], "info");
+    }
+
+    #[test]
+    fn suppression_and_an_issue_s_rating_come_before_a_filter() {
+        let mut s = Store::open_in_memory().unwrap();
+        seen_at(&mut s, "/x");
+        let rule = Suppression {
+            alert: "10037".into(),
+            host: "app.test".into(),
+            path_prefix: "/static/".into(),
+            param: None,
+            reason: "CDN".into(),
+        };
+        let (sid, _) = s.suppression_add(&rule).unwrap();
+        let (fid, _) = s.filter_add(&filter("10037", Some("high"), "everywhere")).unwrap();
+        // Suppressed: a false positive, and the filter doesn't rate it.
+        seen_at(&mut s, "/static/a.js");
+        let a = at(&s, "/static/a.js");
+        assert_eq!((a["state"].as_str(), a["suppressed_by"].as_i64()), (Some("false_positive"), Some(sid)));
+        assert!(a["rated"].is_null(), "{a}");
+        // The issue rated as a whole: its new instances take that, not the filter's.
+        let issue = at(&s, "/x")["issue_id"].as_i64().unwrap();
+        s.findings_rate(&[], &[issue], Some(&Rating { risk: Some("medium"), confidence: None, reason: "issue" }))
+            .unwrap();
+        seen_at(&mut s, "/y");
+        let y = at(&s, "/y");
+        assert_eq!((y["risk"].as_str(), y["rated"]["filter"].as_i64()), (Some("medium"), None), "{y}");
+        // Without the issue's rating, the filter rates it.
+        s.findings_rate(&[], &[issue], None).unwrap();
+        seen_at(&mut s, "/z");
+        assert_eq!(at(&s, "/z")["rated"]["filter"], fid);
+        // A suppression rule and a filter are listed apart, and the suppression list is as before.
+        let list = s.suppressions_list().unwrap();
+        assert_eq!(list.len(), 1);
+        let keys: Vec<&str> = list[0].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["id", "time", "alert_ref", "host", "path_prefix", "param", "reason", "by", "origin", "findings", "port"]
+        );
+        assert!(matches!(s.filter_remove(sid, false), Err(Error::NotFound(_))));
     }
 
     #[test]

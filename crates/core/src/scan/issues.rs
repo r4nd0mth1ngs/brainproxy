@@ -200,7 +200,9 @@ pub(crate) fn issue_for(conn: &Connection, alert_ref: &str, host: &str) -> Resul
 /// Puts a new finding a scanner found in its issue and records that it was created. Triage
 /// made before it carries over: a suppression rule that matches it marks it a false positive,
 /// or else, when its issue was decided as a whole (false positive or accepted risk), it takes
-/// that decision. (A finding a person adds by hand is theirs to triage: see [`created`].)
+/// that decision. Its rating: the issue's, when a person rated the issue as a whole (that is
+/// about this root cause, so it is more specific); else, unless suppressed, the oldest alert
+/// filter that matches it. (A finding a person adds by hand is theirs to triage: see [`created`].)
 pub(crate) fn found(
     conn: &Connection,
     finding: i64,
@@ -209,14 +211,19 @@ pub(crate) fn found(
     history_id: Option<i64>,
 ) -> Result<()> {
     let issue = created(conn, finding, alert_ref, host, history_id)?;
-    if !crate::scan::findings_db::suppress_new(conn, finding, history_id)? {
+    let suppressed = crate::scan::findings_db::suppress_new(conn, finding, history_id)?;
+    if !suppressed {
         inherit_decision(conn, finding, issue, history_id)?;
     }
-    inherit_rating(conn, finding, issue, history_id)
+    if !inherit_rating(conn, finding, issue, history_id)? && !suppressed {
+        crate::scan::findings_db::rate_new(conn, finding, history_id)?;
+    }
+    Ok(())
 }
 
-/// A new instance of an issue a person rated as a whole takes the rating, as theirs.
-fn inherit_rating(conn: &Connection, finding: i64, issue: i64, history_id: Option<i64>) -> Result<()> {
+/// A new instance of an issue a person rated as a whole takes the rating, as theirs. Returns
+/// whether the issue had one.
+fn inherit_rating(conn: &Connection, finding: i64, issue: i64, history_id: Option<i64>) -> Result<bool> {
     type Row = (Option<String>, Option<String>, String, String);
     let row: Option<Row> = conn
         .prepare_cached(
@@ -226,13 +233,13 @@ fn inherit_rating(conn: &Connection, finding: i64, issue: i64, history_id: Optio
         .query_row([issue], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .optional()?;
     let Some((risk, confidence, reason, origin)) = row else {
-        return Ok(());
+        return Ok(false);
     };
     let text = format!("rated as issue {issue} was: {reason}");
     let rating =
         crate::scan::findings_db::Rating { risk: risk.as_deref(), confidence: confidence.as_deref(), reason: &reason };
     crate::scan::findings_db::rate_one(conn, finding, &rating, &origin, Some(&text), history_id)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Keeps (or with `None` ends) a person's rating of a whole issue, for the findings it gets

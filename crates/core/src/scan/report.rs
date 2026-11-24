@@ -393,6 +393,9 @@ pub struct Rated {
     pub reason: String,
     pub origin: Option<String>,
     pub at: Option<String>,
+    /// The alert filter (`findings filter`) whose rating it is; absent when a person rated it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<i64>,
 }
 
 impl Instance {
@@ -725,7 +728,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
             f.origin, f.state_origin, f.state_changed_at, f.note_origin, f.note_changed_at,
             f.last_history_id, h.time, f.issue_id, i.cvss_vector, i.cvss_score,
             f.rated_origin, f.scanner_risk, f.scanner_confidence, f.rated_reason, f.rated_at,
-            COALESCE(i.title, f.name), i.title IS NOT NULL
+            COALESCE(i.title, f.name), i.title IS NOT NULL, f.rated_by
          FROM (SELECT * FROM findings WHERE {where_sql}) f LEFT JOIN finding_types t ON t.alert_ref = f.alert_ref
             LEFT JOIN history h ON h.id = coalesce(f.last_history_id, f.history_id)
             LEFT JOIN issues i ON i.id = f.issue_id
@@ -788,6 +791,7 @@ pub fn build(store: &Store, opts: &ReportOptions) -> Result<Report> {
                     reason: r.get::<_, Option<String>>(38)?.unwrap_or_default(),
                     origin: Some(origin),
                     at: r.get(39)?,
+                    filter: r.get(42)?,
                 }),
                 None => None,
             },
