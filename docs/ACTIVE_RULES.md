@@ -149,9 +149,10 @@ These use IDs from 100000, so they never clash with ZAP's.
 
 ## Opt-in rules
 
-Two rules are off unless asked for, because what they send can do harm: **40041 File Upload**
-leaves files on the server, and **40023 Possible Username Enumeration** sends failed logins for
-the `--auth` user, which can lock the account. `scan rules --active` marks them `"opt_in": true`.
+Three rules are off unless asked for, because what they send can do harm: **40041 File Upload**
+leaves files on the server, **40023 Possible Username Enumeration** sends failed logins for
+the `--auth` user, which can lock the account, and **40013 Session Fixation** logs in as that
+user outside the scan's session, which can end it. `scan rules --active` marks them `"opt_in": true`.
 A scan that names no rules leaves them out, and so does a policy that doesn't turn them on by
 name (`scan policy save NAME --enable 40041`, or `"enabled": true` for the rule in its JSON):
 "on unless turned off" doesn't cover them. Naming one with `--rules 40041` turns it on, by a
@@ -196,7 +197,7 @@ requests without the scan's session.
 | 40008 | Parameter Tampering | param | medium | 40008 |
 | 40009 | Server Side Include | param | high | 40009 |
 | 40012 | Cross Site Scripting (Reflected) | param | high | 40012 |
-| 40013 | Session Fixation (needs `--auth` with a login) | host | high | 40013-4 |
+| 40013 | Session Fixation (opt-in; needs `--auth` with a login) | host | high | 40013-4 |
 | 40014 | Cross Site Scripting (Persistent) | param | high | 40014-1, 40014-2, 40014-3 |
 | 40015 | LDAP Injection | param | high | 40015-1, 40015-2 |
 | 40016 | Cross Site Scripting (Persistent) - Prime | param | (none) | |

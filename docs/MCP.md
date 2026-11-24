@@ -296,7 +296,7 @@ Some arguments need a person, so a command run for a tool call (the server sets
   replaces or removes one in the app or a terminal.
 - `scan_policy_save` under a name that is already saved (`conflict`), for the same reason: an
   agent saves a new policy and runs `scan_active` with `policy`. Opt-in rules (40041 file
-  upload, 40023 username enumeration: `scan_rules` with `active` marks them `opt_in`) aren't
+  upload, 40023 username enumeration, 40013 session fixation: `scan_rules` with `active` marks them `opt_in`) aren't
   refused: an agent turns one on as a person does, by naming it in `scan_active`'s `rules` or
   in a policy it saves with `enable`. Without that, a scan leaves them out.
 - `report`, `findings_repro`, `history_export`, `poc_csrf`, `poc_clickjacking` and `ca_export` with `force`: `output` (`out`)

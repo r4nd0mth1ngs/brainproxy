@@ -54,6 +54,7 @@ export interface RuleInfo {
 
 /** Why each opt-in rule is off until it is turned on. */
 const OPT_IN_WHY: Record<string, string> = {
+  "40013": "logs in as the --auth user outside the scan's session, which can end that session",
   "40023": "sends failed logins for the --auth user, which can lock the account",
   "40041": "uploads test files, which stay on the server",
 };

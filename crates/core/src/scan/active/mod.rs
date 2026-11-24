@@ -1722,10 +1722,10 @@ mod tests {
     #[test]
     fn opt_in_rules_run_only_when_named() {
         let all = selected_rule_ids(None, &[]);
-        assert!(!all.contains(&40041) && !all.contains(&40023), "{all:?}");
-        assert!(all.contains(&40013) && all.contains(&90027) && all.contains(&90026));
+        assert!(!all.contains(&40041) && !all.contains(&40023) && !all.contains(&40013), "{all:?}");
+        assert!(all.contains(&90027) && all.contains(&90026));
         assert_eq!(selected_rule_ids(Some(&[40041, 40023]), &[]), [40023, 40041]);
         let opt_in: Vec<u32> = all_rules().iter().filter(|r| r.opt_in()).map(|r| r.id()).collect();
-        assert_eq!(opt_in.len(), 2, "{opt_in:?}");
+        assert_eq!(opt_in.len(), 3, "{opt_in:?}");
     }
 }

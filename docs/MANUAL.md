@@ -997,7 +997,8 @@ with a login…"). It is left out when none was.
 
 **Opt-in rules.** `scan rules --active` gives each rule `opt_in`: true for the rules that are
 off unless asked for, because what they send can do harm (40041 file upload leaves files on
-the server; 40023 username enumeration sends failed logins, which can lock the account). A
+the server; 40023 username enumeration sends failed logins, which can lock the account; 40013
+session fixation logs in outside the scan's session, which can end it). A
 scan that names no rules leaves them out, and so does a policy that doesn't turn them on by
 name. Turn one on by naming it, `scan active --rules 40041` (or `--rules 40041,40012` with
 others), or in a policy, `scan policy save NAME --enable 40041`; an agent turns one on the same

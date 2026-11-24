@@ -301,7 +301,7 @@ mod tests {
             p.effective(40014),
             Effective { enabled: true, strength: Strength::High, threshold: Threshold::Medium }
         );
-        assert_eq!(p.disabled(), [40012, 40023, 40041], "opt-in rules are off unless turned on");
+        assert_eq!(p.disabled(), [40012, 40013, 40023, 40041], "opt-in rules are off unless turned on");
         assert_eq!(p.enabled_rules().len(), all_rules().iter().filter(|r| !r.opt_in()).count() - 1);
         let t = p.tuning();
         assert_eq!(t.rules[&40018], RuleTuning { strength: Some(Strength::Insane), threshold: None });

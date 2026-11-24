@@ -420,15 +420,18 @@ mod tests {
         let t = scope(&["a.test", "--no-rules", "--checks", "nuclei", "--check-ids=x,y", "--exclude-rules", "40018"]);
         assert_eq!(
             (t.ported_rules, t.check_ids, t.exclude_rules),
-            (false, vec!["x".to_string(), "y".to_string()], vec![40018, 40023, 40041])
+            (false, vec!["x".to_string(), "y".to_string()], vec![40013, 40018, 40023, 40041])
         );
         // A scan that names no rules didn't run the opt-in ones: their findings aren't covered.
-        assert_eq!(scope(&["a.test"]).exclude_rules, [40023, 40041]);
+        assert_eq!(scope(&["a.test"]).exclude_rules, [40013, 40023, 40041]);
         // A rule left without a rule it depends on didn't run.
         assert_eq!(scope(&["--rules=40014,40034", "--exclude-rules=40017"]).rules.unwrap(), [40034]);
         let mut x = scope(&["--exclude-rules=40016"]).exclude_rules;
         x.sort_unstable();
-        assert_eq!((scope(&["--exclude-rules=40016"]).rules, x), (None, vec![40014, 40016, 40017, 40023, 40041]));
+        assert_eq!(
+            (scope(&["--exclude-rules=40016"]).rules, x),
+            (None, vec![40013, 40014, 40016, 40017, 40023, 40041])
+        );
         // Checks picked by severity or tags: which ran isn't known.
         assert!(scope(&["a.test", "--checks", "nuclei", "--check-severity", "high"]).check_ids.is_empty());
         assert!(scope(&["a.test", "--checks", "nuclei", "--check-ids", "x", "--check-tags", "cve"])

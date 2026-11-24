@@ -138,7 +138,7 @@ fn policies_are_saved_shown_listed_and_removed() {
     );
     assert_eq!((saved["strength"].as_str(), saved["threshold"].as_str()), (Some("high"), Some("medium")), "{saved}");
     // Its two and the opt-in rules, which it doesn't turn on.
-    assert_eq!(saved["rules_disabled"], 4);
+    assert_eq!(saved["rules_disabled"], 5);
     assert_eq!(saved["rules"]["40018"], json!({"strength": "insane", "threshold": "high"}));
 
     let shown = ok(&p, &["scan", "policy", "show", "api"]);
@@ -154,7 +154,7 @@ fn policies_are_saved_shown_listed_and_removed() {
 
     // From another, changing only what's given; from JSON on stdin.
     let copy = ok(&p, &["scan", "policy", "save", "api2", "--from", "api", "--enable", "40012", "--reset", "40018"]);
-    assert_eq!((copy["rules_disabled"].as_u64(), copy["rules"].get("40018")), (Some(3), None), "{copy}");
+    assert_eq!((copy["rules_disabled"].as_u64(), copy["rules"].get("40018")), (Some(4), None), "{copy}");
     let (code, v) = run_with(
         &p,
         &["scan", "policy", "save", "only-env", "--json", "-"],
@@ -263,7 +263,7 @@ fn compare_reads_what_a_policy_scan_ran() {
     assert_eq!(scope["threshold"], "medium", "{d}");
     assert_eq!(scope["rule_thresholds"], json!({"40018": "high"}));
     // The opt-in rules the policy didn't turn on are left out too.
-    assert_eq!(scope["exclude_rules"], json!([40023, 40041, 40012]));
+    assert_eq!(scope["exclude_rules"], json!([40013, 40023, 40041, 40012]));
     assert_eq!(scope["ported_rules"], true);
 
     // A result that doesn't say: no ported rule is covered.
@@ -289,7 +289,7 @@ fn a_policy_turns_an_opt_in_rule_on() {
         .map(|r| r["id"].as_u64().unwrap())
         .collect();
     opt_in.sort_unstable();
-    assert_eq!(opt_in, [40023, 40041]);
+    assert_eq!(opt_in, [40013, 40023, 40041]);
 
     let body = "--b\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"cat.png\"\r\nContent-Type: image/png\r\n\r\nPNG\r\n--b--\r\n";
     let req = format!(

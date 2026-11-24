@@ -8,6 +8,10 @@
 //! `--logged-in` or `--logged-out` pattern), the check URL is then fetched with the pre-login
 //! cookies alone, as the attacker would: logged in there is a confirmed fixation.
 //!
+//! Opt-in ([`ActiveRule::opt_in`]): it sends a real login for the `--auth` user outside the
+//! scan's session, which can end that session or count against the account. It runs only when
+//! named with `--rules` or turned on in a scan policy.
+//!
 //! Differences from ZAP: ZAP sets each cookie, form and URL parameter of every page to null and
 //! watches for a session value coming back, reporting it as information unless the page is a
 //! flagged login page; it also reports session ids in URLs and their cookie flags and expiry,
@@ -72,6 +76,10 @@ impl ActiveRule for SessionFixation {
 
     fn scope(&self) -> RuleScope {
         RuleScope::Host
+    }
+
+    fn opt_in(&self) -> bool {
+        true
     }
 
     fn needs_login(&self) -> bool {
