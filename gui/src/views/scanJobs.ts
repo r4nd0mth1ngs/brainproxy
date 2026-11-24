@@ -28,3 +28,15 @@ export function sourcesToggle(current: readonly string[], source: string, all: r
   const next = all.filter((s) => on.has(s));
   return next.length ? { args: ["scan", "sources", ...next] } : { refused: SOURCES_REFUSED };
 }
+
+/** What the New scan form's "Host-header test" option permits, as its tooltip says. */
+export const HOST_HEADER_TEST_TITLE =
+  "Says the scan's foreign Host values are a deliberate Host-header test (--host-header-test): base requests whose Host names a host the scope doesn't list are attacked as they are, and rule 100010 (Host header injection) puts a made-up host in X-Forwarded-Host and similar headers. The app runs 100010 whenever it is selected; the flag puts the intent on record, and the same command run by an agent through MCP needs it, or 100010 is skipped.";
+
+/**
+ * `--host-header-test` for the New scan form's kinds that run the scan rules (an active scan, a
+ * targeted one) with the option on; the crawl and the single checks have no use for it.
+ */
+export function hostHeaderTestArgs(kind: string, on: boolean): string[] {
+  return on && (kind === "scan" || kind === "targeted") ? ["--host-header-test"] : [];
+}

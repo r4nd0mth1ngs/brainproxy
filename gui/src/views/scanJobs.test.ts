@@ -1,6 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { jobEndedText, jobName, SOURCES_REFUSED, sourcesToggle } from "./scanJobs.ts";
+import { HOST_HEADER_TEST_TITLE, hostHeaderTestArgs, jobEndedText, jobName, SOURCES_REFUSED, sourcesToggle } from "./scanJobs.ts";
+
+test("the Host-header test option passes its flag only to scans that run the rules", () => {
+  assert.deepEqual(hostHeaderTestArgs("scan", true), ["--host-header-test"]);
+  assert.deepEqual(hostHeaderTestArgs("targeted", true), ["--host-header-test"]);
+  assert.deepEqual(hostHeaderTestArgs("scan", false), []);
+  for (const kind of ["crawl", "php2shell", "quick"]) assert.deepEqual(hostHeaderTestArgs(kind, true), [], kind);
+  assert.match(HOST_HEADER_TEST_TITLE, /100010/);
+});
 
 test("each job kind is named for what it is", () => {
   assert.equal(jobEndedText({ kind: "active-scan", id: 3, state: "completed" }), "Scan #3 completed");

@@ -12,7 +12,7 @@ import { ScanPolicies, usePolicies } from "./ScanPolicies";
 import { describe as describePolicy, policyFacts, policyScanArgs } from "./scanPolicy";
 import { maxRiskLabel, passiveNote, SCRIPT_LIST_ARGS, type PassiveStats, type ScriptCheck } from "./scriptChecks.ts";
 import { AddScriptCheck, ScriptChecks } from "./ScriptChecks.tsx";
-import { jobEndedText, sourcesToggle } from "./scanJobs.ts";
+import { HOST_HEADER_TEST_TITLE, hostHeaderTestArgs, jobEndedText, sourcesToggle } from "./scanJobs.ts";
 
 export interface Job {
   id: number;
@@ -350,6 +350,8 @@ const SCAN_DEFAULTS = {
   urlPath: false,
   noRules: false,
   noOob: false,
+  /** `--host-header-test`: foreign Host values are a stated test. */
+  hostHeaderTest: false,
   http2: false,
   http3: false,
   verifyTls: false,
@@ -644,6 +646,7 @@ function NewScan({ picked, onLaunched, active }: { picked: Set<number>; onLaunch
           ...flag("--no-xml", f.noXml),
           ...flag("--url-path", f.urlPath),
           ...flag("--no-oob", f.noOob),
+          ...hostHeaderTestArgs(kind, f.hostHeaderTest),
           ...flag("--http2", f.http2),
           ...flag("--http3", f.http3),
           ...flag("--verify-tls", f.verifyTls),
@@ -924,6 +927,7 @@ function NewScan({ picked, onLaunched, active }: { picked: Set<number>; onLaunch
           <>
             {check("Inject into cookies", "cookies")}
             {check("No out-of-band", "noOob")}
+            {check("Host-header test", "hostHeaderTest", HOST_HEADER_TEST_TITLE)}
           </>
         ) : kind === "scan" ? (
           <>
@@ -936,6 +940,7 @@ function NewScan({ picked, onLaunched, active }: { picked: Set<number>; onLaunch
             {check("Skip XML bodies", "noXml")}
             {check("Checks only (no rules)", "noRules")}
             {check("No out-of-band", "noOob")}
+            {check("Host-header test", "hostHeaderTest", HOST_HEADER_TEST_TITLE)}
             {mode === "crawl" && browserCheck()}
           </>
         ) : kind === "crawl" ? (
