@@ -15,12 +15,13 @@
 //   TAURI_DRIVER     tauri-driver (default: tauri-driver on PATH)
 //   SCREENSHOT       where the PNG goes (default: e2e/native.png)
 
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const gui = resolve(here, "..");
@@ -32,12 +33,18 @@ const PORT = 4444;
 const BASE = `http://127.0.0.1:${PORT}`;
 const PROBE = "/native-e2e-probe";
 
+const run = promisify(execFile);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function brainproxy(project, args) {
-  const r = spawnSync(cli, ["--format", "json", "--project", project, ...args], { encoding: "utf8" });
-  if (r.status !== 0) throw new Error(`brainproxy ${args.join(" ")} failed: ${r.stderr || r.stdout}`);
-  return JSON.parse(r.stdout);
+// Async, not spawnSync: the fixture's server runs in this process, and a blocked event loop
+// would leave `send` waiting on a server that can't answer.
+async function brainproxy(project, args) {
+  try {
+    const { stdout } = await run(cli, ["--format", "json", "--project", project, ...args], { encoding: "utf8" });
+    return JSON.parse(stdout);
+  } catch (e) {
+    throw new Error(`brainproxy ${args.join(" ")} failed: ${e.stderr || e.stdout || e.message}`);
+  }
 }
 
 /** A project in a new folder with one request recorded against a local server. */
@@ -50,8 +57,8 @@ async function fixture(dir) {
   const { port } = server.address();
   const project = join(dir, "native.bpdb");
   try {
-    brainproxy(project, ["engagement", "start", "--target", "127.0.0.1"]);
-    brainproxy(project, ["send", "--url", `http://127.0.0.1:${port}${PROBE}`]);
+    await brainproxy(project, ["engagement", "start", "--target", "127.0.0.1"]);
+    await brainproxy(project, ["send", "--url", `http://127.0.0.1:${port}${PROBE}`]);
   } finally {
     server.close();
   }
