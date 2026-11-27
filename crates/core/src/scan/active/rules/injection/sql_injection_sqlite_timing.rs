@@ -232,8 +232,10 @@ mod tests {
                 .await;
         assert_eq!(found.len(), 1, "{s:?}");
         // The first timed request asks for two seconds and a tenth more: some 2.2 million rows.
+        // A loaded machine adds its own delay to the calibration requests, so the rate it
+        // measures is lower and it asks for fewer (1.99 million was seen on a CI macOS runner).
         let asked = rows(&found[0].attack).unwrap();
-        assert!((2_000_000..2_400_000).contains(&asked), "{found:?}");
+        assert!((1_500_000..2_400_000).contains(&asked), "{found:?}");
         // Calibration: 1, 100,000 and 1,000,000 rows; then two sequences of four.
         assert_eq!(s.requests, 3 + 8, "{s:?}");
 
